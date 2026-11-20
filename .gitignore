@@ -1,0 +1,25 @@
+# Build output
+build-arm/
+build-vita/
+*.vpk
+*.elf
+*.velf
+eboot.bin
+
+# Blizzard game files never go in this repository: use your own copy.
+*.mpq
+*.MPQ
+*.exe
+*.dll
+*.snp
+*.smk
+*.scm
+*.scx
+*.rep
+gamedata/
+
+# Logs and captures
+*.log
+scvita_*.txt
+shots/
+*.bmp

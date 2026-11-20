@@ -1,0 +1,140 @@
+#include <thread>
+#include <chrono>
+#include "runtime/guest_thread.h"
+#include "runtime/guest_thread_ctx.h"
+// sc_present.cpp — frame presentation, host test build.
+//
+// Receives the game's 8-bit frame and palette. On the host it measures the
+// frame interval and saves captures as 8-bit BMP (lossless, palette kept;
+// tools/bmp2png.py turns them into PNG). The Vita build replaces this file
+// with the sceGxm palette pass (640x480 -> 725x544 pillarboxed).
+//
+// SC_SHOTS=<dir>   save frames there
+// SC_SHOT_EVERY=N  save every Nth presented frame (default 30)
+// SC_PAD_SCRIPT=<file>  drive the controller from a script ("<frame> goto x y" warps the cursor): lines of
+//                  "<frame> <buttons-hex> <lx> <ly> <rx> <ry>", each held until
+//                  the next line; frames are counted at a fixed 1/60 s so a
+//                  script means the same thing on any host speed.
+#ifndef __vita__
+#include "sc_host.h"
+#include "sc_input.h"
+
+#include "runtime/host_clock.h"
+#include "runtime/ds_emul.h"
+
+#include <cstring>
+#include <string>
+#include <vector>
+#include <sys/stat.h>
+
+namespace sc {
+
+namespace {
+struct PadStep { uint64_t frame; Pad pad; std::string text; int wx = -1, wy = -1; };
+std::vector<PadStep> load_script(const char* path) {
+    std::vector<PadStep> v; FILE* f = std::fopen(path, "r"); if (!f) return v;
+    char line[256];
+    while (std::fgets(line, sizeof line, f)) {
+        unsigned long long fr; unsigned b, lx, ly, rx, ry;
+        unsigned long long tf; char txt[200];
+        int gx, gy;
+        if (std::sscanf(line, "%llu goto %d %d", &tf, &gx, &gy) == 3) {   // "<frame> goto x y": test-only cursor warp
+            PadStep s; s.frame = tf; s.wx = gx; s.wy = gy; s.pad = v.empty() ? Pad() : v.back().pad; v.push_back(s); continue;
+        }
+        if (std::sscanf(line, "%llu text %199[^\n]", &tf, txt) == 2) {   // "<frame> text <chars>"
+            PadStep s; s.frame = tf; s.text = txt; s.pad = v.empty() ? Pad() : v.back().pad; v.push_back(s); continue;
+        }
+        if (line[0] == '#' || std::sscanf(line, "%llu %x %u %u %u %u", &fr, &b, &lx, &ly, &rx, &ry) != 6) continue;
+        PadStep s; s.frame = fr; s.pad.buttons = b; s.pad.lx = lx; s.pad.ly = ly; s.pad.rx = rx; s.pad.ry = ry;
+        v.push_back(s);
+    }
+    std::fclose(f); return v;
+}
+uint64_t g_frames = 0, g_last_us = 0, g_win_start = 0, g_win_frames = 0;
+
+void write_bmp(const char* path, d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t h, const uint32_t* pal) {
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    uint32_t row = (w + 3) & ~3u, data = row * h, off = 14 + 40 + 1024;
+    uint8_t hdr[54] = { 'B', 'M' };
+    uint32_t v = off + data; std::memcpy(hdr + 2, &v, 4); std::memcpy(hdr + 10, &off, 4);
+    v = 40; std::memcpy(hdr + 14, &v, 4);
+    std::memcpy(hdr + 18, &w, 4);
+    int32_t ih = (int32_t)h; std::memcpy(hdr + 22, &ih, 4);   // bottom-up rows
+    uint16_t planes = 1, bpp = 8; std::memcpy(hdr + 26, &planes, 2); std::memcpy(hdr + 28, &bpp, 2);
+    std::memcpy(hdr + 34, &data, 4);
+    v = 256; std::memcpy(hdr + 46, &v, 4);
+    std::fwrite(hdr, 1, 54, f);
+    for (int i = 0; i < 256; ++i) {   // RGBQUAD = b, g, r, 0
+        uint8_t q[4] = { (uint8_t)(pal[i] >> 16), (uint8_t)(pal[i] >> 8), (uint8_t)pal[i], 0 };
+        std::fwrite(q, 1, 4, f);
+    }
+    std::vector<uint8_t> line(row, 0);
+    for (int y = (int)h - 1; y >= 0; --y) { c.read(pixels + y * pitch, line.data(), w); std::fwrite(line.data(), 1, row, f); }
+    std::fclose(f);
+}
+}  // namespace
+
+// Host stall watchdog: if no frame arrives for 10 s, dump the guest threads
+// (same report as the Vita build) so a deadlock can be traced on the host.
+static void start_stall_watch() {
+    static bool started = false; if (started) return; started = true;
+    std::thread([] {
+        uint64_t last = 0; int dumps = 0;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            const uint64_t f = g_frames;
+            if (f == last && f > 0 && dumps < 3) {
+                ++dumps;
+                log("[not-bound] [cause: guest stall] no frame for 10 s; guest threads:");
+                if (d2rt::ThreadScheduler* sc = wx86_sched()) sc->dump_threads_to([](const char* m) { log("[not-bound]   %s", m); });
+            }
+            last = f;
+        }
+    }).detach();
+}
+
+extern "C" { extern uint64_t dyn86_jp_created, dyn86_jp_invalid; }
+void present(d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t h, const uint32_t* pal) {
+    uint64_t now = wx86_now_us();
+    start_stall_watch();
+    ++g_frames; ++g_win_frames;
+    if (!g_win_start) g_win_start = now;
+    if (now - g_win_start >= 5000000) {
+        double fps = g_win_frames * 1e6 / double(now - g_win_start);
+        // Host numbers say nothing about the Vita; logged to watch the flow only.
+        uint32_t hc, hp, vc, vp; guest_mem(&hc, &hp, &vc, &vp);
+        log("[not-bound] [host qemu, not representative] presented %.1f frames/s (%llu total) heap %u/%u KiB va %u/%u KiB (cur/peak)",
+            fps, (unsigned long long)g_frames, hc >> 10, hp >> 10, vc >> 10, vp >> 10);
+        char line[400]; io_window_line(line, sizeof line, (now - g_win_start) / 1e6); log("[not-bound] %s", line);
+        if (d2rt::dsound::stat_line(line, sizeof line) > 0) log("[not-bound] %s", line);
+        {   // JIT churn per window (WX86_JITPROFILE=1 arms the counters)
+            static uint64_t p_new = 0, p_inv = 0;
+            log("[not-bound] jit(5s): new=%llu invalidated=%llu", (unsigned long long)(dyn86_jp_created - p_new),
+                (unsigned long long)(dyn86_jp_invalid - p_inv));
+            p_new = dyn86_jp_created; p_inv = dyn86_jp_invalid;
+        }
+        g_win_start = now; g_win_frames = 0;
+    }
+    g_last_us = now;
+    d2rt::dsound::frame_pump(c);
+    static std::vector<PadStep> script = std::getenv("SC_PAD_SCRIPT") ? load_script(std::getenv("SC_PAD_SCRIPT")) : std::vector<PadStep>();
+    if (!script.empty()) {
+        Pad cur; for (auto& st : script) {
+            if (st.frame <= g_frames) cur = st.pad;
+            if (st.frame == g_frames && !st.text.empty()) input_text(st.text);
+            if (st.frame == g_frames && st.wx >= 0) input_warp(st.wx, st.wy);
+        }
+        input_tick(cur, 16667);
+    }
+    static const char* dir = std::getenv("SC_SHOTS");
+    static uint64_t every = std::getenv("SC_SHOT_EVERY") ? std::strtoull(std::getenv("SC_SHOT_EVERY"), nullptr, 10) : 30;
+    if (dir && (g_frames == 1 || g_frames % every == 0)) {
+        mkdir(dir, 0777);
+        char p[512]; std::snprintf(p, sizeof p, "%s/frame_%06llu.bmp", dir, (unsigned long long)g_frames);
+        write_bmp(p, c, pixels, pitch, w, h, pal);
+    }
+}
+
+}  // namespace sc
+#endif  // !__vita__
