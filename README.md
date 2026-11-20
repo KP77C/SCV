@@ -5,8 +5,6 @@ unmodified Windows game through an x86-to-ARM dynamic recompiler (winx86,
 derived from Box86), with Win32, DirectDraw and DirectSound replaced by native
 Vita code.
 
-Thank you to Franckrst and D2Vita for the inspiration. https://github.com/Franckrst/D2Vita
-
 **No game files are included, and none ever will be.** You need your own legal
 copy of StarCraft 1.16.1 (StarCraft.exe, storm.dll, local.dll, StarDat.mpq,
 BrooDat.mpq, and StarCraft.mpq/BroodWar.mpq from your CDs). This port does not
@@ -62,6 +60,18 @@ Logs are written to `ux0:data/StarCraft/` (`scvita_log.txt`, `scvita_progress.tx
 | Select / L+Select | Enter / on-screen keyboard |
 
 Double click a unit to select all units of that type on screen.
+
+## Acknowledgements
+
+- **Franck Roustan (Franckrst) and [D2Vita](https://github.com/Franckrst/D2Vita)**: the project that inspired this whole port, and the winx86 engine it runs on.
+- **The PS Vita homebrew community**, whose work makes any of this possible, including:
+  - **TheFloW**, for HENkaku, h-encore, Ensō and VitaShell.
+  - **Rinnegatamante**, for vitaGL and many ports that showed what the Vita can do.
+  - **Team Molecule** (Davee, Proxima, xyz, YifanLu), for HENkaku and taiHEN.
+  - **The VitaSDK contributors**, for the open toolchain.
+  - **ptitSeb**, for Box86, whose dynarec sits at the heart of the engine.
+  - Everyone else who has written tools, plugins, guides and ports for the Vita.
+- **Blizzard Entertainment**, for creating StarCraft and Brood War, one of the greatest RTS games ever made.
 
 ## Licenses
 
