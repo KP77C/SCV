@@ -71,6 +71,7 @@ Double click a unit to select all units of that type on screen.
   - **The VitaSDK contributors**, for the open toolchain.
   - **ptitSeb**, for Box86, whose dynarec sits at the heart of the engine.
   - Everyone else who has written tools, plugins, guides and ports for the Vita.
+- **Claude** (Anthropic), which wrote the port and the engine fixes with KP77C.
 - **Blizzard Entertainment**, for creating StarCraft and Brood War, one of the greatest RTS games ever made.
 
 ## Licenses
