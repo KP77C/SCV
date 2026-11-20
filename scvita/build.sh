@@ -25,9 +25,16 @@ if [ "${TARGET:-}" = vita ]; then
     vita-make-fself "$OUT/scvita.velf" "$OUT/eboot.bin"
     # ATTRIBUTE2=12: the extended user memory budget (no DMR), for K's 304 MiB.
     vita-mksfoex -s TITLE_ID=SCVITA001 -s STITLE="StarCraft Vita" -d ATTRIBUTE2=12 "StarCraft Vita" "$OUT/sce_sys/param.sfo"
-    [ -f "$ROOT/sce_sys/icon0.png" ] && cp "$ROOT/sce_sys/icon0.png" "$OUT/sce_sys/icon0.png"
-    ( cd "$OUT" && vita-pack-vpk -s sce_sys/param.sfo -b eboot.bin \
-        $( [ -f sce_sys/icon0.png ] && echo "-a sce_sys/icon0.png=sce_sys/icon0.png" ) scvita.vpk )
+    # Optional art (icon0.png, livearea/contents/{bg,startup}.png + template.xml):
+    # not in the repository, since it is the owner's local artwork.
+    EXTRA_A=()
+    for f in icon0.png livearea/contents/bg.png livearea/contents/startup.png livearea/contents/template.xml; do
+        if [ -f "$ROOT/sce_sys/$f" ]; then
+            mkdir -p "$OUT/sce_sys/$(dirname "$f")"; cp "$ROOT/sce_sys/$f" "$OUT/sce_sys/$f"
+            EXTRA_A+=(-a "sce_sys/$f=sce_sys/$f")
+        fi
+    done
+    ( cd "$OUT" && vita-pack-vpk -s sce_sys/param.sfo -b eboot.bin "${EXTRA_A[@]}" scvita.vpk )
     echo "built $OUT/scvita.vpk"
     exit 0
 fi

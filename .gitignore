@@ -23,3 +23,6 @@ gamedata/
 scvita_*.txt
 shots/
 *.bmp
+
+# LiveArea art is local (Blizzard artwork): keep it out of the public repository
+scvita/sce_sys/
