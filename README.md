@@ -5,6 +5,8 @@ unmodified Windows game through an x86-to-ARM dynamic recompiler (winx86,
 derived from Box86), with Win32, DirectDraw and DirectSound replaced by native
 Vita code.
 
+Thank you to Franckrst and D2Vita for the inspiration. https://github.com/Franckrst/D2Vita
+
 **No game files are included, and none ever will be.** You need your own legal
 copy of StarCraft 1.16.1 (StarCraft.exe, storm.dll, local.dll, StarDat.mpq,
 BrooDat.mpq, and StarCraft.mpq/BroodWar.mpq from your CDs). This port does not
