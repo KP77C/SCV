@@ -41,11 +41,18 @@ std::vector<PadStep> load_script(const char* path) {
         if (std::sscanf(line, "%llu goto %d %d", &tf, &gx, &gy) == 3) {   // "<frame> goto x y": test-only cursor warp
             PadStep s; s.frame = tf; s.wx = gx; s.wy = gy; s.pad = v.empty() ? Pad() : v.back().pad; v.push_back(s); continue;
         }
+        if (std::sscanf(line, "%llu touch %d %d", &tf, &gx, &gy) == 3) {  // "<frame> touch x y": finger on the screen (640x480)
+            PadStep s; s.frame = tf; s.pad = v.empty() ? Pad() : v.back().pad; s.pad.touch = true; s.pad.tx = gx; s.pad.ty = gy; v.push_back(s); continue;
+        }
+        if (std::sscanf(line, "%llu untouc%1[h]", &tf, txt) == 2) {          // "<frame> untouch": finger lifted
+            PadStep s; s.frame = tf; s.pad = v.empty() ? Pad() : v.back().pad; s.pad.touch = false; v.push_back(s); continue;
+        }
         if (std::sscanf(line, "%llu text %199[^\n]", &tf, txt) == 2) {   // "<frame> text <chars>"
             PadStep s; s.frame = tf; s.text = txt; s.pad = v.empty() ? Pad() : v.back().pad; v.push_back(s); continue;
         }
         if (line[0] == '#' || std::sscanf(line, "%llu %x %u %u %u %u", &fr, &b, &lx, &ly, &rx, &ry) != 6) continue;
-        PadStep s; s.frame = fr; s.pad.buttons = b; s.pad.lx = lx; s.pad.ly = ly; s.pad.rx = rx; s.pad.ry = ry;
+        PadStep s; s.frame = fr; if (!v.empty()) { s.pad.touch = v.back().pad.touch; s.pad.tx = v.back().pad.tx; s.pad.ty = v.back().pad.ty; }
+        s.pad.buttons = b; s.pad.lx = lx; s.pad.ly = ly; s.pad.rx = rx; s.pad.ry = ry;
         v.push_back(s);
     }
     std::fclose(f); return v;

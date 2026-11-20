@@ -1,17 +1,16 @@
 // sc_input.cpp — K's control scheme (2026-11-20), see sc_input.h.
 //
 //   Right stick   cursor (L held: faster)
-//   Touch screen  puts the cursor under the finger, follows a drag (no click)
+//   Touch screen  cursor under the finger; tap = left click, touch and move = drag
 //   Left stick    map scroll (arrow keys)
 //   R             left click        L+R      right click (double R = double click)
-//   Cross         A                 D-pad down  right click (K, build 19)
+//   Cross         A
 //   Triangle      R                 L+Tri    G
 //   Square        S                 L+Sq     H
 //   Circle        P                 L+Circle R
 //   D-pad left    Ctrl (held)       D-pad right  Space
 //   D-pad left + face/L/R  Ctrl+1-6 (Cross 1, Square 2, Triangle 3, Circle 4, L 5, R 6)
-//   D-pad up + face/L/R    1-6 (the grid stays open; R with the right stick
-//                          pushed clicks the grid cell instead of sending 6)
+//   D-pad down + face/L/R  1-6
 //   L + cursor at a screen edge: scroll (without L the cursor stops 2 px short)
 //   D-pad up      hold: 3x3 command grid, right stick picks the cell,
 //                 R clicks it (grid stays up until D-pad up is released)
@@ -42,10 +41,11 @@ bool     g_ctrl_by_dpad = false;
 bool     g_grid = false; int g_cell = 4;
 bool     g_ime = false;
 // D-pad up/down swapped at K's request (build 16): grid on up, Ctrl on down.
-constexpr uint32_t kBtnGrid = PAD_UP;   // D-pad down is unbound (K, build 18)
+constexpr uint32_t kBtnGrid = PAD_UP, kBtnNum = PAD_DOWN;   // grid on up, numbers on down (K, build 20)
 constexpr double kEdgeGuard = 2;   // px kept from the screen edge unless L is held (no edge scroll)
 bool     g_r_grid = false;     // current R press was used by the grid
 bool     g_ctrl_by_left = false; // D-pad left is holding Ctrl
+bool     g_touch_btn = false;   // the left button is held by a finger on the touch screen
 uint32_t g_sh_owned = 0;         // shoulder buttons currently sending a digit (not mouse/grid)
 bool     g_stick_hold = false;   // after a grid click, ignore the right stick until it recentres
 double   g_fx = 320, g_fy = 240; // sub-pixel cursor
@@ -139,22 +139,21 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     const double dt = dt_us / 1e6;
     g_clock_us += dt_us;
 
-    // Command grid: hold D-pad down, pick with the right stick, press R to
-    // click the cell (K, 2026-11-20). The grid stays up while D-pad down is
+    // Command grid: hold D-pad up, pick with the right stick, press R to
+    // click the cell (K, 2026-11-20). The grid stays up while D-pad up is
     // held, so several buttons can be pressed in a row; releasing closes it.
     if (pressed & kBtnGrid) { g_grid = true; g_cell = 4; }
     if (g_grid) g_cell = grid_cell(p);
     if ((released & kBtnGrid) && g_grid) g_grid = false;
     // Shoulders as digits (K, build 18): D-pad left + L/R = Ctrl+5/6 (Ctrl is
-    // already held by D-pad left), D-pad up + L/R = 5/6. On D-pad up, R with the
-    // right stick pushed still clicks the grid cell; R with the stick centred is 6.
+    // already held by D-pad left), D-pad down + L/R = 5/6 (K, build 20). D-pad up
+    // is only the grid now, so R there always clicks the picked cell, centre included.
     static uint32_t sh_key[2] = { 0, 0 };
     const struct { uint32_t bit; uint32_t digit; } shoulders[2] = { { PAD_L, '5' }, { PAD_R, '6' } };
     for (int i = 0; i < 2; ++i) {
         if (pressed & shoulders[i].bit) {
-            const bool by_left = b & PAD_LEFT, by_up = b & kBtnGrid;
-            const bool grid_click = shoulders[i].bit == PAD_R && by_up && !by_left && g_cell != 4;
-            if ((by_left || by_up) && !grid_click) { key(shoulders[i].digit, true); sh_key[i] = shoulders[i].digit; }
+            const bool by_left = b & PAD_LEFT, by_num = b & kBtnNum;
+                        if (by_left || by_num) { key(shoulders[i].digit, true); sh_key[i] = shoulders[i].digit; }
         }
         if ((released & shoulders[i].bit) && sh_key[i]) { key(sh_key[i], false); sh_key[i] = 0; }
         if (sh_key[i]) g_sh_owned |= shoulders[i].bit;
@@ -170,15 +169,19 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     }
 
     // Front touch screen: the cursor goes where the finger is and follows a
-    // drag (K, 2026-11-20). It only moves the cursor; clicks stay on R and
-    // Cross. Same edge rule as the stick: without L it stops 2 px short.
+    // drag (K, 2026-11-20). Same edge rule as the stick: without L it stops 2 px short.
     if (!g_grid && p.touch) {
         const double m = L ? 0 : kEdgeGuard;
         double x = p.tx, y = p.ty;
         x = x < m ? m : x > 639 - m ? 639 - m : x; y = y < m ? m : y > 479 - m ? 479 - m : y;
         if ((int)x != (int)g_fx || (int)y != (int)g_fy) move_to((int)x, (int)y);
         g_fx = x; g_fy = y;
+        // Touch clicks too (K, build 20): finger down = left button down where
+        // it landed, finger up = release. A tap is a click (two quick taps a
+        // double click), and moving while touching drags a selection box.
+        if (!g_touch_btn && !g_lbtn) { lbutton(true); g_touch_btn = true; }
     }
+    if (!p.touch && g_touch_btn) { lbutton(false); g_touch_btn = false; }
 
     // Cursor from the right stick (not while the grid owns it).
     if (!g_grid && !p.touch) {
@@ -222,9 +225,6 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     }
 
     g_sh_owned &= ~released;
-    // D-pad down: right click, held as long as the button is (K, build 19).
-    if ((pressed & PAD_DOWN) && !g_rbtn) { g_r_owner = PAD_DOWN; rbutton(true); }
-    if ((released & PAD_DOWN) && g_r_owner == PAD_DOWN) { rbutton(false); g_r_owner = 0; }
 
     // Face buttons.
     struct Face { uint32_t bit; uint32_t plain, with_l, digit; };
@@ -238,7 +238,7 @@ void input_tick(const Pad& p, uint64_t dt_us) {
             if (b & PAD_LEFT) {                                                  // D-pad left (Ctrl held) + face: Ctrl+1-4
                 if (!g_down[VK_CONTROL]) key(VK_CONTROL, true);
                 key(f.digit, true); g_face_key[i] = f.digit;
-            } else if (b & kBtnGrid) {                                           // D-pad up + face: 1-4 (K, build 16)
+            } else if (b & kBtnNum) {                                            // D-pad down + face: 1-4 (K, build 20)
                 const bool ctrl = g_down[VK_CONTROL];
                 if (ctrl) key(VK_CONTROL, false);
                 key(f.digit, true); g_face_key[i] = f.digit | (ctrl ? 0x100 : 0);

@@ -45,16 +45,17 @@ Logs are written to `ux0:data/StarCraft/` (`scvita_log.txt`, `scvita_progress.tx
 
 | Input | Action |
 |---|---|
-| Right stick / touch screen | Cursor (L held: faster, and edge scrolling) |
+| Right stick | Cursor (L held: faster, and edge scrolling) |
+| Touch screen | Cursor under the finger; tap = left click, touch and move = drag a selection box |
 | Left stick | Scroll the map |
-| R | Left click (L+R: right click) |
-| D-pad down | Right click |
+| R | Left click |
+| L+R | Right click |
 | Cross | A (attack) |
 | Square | S (L: H) |
 | Triangle | R (L: G) |
 | Circle | P (L: R) |
 | D-pad left (hold) + Cross/Square/Triangle/Circle/L/R | Ctrl+1 to 6 (assign group) |
-| D-pad up (hold) + Cross/Square/Triangle/Circle/L/R | 1 to 6 (select group) |
+| D-pad down (hold) + Cross/Square/Triangle/Circle/L/R | 1 to 6 (select group) |
 | D-pad up (hold) + right stick + R | Click a cell of the 3x3 command card |
 | D-pad right | Space |
 | Start / L+Start | F10 (menu) / Escape |
