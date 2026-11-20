@@ -24,7 +24,7 @@ if [ "${TARGET:-}" = vita ]; then
     vita-elf-create "$OUT/scvita.elf" "$OUT/scvita.velf"
     vita-make-fself "$OUT/scvita.velf" "$OUT/eboot.bin"
     # ATTRIBUTE2=12: the extended user memory budget (no DMR), for K's 304 MiB.
-    vita-mksfoex -s TITLE_ID=SCVITA001 -d ATTRIBUTE2=12 "StarCraft (scvita)" "$OUT/sce_sys/param.sfo"
+    vita-mksfoex -s TITLE_ID=SCVITA001 -s STITLE="StarCraft Vita" -d ATTRIBUTE2=12 "StarCraft Vita" "$OUT/sce_sys/param.sfo"
     [ -f "$ROOT/sce_sys/icon0.png" ] && cp "$ROOT/sce_sys/icon0.png" "$OUT/sce_sys/icon0.png"
     ( cd "$OUT" && vita-pack-vpk -s sce_sys/param.sfo -b eboot.bin \
         $( [ -f sce_sys/icon0.png ] && echo "-a sce_sys/icon0.png=sce_sys/icon0.png" ) scvita.vpk )
