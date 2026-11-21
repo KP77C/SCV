@@ -12,6 +12,7 @@
 //
 // W3_RES=WxH sets the size the game renders at (default 800x600 on the host).
 #include "sc_host.h"
+#include "sc_input.h"
 
 #include "runtime/guest_scratch.h"
 #include "runtime/guest_str.h"
@@ -121,6 +122,7 @@ uint32_t guest_string(Cpu& c, const std::string& s) {
 void install_gl(d2rt::Bridge& br) {
     if (const char* r = std::getenv("W3_RES")) { unsigned w, h; if (std::sscanf(r, "%ux%u", &w, &h) == 2) { g_w = w; g_h = h; } }
     set_default_window_size((int)g_w, (int)g_h);
+    input_set_screen((int)g_w, (int)g_h);
     // ---- pixel formats (GDI32) ----------------------------------------------
     // One format: 32-bit RGBA, 24-bit depth, 8-bit stencil, double buffered.
     auto fill_pfd = [](Cpu& c, uint32_t p) {

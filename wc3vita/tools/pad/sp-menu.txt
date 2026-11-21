@@ -1,0 +1,25 @@
+# WarCraft III host test: main menu -> Single Player -> new profile "Vita" (800x600 coordinates).
+0 0 128 128 128 128
+60 goto 680 145
+61 goto 683 141
+63 touch 683 141
+65 untouch
+90 goto 112 218
+91 goto 110 216
+92 touch 110 216
+94 untouch
+97 text Vita
+100 goto 256 218
+101 goto 254 216
+102 touch 254 216
+104 untouch
+# Single Player menu -> Custom Game
+115 goto 682 382
+116 goto 680 380
+117 touch 680 380
+119 untouch
+# Custom Game (Booty Bay, 1v1 vs Computer Normal) -> Start Game
+235 goto 690 494
+236 goto 688 492
+237 touch 688 492
+239 untouch

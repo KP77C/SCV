@@ -44,6 +44,7 @@ bool input_grid_active(int* cell);
 
 // Test scripts only: put the cursor at x,y (sends a mouse move).
 void input_warp(int x, int y);
+void input_set_screen(int w, int h);   // cursor bounds = the game's screen size
 
 // L+Select asks the platform for its on-screen keyboard.
 bool input_take_ime_request();

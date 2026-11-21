@@ -35,6 +35,7 @@ constexpr uint32_t VK_RETURN = 0x0D, VK_CONTROL = 0x11, VK_SPACE = 0x20, VK_LEFT
 uint8_t  g_down[256];            // key-state table (1 = down)
 uint32_t g_prev = 0;             // previous buttons
 bool     g_lbtn = false, g_rbtn = false;
+int kMaxX = 639, kMaxY = 479;      // screen size - 1 (input_set_screen: the game's render resolution)
 uint32_t g_r_owner = 0;          // which input holds the right mouse button (PAD_R or PAD_CROSS)
 uint32_t g_face_key[16];         // key a face button pressed, so release matches press
 bool     g_ctrl_by_dpad = false;
@@ -83,7 +84,7 @@ uint32_t mk() {
 uint32_t xy() { uint32_t x, y; wx86_get_cursor(&x, &y); return (y << 16) | (x & 0xFFFF); }
 void mouse(uint32_t msg) { post_input(msg, mk(), xy()); }
 void move_to(int x, int y) {
-    x = x < 0 ? 0 : x > 639 ? 639 : x; y = y < 0 ? 0 : y > 479 ? 479 : y;
+    x = x < 0 ? 0 : x > kMaxX ? kMaxX : x; y = y < 0 ? 0 : y > kMaxY ? kMaxY : y;
     uint32_t ox, oy; wx86_get_cursor(&ox, &oy);
     if ((int)ox == x && (int)oy == y) return;
     wx86_set_cursor((uint32_t)x, (uint32_t)y);
@@ -131,6 +132,8 @@ void input_text(const std::string& s) {
     for (unsigned char ch : s) if (ch >= 0x20 && ch < 0x7F) post_input(WM_CHAR, ch, 1);
 }
 
+void input_set_screen(int w, int h) { if (w > 1 && h > 1) { kMaxX = w - 1; kMaxY = h - 1; } }
+
 void input_warp(int x, int y) { move_to(x, y); g_fx = x; g_fy = y; }
 
 void input_tick(const Pad& p, uint64_t dt_us) {
@@ -173,7 +176,7 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     if (!g_grid && p.touch) {
         const double m = L ? 0 : kEdgeGuard;
         double x = p.tx, y = p.ty;
-        x = x < m ? m : x > 639 - m ? 639 - m : x; y = y < m ? m : y > 479 - m ? 479 - m : y;
+        x = x < m ? m : x > kMaxX - m ? kMaxX - m : x; y = y < m ? m : y > kMaxY - m ? kMaxY - m : y;
         if ((int)x != (int)g_fx || (int)y != (int)g_fy) move_to((int)x, (int)y);
         g_fx = x; g_fy = y;
         // Touch clicks too (K, build 20): finger down = left button down where
@@ -195,15 +198,15 @@ void input_tick(const Pad& p, uint64_t dt_us) {
             const double speed = (L ? 1400.0 : 560.0) * dt;   // px per second at full deflection
             g_fx += x * std::fabs(x) * speed; g_fy += y * std::fabs(y) * speed;
             const double m = L ? 0 : kEdgeGuard;
-            g_fx = g_fx < m ? m : g_fx > 639 - m ? 639 - m : g_fx; g_fy = g_fy < m ? m : g_fy > 479 - m ? 479 - m : g_fy;
+            g_fx = g_fx < m ? m : g_fx > kMaxX - m ? kMaxX - m : g_fx; g_fy = g_fy < m ? m : g_fy > kMaxY - m ? kMaxY - m : g_fy;
             move_to((int)g_fx, (int)g_fy);
         } else if (!L) {
             // Edge scrolling only while L is held (K, 2026-11-20): when L is let
             // go with the cursor on an edge, step it back inside.
             uint32_t cx, cy; wx86_get_cursor(&cx, &cy);
             const int m = (int)kEdgeGuard;
-            const int nx = (int)cx < m ? m : (int)cx > 639 - m ? 639 - m : (int)cx;
-            const int ny = (int)cy < m ? m : (int)cy > 479 - m ? 479 - m : (int)cy;
+            const int nx = (int)cx < m ? m : (int)cx > kMaxX - m ? kMaxX - m : (int)cx;
+            const int ny = (int)cy < m ? m : (int)cy > kMaxY - m ? kMaxY - m : (int)cy;
             if (nx != (int)cx || ny != (int)cy) { move_to(nx, ny); g_fx = nx; g_fy = ny; }
         }
     }
