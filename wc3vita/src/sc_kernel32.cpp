@@ -465,7 +465,7 @@ static uint32_t read_chunked(Cpu& c, uint32_t buf, uint32_t n, F&& rd) {
 std::string guest_stack(Cpu& c) {
     const uint32_t E = c.reg(d2rt::R_ESP);
     std::string chain;
-    for (uint32_t k = 0; k < 96 && chain.size() < 400; ++k) {
+    for (uint32_t k = 0; k < 1024 && chain.size() < 900; ++k) {
         uint32_t v = c.read_u32(E + 4 * k);
         auto it = g_modbase.upper_bound(v);
         if (it == g_modbase.begin()) continue;

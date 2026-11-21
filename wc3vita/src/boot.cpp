@@ -333,7 +333,13 @@ int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: %s <game-dir> [max-unshimmed]\n", argv[0]); return 2; }
     g_root = argv[1];
     if (argc > 2) g_max_unshimmed = std::atoi(argv[2]);
+    // SC_FPSCR=hex: run with the Vita's floating-point mode (flush-to-zero,
+    // default NaN) to compare against the console.
+    if (const char* fp = std::getenv("SC_FPSCR")) { uint32_t v = (uint32_t)std::strtoul(fp, nullptr, 16); asm volatile("vmsr fpscr, %0" :: "r"(v)); }
 #endif
+    // The ARM floating-point mode the guest's x87/SSE code runs under: the
+    // Vita's default may differ from Linux's (flush-to-zero, default NaN).
+    { uint32_t fpscr; asm volatile("vmrs %0, fpscr" : "=r"(fpscr)); log("[not-bound] fpscr 0x%08x", fpscr); }
 
     // The game's archives, with their sizes: a short or damaged copy (a
     // transfer cut off part way) shows up here before it shows up as an error.
@@ -438,6 +444,7 @@ int main(int argc, char** argv) {
             if (e.cpu) log("[RAM-bound]   stack:%s", sc::guest_stack(*e.cpu).c_str());
             if (e.kind == WX86_MEM_VA_FAIL) {   // full, or fragmented? and who holds it
                 static int dumps = 0;
+                if (e.cpu && dumps < 2) sc::trace_report(*e.cpu);   // the biggest Storm allocators so far
                 if (dumps++ < 2) {
                     std::vector<std::pair<uint32_t, uint32_t>> v;
                     for (auto& b : g_va.used_map()) v.push_back({ b.second, b.first });
@@ -512,6 +519,7 @@ int main(int argc, char** argv) {
     static_files.clear();
     if (!br.link(err))   { log("[not-bound] [cause: link error] link: %s", err.c_str()); return 1; }
     log("[not-bound] linked: %u imports routed to the catch-all shim", br.unresolved_count());
+    sc::install_w3_trace(*cpu, br);
     if (std::getenv("W3_LIST_UNBOUND")) {     // name every import with no shim and no loaded module
         for (const char* m : { kExeName, "Game.dll", "Storm.dll", "MSVCR120.dll", "MSVCP120.dll", "mss32.dll", "ijl15.dll" })
             if (d2rt::PeImage* pi = br.module(m))
