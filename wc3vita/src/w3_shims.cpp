@@ -232,6 +232,20 @@ void seed_registry() {
     reg_seed_dword(k + "\\video", "resheight", h);
     reg_seed_dword(k + "\\video", "colordepth", 32);
     reg_seed_dword(k + "\\video", "refreshrate", 60);
+    // Build 6: switch once to the game's lowest detail settings (host profile,
+    // Booty Bay frames 900-1200: Game.dll ran 19% fewer instructions per frame
+    // than with the game's defaults). A marker records that it was done, so
+    // what the player picks later in Options > Video is kept.
+    // W3_KEEP_DETAIL=1 skips it.
+    const std::string mk = "hkcu\\software\\w3vita";
+    const char* keep = std::getenv("W3_KEEP_DETAIL");
+    if (!reg_has(mk, "lowdetail6") && !(keep && *keep == '1')) {
+        for (const char* n : { "animquality", "lights", "occlusion", "particles", "spellfilter",
+                               "texquality", "unitshadows", "modeldetail" })
+            reg_seed_dword(k + "\\video", n, 0);
+        reg_seed_dword(mk, "lowdetail6", 1);
+        log("[not-bound] video: lowest detail settings set once (raise them in Options > Video; W3_KEEP_DETAIL=1 skips)");
+    }
 }
 
 // ---- hot trivial imports as guest x86 ---------------------------------------
@@ -280,6 +294,28 @@ void inline_hot_imports() {
     for (const Stub& st : stubs) n += g_br->repatch_import("KERNEL32.dll", st.name, st.va);
     static int said = 0;
     if (said++ < 4) log("[not-bound] inline imports: GetLastError/SetLastError/TlsGetValue/TlsSetValue as guest code at %d import slots", n);
+}
+
+// Data patches to a module right after it loads.
+//
+// Game.dll picks the Miles mixing rate from a two-entry table (22050, 44100)
+// and uses the 44100 entry. Miles mixes every voice, filter and the music in
+// software on the guest core, per output sample: the build 5 log on K's Vita
+// put the sound thread at ~17% of that core. At 22050 the mix costs about
+// half; the game's sound effects are 22 kHz recordings, so only the music
+// loses its top octave. W3_AUDIO_HZ=44100 keeps the original rate.
+void patch_module(const std::string& name, uint32_t base) {
+    if (name != "game.dll" || !g_cpu) return;
+    gl_install_filters(*g_cpu);
+    const uint32_t tab = base + 0x961ac8;   // RVA of the rate table in 1.27a's Game.dll
+    const char* e = std::getenv("W3_AUDIO_HZ");
+    const uint32_t want = e && std::atoi(e) > 0 ? (uint32_t)std::atoi(e) : 22050u;
+    if (g_cpu->read_u32(tab) != 22050u || g_cpu->read_u32(tab + 4) != 44100u) {
+        log("[not-bound] [cause: unknown Game.dll] sound rate table not found; Miles mixes at the game's own rate");
+        return;
+    }
+    if (want != 44100u) g_cpu->write_u32(tab + 4, want);
+    log("[not-bound] sound: Miles mixes at %u Hz (game default 44100; W3_AUDIO_HZ)", want);
 }
 
 void install_w3(d2rt::Bridge& br) {

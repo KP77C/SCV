@@ -22,6 +22,7 @@
 #include "runtime/guest_str.h"
 #include "runtime/host_clock.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -69,12 +70,83 @@ double   D(Cpu& c, int k) { uint64_t u = (uint64_t)c.arg(k) | ((uint64_t)c.arg(k
 template <class T = void>
 T*       P(Cpu& c, uint32_t va) { return va ? (T*)c.hostptr(va, 1) : nullptr; }
 
+// W3_GLSTAT=1: per entry point, calls and REDUNDANT calls (arguments, and
+// for pointer arguments the data, equal to that entry's previous call; for
+// glEnable/glDisable and the client states, the state already set). Logged
+// with the 5 s line. Measures what a filter in front of the GL could save.
+struct GlStat { std::string name; uint32_t argc; uint64_t calls = 0, same = 0; uint32_t last[9] = {}; uint64_t lasth = 0; };
+std::vector<GlStat*> g_stats;
+const bool g_glstat = std::getenv("W3_GLSTAT") != nullptr;
+std::map<uint32_t, bool> g_caps;          // glEnable/glDisable state (unit-tagged for GL_TEXTURE_2D)
+uint32_t g_unit = 0, g_cunit = 0;          // active / client-active texture unit (GL_TEXTURE0 = 0)
+uint64_t data_hash(Cpu& c, uint32_t va, uint32_t n) {
+    const uint8_t* p = va ? (const uint8_t*)c.hostptr(va, n) : nullptr;
+    uint64_t h = 1469598103934665603ull;
+    if (p) for (uint32_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+bool redundant(GlStat& st, Cpu& c) {
+    const std::string& n = st.name;
+    if (n == "glEnable" || n == "glDisable" || n == "glEnableClientState" || n == "glDisableClientState") {
+        const bool on = n == "glEnable" || n == "glEnableClientState";
+        const bool client = n.find("Client") != std::string::npos;
+        uint32_t key = c.arg(0);
+        if (key == GL_TEXTURE_2D) key |= g_unit << 24;
+        if (client && key == GL_TEXTURE_COORD_ARRAY) key |= g_cunit << 24;
+        if (client) key |= 0x80000000u;
+        auto it = g_caps.find(key);
+        const bool same = it != g_caps.end() && it->second == on;
+        g_caps[key] = on;
+        return same;
+    }
+    if (n == "glActiveTextureARB") g_unit = c.arg(0) - GL_TEXTURE0;
+    if (n == "glClientActiveTextureARB") g_cunit = c.arg(0) - GL_TEXTURE0;
+    uint64_t h = 0;
+    if (n == "glLightfv" || n == "glMaterialfv") h = data_hash(c, c.arg(2), 16);
+    else if (n == "glLightModelfv" || n == "glFogfv") h = data_hash(c, c.arg(1), 16);
+    else if (n == "glLoadMatrixf") h = data_hash(c, c.arg(0), 64);
+    bool same = h == st.lasth;
+    const uint32_t k = st.argc < 9 ? st.argc : 9;
+    for (uint32_t i = 0; i < k; ++i) { same = same && st.last[i] == c.arg(i); st.last[i] = c.arg(i); }
+    st.lasth = h;
+    return same && st.calls > 1;
+}
+void glstat_line() {
+    if (!g_glstat) return;
+    std::vector<GlStat*> v = g_stats;
+    std::sort(v.begin(), v.end(), [](GlStat* a, GlStat* b) { return a->calls > b->calls; });
+    std::string line; char b[96];
+    for (size_t i = 0; i < v.size() && i < 24 && v[i]->calls; ++i) {
+        std::snprintf(b, sizeof b, " %s=%llu(%llu%% same)", v[i]->name.c_str() + 2, (unsigned long long)v[i]->calls,
+                      (unsigned long long)(v[i]->same * 100 / v[i]->calls));
+        line += b;
+    }
+    log("[not-bound] gl calls (5s):%s", line.c_str());
+    for (GlStat* s : g_stats) { s->calls = 0; s->same = 0; }
+}
+
+// Texture units are set lazily (see the filters below): the game's
+// glActiveTextureARB / glClientActiveTextureARB only write a guest record,
+// and the unit the GL really has is brought in line before any GL call.
+uint32_t g_rec_act = 0, g_rec_cact = 0;       // the records (guest VAs); 0 = filters off
+uint32_t g_gl_act = GL_TEXTURE0, g_gl_cact = GL_TEXTURE0;   // what the GL has now
+inline void sync_units(Cpu& c) {
+    if (!g_rec_act || !g_current) return;
+    const uint32_t a = c.read_u32(g_rec_act), ca = c.read_u32(g_rec_cact);
+    if (a != g_gl_act && a != 0xFFFFFFFFu) { glActiveTexture(a); g_gl_act = a; }
+    if (ca != g_gl_cact && ca != 0xFFFFFFFFu) { glClientActiveTexture(ca); g_gl_cact = ca; }
+}
+
 void G(d2rt::Bridge& br, const char* name, uint32_t argc, std::function<uint32_t(Cpu&)> fn) {
+    if (g_glstat) {
+        GlStat* st = new GlStat; st->name = name; st->argc = argc; g_stats.push_back(st);
+        fn = [st, f = std::move(fn)](Cpu& c) { ++st->calls; if (redundant(*st, c)) ++st->same; return f(c); };
+    }
     if (std::getenv("W3_TRACE_GL")) {
         std::string t = name;
         fn = [t, f = std::move(fn)](Cpu& c) { uint32_t r = f(c); log("[not-bound] gl %s(%x,%x,%x,%x) -> 0x%x", t.c_str(), c.arg(0), c.arg(1), c.arg(2), c.arg(3), r); return r; };
     }
-    fn = [f = std::move(fn)](Cpu& c) { ++g_calls; return f(c); };
+    fn = [f = std::move(fn)](Cpu& c) { ++g_calls; sync_units(c); return f(c); };
     Shim s; s.fn = std::move(fn); s.argc = argc; s.stdcall_cleanup = true;
     s.tag = std::string("OPENGL32.dll!") + name;
     br.register_shim("OPENGL32.dll", name, s);
@@ -186,6 +258,7 @@ void swap(Cpu& c) {
             (unsigned long long)frames, (unsigned long long)(g_calls - last_calls),
             (unsigned long long)(g_draws - last_draws), (unsigned long long)(g_tris - last_tris));
         frames = 0; t0 = now; last_calls = g_calls; last_draws = g_draws; last_tris = g_tris;
+        glstat_line();
     }
 #ifdef __vita__
     vglSwapBuffers(present_ime_open() ? GL_TRUE : GL_FALSE);   // GL_TRUE also draws the keyboard dialog
@@ -209,6 +282,215 @@ void gl_render_size(uint32_t* w, uint32_t* h) {
     static bool read = false;
     if (!read) { read = true; read_render_size(); }
     *w = g_w; *h = g_h;
+}
+
+// ---- redundant-call filters, as guest x86 ------------------------------------
+// Every GL call the game makes leaves the translated code for a shim: a
+// dispatcher exit, the bridge, and the way back in, which costs far more
+// than most of these calls do in vitaGL. WarCraft III sets much of its state
+// again each time it draws (W3_GLSTAT on the host, Booty Bay: most client
+// array switches, glEnable/glDisable and glMatrixMode calls set what is
+// already set). A short x86 stub in front of such an entry point compares
+// the call with what was last set and returns at once when it changes
+// nothing; the translator compiles it inline with the caller. Any other call
+// updates the stub's record and jumps on to the shim.
+//
+// The record mirrors the GL exactly because nothing else changes that state:
+// the game has no glPushAttrib/glPopAttrib, and the port's own command-card
+// overlay puts back everything it changes. W3_GL_FILTER=0 turns this off.
+namespace {
+struct X86 {
+    std::vector<uint8_t> b;
+    void u8(uint8_t v) { b.push_back(v); }
+    void u32(uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back((uint8_t)(v >> (8 * i))); }
+    void mov_eax_arg(int k) { u8(0x8B); u8(0x44); u8(0x24); u8((uint8_t)(4 + 4 * k)); }    // mov eax,[esp+4+4k]
+    void cmp_eax_mem(uint32_t a) { u8(0x3B); u8(0x05); u32(a); }                           // cmp eax,[a]
+    void cmp_eax_mem_ecx(uint32_t a) { u8(0x3B); u8(0x81); u32(a); }                       // cmp eax,[ecx+a]
+    void mov_mem_eax(uint32_t a) { u8(0xA3); u32(a); }                                     // mov [a],eax
+    void mov_mem_ecx_eax(uint32_t a) { u8(0x89); u8(0x81); u32(a); }                       // mov [ecx+a],eax
+    size_t jne32() { u8(0x0F); u8(0x85); u32(0); return b.size(); }                       // patched by bind()
+    void bind(size_t at) { const uint32_t rel = (uint32_t)(b.size() - at); std::memcpy(&b[at - 4], &rel, 4); }
+    void ret(uint32_t argc) { if (argc) { u8(0xC2); u8((uint8_t)(4 * argc)); u8(0); } else u8(0xC3); }
+    void jmp(uint32_t from_va, uint32_t to) { u8(0xE9); u32(to - (from_va + (uint32_t)b.size() + 4)); }
+    // ecx = (unit & 1) * 16, the unit from an active-texture record
+    void ecx_unit16(uint32_t rec) { u8(0x8B); u8(0x0D); u32(rec); u8(0x83); u8(0xE1); u8(0x01); u8(0xC1); u8(0xE1); u8(0x04); }
+};
+std::map<std::string, uint32_t> g_filters;   // entry point -> stub VA
+std::map<std::string, uint32_t> g_recs;      // entry point -> its record (same-argument stubs)
+uint32_t g_caps_tab = 0, g_client_tab = 0;    // glEnable/glDisable and client-state tables
+
+uint32_t put_stub(Cpu& c, X86& x) {
+    const uint32_t va = wx86_scratch_alloc((uint32_t)x.b.size() + 16);
+    if (va) c.write(va, x.b.data(), (uint32_t)x.b.size());
+    return va;
+}
+uint32_t record(Cpu& c, uint32_t words) {
+    const uint32_t va = wx86_scratch_alloc(words * 4);
+    if (va) for (uint32_t i = 0; i < words; ++i) c.write_u32(va + 4 * i, 0xFFFFFFFFu);   // matches no real call
+    return va;
+}
+// Same arguments as the previous call (per texture unit when `unit_rec`).
+uint32_t same_args_stub(Cpu& c, const char* name, uint32_t argc, uint32_t unit_rec = 0, uint32_t* rec_out = nullptr) {
+    const uint32_t trap = g_br->shim_trap("OPENGL32.dll", name);
+    const uint32_t rec = record(c, unit_rec ? 8 : 4);
+    if (!trap || !rec) return 0;
+    if (rec_out) *rec_out = rec;
+    g_recs[name] = rec;
+    // Two passes: the jmp's displacement depends on the stub's own address.
+    uint32_t va = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+        X86 x; std::vector<size_t> miss;
+        if (unit_rec) x.ecx_unit16(unit_rec);
+        for (uint32_t k = 0; k < argc; ++k) {
+            x.mov_eax_arg((int)k);
+            if (unit_rec) x.cmp_eax_mem_ecx(rec + 4 * k); else x.cmp_eax_mem(rec + 4 * k);
+            miss.push_back(x.jne32());
+        }
+        x.ret(argc);
+        for (size_t m : miss) x.bind(m);
+        for (uint32_t k = 0; k < argc; ++k) {
+            x.mov_eax_arg((int)k);
+            if (unit_rec) x.mov_mem_ecx_eax(rec + 4 * k); else x.mov_mem_eax(rec + 4 * k);
+        }
+        x.jmp(va, trap);
+        if (pass == 0) { va = wx86_scratch_alloc((uint32_t)x.b.size() + 16); if (!va) return 0; }
+        else c.write(va, x.b.data(), (uint32_t)x.b.size());
+    }
+    return va;
+}
+// glEnable/glDisable (and the client-state pair): one table of 64 (key, on)
+// entries shared by the pair; the key is the capability, with the texture
+// unit for the per-unit ones. A collision only costs a call.
+uint32_t cap_stub(Cpu& c, const char* name, uint32_t on, uint32_t table, uint32_t per_unit_cap, uint32_t unit_rec) {
+    const uint32_t trap = g_br->shim_trap("OPENGL32.dll", name);
+    if (!trap || !table) return 0;
+    uint32_t va = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+        X86 x;
+        x.mov_eax_arg(0);                                                     // eax = cap
+        x.u8(0x3D); x.u32(per_unit_cap);                                      // cmp eax, per_unit_cap
+        x.u8(0x75); x.u8(0x0C);                                               // jne +12
+        x.u8(0x8B); x.u8(0x0D); x.u32(unit_rec);                              // mov ecx,[unit_rec]   (6)
+        x.u8(0xC1); x.u8(0xE1); x.u8(0x10);                                   // shl ecx,16           (3)
+        x.u8(0x0B); x.u8(0xC1);                                               // or eax,ecx           (2)
+        x.u8(0x90);                                                           // nop                  (1)
+        x.u8(0x69); x.u8(0xC8); x.u32(0x9E3779B1u);                           // imul ecx,eax,golden
+        x.u8(0xC1); x.u8(0xE9); x.u8(26);                                     // shr ecx,26 -> 0..63
+        x.u8(0x3B); x.u8(0x04); x.u8(0xCD); x.u32(table);                     // cmp eax,[table+ecx*8]
+        const size_t m1 = x.jne32();
+        x.u8(0x83); x.u8(0x3C); x.u8(0xCD); x.u32(table + 4); x.u8((uint8_t)on);  // cmp dword [table+4+ecx*8], on
+        const size_t m2 = x.jne32();
+        x.ret(1);
+        x.bind(m1); x.bind(m2);
+        x.u8(0x89); x.u8(0x04); x.u8(0xCD); x.u32(table);                     // mov [table+ecx*8],eax
+        x.u8(0xC7); x.u8(0x04); x.u8(0xCD); x.u32(table + 4); x.u32(on);      // mov dword [table+4+ecx*8], on
+        x.jmp(va, trap);
+        if (pass == 0) { va = wx86_scratch_alloc((uint32_t)x.b.size() + 16); if (!va) return 0; }
+        else c.write(va, x.b.data(), (uint32_t)x.b.size());
+    }
+    return va;
+}
+uint32_t cap_table(Cpu& c) {
+    const uint32_t t = wx86_scratch_alloc(64 * 8);
+    if (t) for (uint32_t i = 0; i < 64 * 2; ++i) c.write_u32(t + 4 * i, 0);   // key 0 is no capability
+    return t;
+}
+}  // namespace
+
+void gl_install_filters(Cpu& c) {
+    static const bool off = [] { const char* e = std::getenv("W3_GL_FILTER"); return e && e[0] == '0'; }();
+    if (off || !g_br || !g_filters.empty()) return;
+    // Texture-unit records first: the per-unit stubs read them.
+    // The game switches units around nearly every texture call (in game ~600
+    // switches of each kind a frame, most of them undone before any call that
+    // depends on the unit): the stubs only record the unit, never trap, and
+    // sync_units() applies it when a GL call is actually made.
+    for (auto [n, out] : { std::pair<const char*, uint32_t*>{ "glActiveTextureARB", &g_rec_act },
+                           std::pair<const char*, uint32_t*>{ "glClientActiveTextureARB", &g_rec_cact } }) {
+        const uint32_t rec = record(c, 4);
+        if (!rec) return;
+        X86 x; x.mov_eax_arg(0); x.mov_mem_eax(rec); x.ret(1);
+        g_filters[n] = put_stub(c, x);
+        if (!g_filters[n]) return;
+        g_recs[n] = rec;
+        *out = rec;
+    }
+    {   GLint a = GL_TEXTURE0, ca = GL_TEXTURE0;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &a); glGetIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &ca);
+        g_gl_act = (uint32_t)a; g_gl_cact = (uint32_t)ca; }
+    for (auto& [n, argc] : std::vector<std::pair<const char*, uint32_t>>{
+             { "glMatrixMode", 1 }, { "glBlendFunc", 2 }, { "glAlphaFunc", 2 }, { "glDepthFunc", 1 }, { "glDepthMask", 1 },
+             { "glVertexPointer", 4 }, { "glNormalPointer", 3 }, { "glColorPointer", 4 }, { "glScissor", 4 } })
+        g_filters[n] = same_args_stub(c, n, argc);
+    // (Not glBindTexture: deleting a bound texture unbinds it behind the record.)
+    if (g_rec_act && g_rec_cact) {
+        g_filters["glTexEnvi"] = same_args_stub(c, "glTexEnvi", 3, g_rec_act);
+        g_filters["glTexCoordPointer"] = same_args_stub(c, "glTexCoordPointer", 4, g_rec_cact);
+        const uint32_t caps = cap_table(c), client = cap_table(c);
+        g_caps_tab = caps; g_client_tab = client;
+        g_filters["glEnable"] = cap_stub(c, "glEnable", 1, caps, GL_TEXTURE_2D, g_rec_act);
+        g_filters["glDisable"] = cap_stub(c, "glDisable", 0, caps, GL_TEXTURE_2D, g_rec_act);
+        g_filters["glEnableClientState"] = cap_stub(c, "glEnableClientState", 1, client, GL_TEXTURE_COORD_ARRAY, g_rec_cact);
+        g_filters["glDisableClientState"] = cap_stub(c, "glDisableClientState", 0, client, GL_TEXTURE_COORD_ARRAY, g_rec_cact);
+    }
+    {   // Pure no-ops in this port: no trap at all.
+        X86 l; l.ret(2); g_filters["glLockArraysEXT"] = put_stub(c, l);
+        X86 u; u.ret(0); g_filters["glUnlockArraysEXT"] = put_stub(c, u);
+    }
+    int slots = 0, stubs = 0;
+    for (auto& [n, va] : g_filters) {
+        if (!va) continue;
+        ++stubs;
+        slots += g_br->repatch_import("OPENGL32.dll", n, va);
+    }
+    log("[not-bound] GL filters: %d stubs, %d import slots (W3_GL_FILTER=0 turns them off)", stubs, slots);
+}
+
+// W3_GL_FILTER_CHECK=1 (host test): at every draw, compare what the stubs'
+// records claim with the GL's real state; a mismatch means a filter would
+// have dropped a call that mattered.
+void gl_check_filters(Cpu& c) {
+#ifdef __vita__
+    (void)c;   // host test only (vitaGL has no glGet for some of this state)
+#else
+    static const bool on = std::getenv("W3_GL_FILTER_CHECK") != nullptr;
+    if (!on || g_filters.empty()) return;
+    static uint64_t checks = 0, bad = 0;
+    auto rec = [&](const char* n, int k) -> uint32_t { auto it = g_recs.find(n); return it == g_recs.end() ? 0xFFFFFFFFu : c.read_u32(it->second + 4 * k); };
+    auto geti = [](GLenum e) { GLint v = 0; glGetIntegerv(e, &v); return (uint32_t)v; };
+    auto expect = [&](const char* what, uint32_t claimed, uint32_t real) {
+        if (claimed == 0xFFFFFFFFu || claimed == real) return;
+        if (bad++ < 30) log("[not-bound] GL filter MISMATCH %s: record 0x%x, GL 0x%x (draw check %llu)", what, claimed, real, (unsigned long long)checks);
+    };
+    ++checks;
+    const uint32_t act = geti(GL_ACTIVE_TEXTURE), cact = geti(GL_CLIENT_ACTIVE_TEXTURE);
+    expect("active texture", rec("glActiveTextureARB", 0), act);
+    expect("client active texture", rec("glClientActiveTextureARB", 0), cact);
+    expect("matrix mode", rec("glMatrixMode", 0), geti(GL_MATRIX_MODE));
+    expect("blend src", rec("glBlendFunc", 0), geti(GL_BLEND_SRC));
+    expect("blend dst", rec("glBlendFunc", 1), geti(GL_BLEND_DST));
+    expect("depth func", rec("glDepthFunc", 0), geti(GL_DEPTH_FUNC));
+    { GLboolean m = 0; glGetBooleanv(GL_DEPTH_WRITEMASK, &m); const uint32_t r = rec("glDepthMask", 0);
+      expect("depth mask", r == 0xFFFFFFFFu ? r : (uint32_t)(r != 0), (uint32_t)(m != 0)); }
+    expect("alpha func", rec("glAlphaFunc", 0), geti(GL_ALPHA_TEST_FUNC));
+    { GLvoid* p = nullptr; glGetPointerv(GL_VERTEX_ARRAY_POINTER, &p); const uint32_t r = rec("glVertexPointer", 3);
+      expect("vertex pointer", r == 0xFFFFFFFFu ? r : (uint32_t)(uintptr_t)P(c, r), (uint32_t)(uintptr_t)p);
+      expect("vertex stride", rec("glVertexPointer", 2), geti(GL_VERTEX_ARRAY_STRIDE)); }
+    auto tab = [&](uint32_t t, bool client) {
+        for (uint32_t i = 0; t && i < 64; ++i) {
+            const uint32_t key = c.read_u32(t + 8 * i), st = c.read_u32(t + 8 * i + 4);
+            if (!key) continue;
+            const uint32_t cap = key & 0xFFFF, unit = key >> 16;
+            if (unit) { if (client) glClientActiveTexture(unit); else glActiveTexture(unit); }
+            const uint32_t real = glIsEnabled(cap) ? 1u : 0u;
+            if (unit) { if (client) glClientActiveTexture(cact); else glActiveTexture(act); }
+            char w[48]; std::snprintf(w, sizeof w, "%s 0x%x unit 0x%x", client ? "client state" : "cap", cap, unit);
+            expect(w, st, real);
+        }
+    };
+    tab(g_caps_tab, false); tab(g_client_tab, true);
+    if (checks % 20000 == 0) log("[not-bound] GL filter check: %llu draws checked, %llu mismatches", (unsigned long long)checks, (unsigned long long)bad);
+#endif
 }
 
 void install_gl(d2rt::Bridge& br) {
@@ -247,7 +529,8 @@ void install_gl(d2rt::Bridge& br) {
     G(br, "wglSwapLayerBuffers", 2, [](Cpu& c) { swap(c); return 1u; });
     G(br, "wglGetProcAddress", 1, [](Cpu& c) -> uint32_t {
         std::string n = wx86_gread_mb(c, c.arg(0), -1);
-        uint32_t t = g_br->shim_trap("OPENGL32.dll", n);
+        auto f = g_filters.find(n);
+        uint32_t t = f != g_filters.end() && f->second ? f->second : g_br->shim_trap("OPENGL32.dll", n);
         log("[not-bound] wglGetProcAddress(%s) -> 0x%08x", n.c_str(), t);
         return t;
     });
@@ -338,6 +621,7 @@ void install_gl(d2rt::Bridge& br) {
     G(br, "glTexCoordPointer", 4, [](Cpu& c) { glTexCoordPointer((GLint)c.arg(0), c.arg(1), (GLsizei)c.arg(2), P(c, c.arg(3))); return 0u; });
     G(br, "glDrawElements", 4, [](Cpu& c) {
         ++g_draws; if (c.arg(0) == GL_TRIANGLES) g_tris += c.arg(1) / 3;
+        gl_check_filters(c);
         glDrawElements(c.arg(0), (GLsizei)c.arg(1), c.arg(2), P(c, c.arg(3)));
         return 0u;
     });

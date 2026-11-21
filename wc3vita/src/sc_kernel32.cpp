@@ -295,6 +295,7 @@ uint32_t load_library(Cpu& c, const std::string& name) {
     g_modkey[lb] = lb; g_modbase[pi->load_base()] = lb;
     mark_writable_sections_impl(c, pi->load_base(), bytes, lb);
     inline_hot_imports();   // the new module's own TLS / last-error imports
+    patch_module(lb, pi->load_base());
     log("[not-bound] LoadLibraryA(%s) -> 0x%08x", name.c_str(), pi->load_base());
     if (lb == "smackw32.dll" && std::getenv("SC_TRACE_SMK")) {
         // Debug: observe Smacker's sound-service routine (entry = base+0x8e20,

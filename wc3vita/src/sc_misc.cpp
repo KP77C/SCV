@@ -189,6 +189,10 @@ void reg_default_dword(const std::string& key, const std::string& name, uint32_t
     if (k != g_vals.end() && k->second.count(n)) return;
     reg_seed_dword(key, name, v);
 }
+bool reg_has(const std::string& key, const std::string& name) {
+    auto k = g_vals.find(lower(key));
+    return k != g_vals.end() && k->second.count(lower(name));
+}
 void reg_seed_sz(const std::string& key, const std::string& name, const std::string& v) {
     std::string p = lower(key), n = lower(name);
     std::vector<uint8_t> d(v.begin(), v.end()); d.push_back(0);

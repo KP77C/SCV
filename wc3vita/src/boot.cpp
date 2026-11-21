@@ -344,6 +344,13 @@ int main(int argc, char** argv) {
     // The ARM floating-point mode the guest's x87/SSE code runs under: the
     // Vita's default may differ from Linux's (flush-to-zero, default NaN).
     { uint32_t fpscr; asm volatile("vmrs %0, fpscr" : "=r"(fpscr)); log("[not-bound] fpscr 0x%08x", fpscr); }
+    {   // What one clock read costs: every timer shim and the shim profiler pay it.
+        volatile uint64_t sink = 0;
+        const uint64_t a = wx86_now_us();
+        for (int i = 0; i < 4096; ++i) sink = sink + wx86_now_us();
+        const uint64_t b = wx86_now_us();
+        log("[not-bound] clock read: %.3f us each (4096 in %llu us)", (double)(b - a) / 4096.0, (unsigned long long)(b - a));
+    }
 
     // The game's archives, with their sizes: a short or damaged copy (a
     // transfer cut off part way) shows up here before it shows up as an error.

@@ -209,7 +209,7 @@ private:
                       // happen. Only the INCREMENT is conditional.
                       uint64_t tls_calls = 0, tls_traps = 0; };
     // Snapshot of each slot's prof_ns at the last prof_window() call (for windowing).
-    std::vector<uint64_t> prof_prev_;
+    std::vector<uint64_t> prof_prev_, prof_prev_calls_;
 
     Cpu* cpu_;
     std::vector<Mod> mods_;

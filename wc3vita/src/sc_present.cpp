@@ -132,9 +132,22 @@ extern "C" { extern uint64_t dyn86_jp_created, dyn86_jp_invalid; }
 // Host profiling (engine built with -DD2_EMITPROF): W3_EPCSV=<file> writes
 // every translated block's execution count every 300 frames.
 extern "C" void d2ep_csv(const char* path) __attribute__((weak));
+extern "C" void d2ep_dump(const char* path, int topn) __attribute__((weak));
+extern "C" void d2ep_report(void (*out)(const char*)) __attribute__((weak));
 static void present_pump(d2rt::Cpu& c) {
     static const char* epcsv = std::getenv("W3_EPCSV");
     if (epcsv && d2ep_csv && g_frames && g_frames % 300 == 0) d2ep_csv(epcsv);
+    // W3_EPDUMP=<file>: the emitted ARM of the 200 costliest blocks, at frame 1200.
+    static const char* epdump = std::getenv("W3_EPDUMP");
+    if (epdump && d2ep_dump && g_frames == 1200) {
+        d2ep_dump(epdump, 200);
+        if (d2ep_report) d2ep_report([](const char* l) { log("[not-bound] ep: %s", l); });
+    }
+    // Host: which shims the frames call, and how often (PROF_COUNTERS engines).
+    if (g_br && g_frames && g_frames % 300 == 0) {
+        char line[2048];
+        if (g_br->prof_window(line, sizeof line, 16) > 0) log("[not-bound] shim time (300 frames):%s", line);
+    }
     uint64_t now = wx86_now_us();
     start_stall_watch();
     ++g_frames; ++g_win_frames;

@@ -13,6 +13,7 @@
 // ---- D2_NATPROF: per-slot time -------------------------------------------
 extern "C" {
     int d2rt_natprof = 0;                       // read in commit()
+    uint32_t d2rt_prof_every = 32;              // WX86_PROF_EVERY, read in commit()
     extern int d2rt_wakeprof;                   // D2_WAKEPROF (sched_native.cpp)
 }
 namespace {
@@ -331,6 +332,7 @@ bool Bridge::commit(std::string& err) {
     { const char* w = std::getenv("WX86_WAKEPROF"); if (!w) w = std::getenv("D2_WAKEPROF"); d2rt_wakeprof = (w && *w && *w != '0') ? 1 : 0;
       if (d2rt_wakeprof)
           wx86_vita_progress_c("wakeprof: ARME — latence pthread_cond_signal -> reprise du fil"); }
+    { const char* e = std::getenv("WX86_PROF_EVERY"); if (e && std::atoi(e) > 0) d2rt_prof_every = (uint32_t)std::atoi(e); }
     { const char* e = std::getenv("WX86_NATPROF"); if (!e) e = std::getenv("D2_NATPROF"); d2rt_natprof = (e && *e && *e != '0') ? 1 : 0;
       g_natprof_bridge = this;
       if (d2rt_natprof) wx86_vita_progress_c("natprof: ARME — temps par creneau publie par fenetre (cout ~5 %)"); }
@@ -480,7 +482,16 @@ bool Bridge::trap_handler(Cpu& cpu, uint32_t trap_va) {
               std::memcpy(ref, cur, 24);
           } } }
 #ifdef PROF_COUNTERS
-    uint64_t t0 = prof::now_ns();
+    // Shim timing is SAMPLED once a slot is hot: its first 1024 calls are
+    // all timed (rare, slow calls such as LoadLibrary stay exact), then one
+    // call in d2rt_prof_every, its time scaled up. Every call is counted. On
+    // the Vita a clock read is a kernel call (~1.3 us), and WarCraft III
+    // crosses into shims ~70k times a second: two reads around each crossing
+    // took ~18% of the guest core, more than most of the shims themselves.
+    const uint64_t prof_n = slot->prof_calls++;
+    const uint32_t prof_w = prof_n < 1024 ? 1u : d2rt_prof_every;
+    const bool prof_timed = prof_w == 1 || prof_n % prof_w == 0;
+    uint64_t t0 = prof_timed ? prof::now_ns() : 0;
 #endif
     // GIL observability (§19): name the shim body currently running. This
     // runs under the GIL (trap-dispatch gil::Guard), so the write is the
@@ -505,9 +516,11 @@ bool Bridge::trap_handler(Cpu& cpu, uint32_t trap_va) {
         std::fprintf(stderr,"[tag %llu] %s -> eax=0x%08x\n",
             (unsigned long long)tn, slot->shim.tag.c_str(), eax); }
 #ifdef PROF_COUNTERS
-    uint64_t dt = prof::now_ns() - t0;
-    slot->prof_calls++; slot->prof_ns += dt;
-    prof::trap_calls++;  prof::trap_ns += dt;
+    if (prof_timed) {
+        const uint64_t dt = (prof::now_ns() - t0) * prof_w;
+        slot->prof_ns += dt; prof::trap_ns += dt;
+    }
+    prof::trap_calls++;
 #endif
     // Simulate `ret [imm]`: pop retaddr; for stdcall also pop argc dwords.
     uint32_t esp_add = 4;                              // pop return address
@@ -551,10 +564,14 @@ int Bridge::prof_window(char* out, unsigned n, int topk) {
     if (!out || !n) return 0;
     out[0] = 0;
     if (prof_prev_.size() < slots_.size()) prof_prev_.resize(slots_.size(), 0);
+    if (prof_prev_calls_.size() < slots_.size()) prof_prev_calls_.resize(slots_.size(), 0);
     std::vector<std::pair<uint64_t, size_t>> v;
+    std::vector<uint64_t> calls(slots_.size(), 0);
     for (size_t i = 0; i < slots_.size(); ++i) {
         const uint64_t d = slots_[i].prof_ns - prof_prev_[i];
         prof_prev_[i] = slots_[i].prof_ns;
+        calls[i] = slots_[i].prof_calls - prof_prev_calls_[i];
+        prof_prev_calls_[i] = slots_[i].prof_calls;
         if (d) v.emplace_back(d, i);
     }
     std::sort(v.begin(), v.end(),
@@ -564,8 +581,9 @@ int Bridge::prof_window(char* out, unsigned n, int topk) {
     for (const auto& p : v) {
         if (k++ >= topk) break;
         const char* t = slots_[p.second].tagc ? slots_[p.second].tagc : "?";
-        const int w = std::snprintf(out + off, n - off, " %s=%llums",
-                                    t, (unsigned long long)(p.first / 1000000ull));
+        const int w = std::snprintf(out + off, n - off, " %s=%llums/%llu",
+                                    t, (unsigned long long)(p.first / 1000000ull),
+                                    (unsigned long long)calls[p.second]);
         if (w <= 0 || (unsigned)w >= n - off) break;
         off += (unsigned)w;
     }
