@@ -76,6 +76,7 @@ void inline_hot_imports();               // TLS / last-error imports as guest x8
 void patch_module(const std::string& name, uint32_t base);   // data patches to a module just loaded (w3_shims.cpp)
 void mp3_install(d2rt::Cpu& c, uint32_t base);                 // w3_mp3.cpp: native MP3 for Mp3dec.asi
 void mp3_stats(uint64_t* opens, uint64_t* frames);
+void softfloat_install(d2rt::Cpu& c, uint32_t base);           // w3_softfloat.cpp: Game.dll float routines served natively
 // Per-frame GL counters for the spike report (w3_gl.cpp): read and cleared.
 // The display lock: vblanks per frame from SC_FPS (60, 30, 20 or 15). WarCraft
 // III defaults to a steady 15 fps (K, 2026-11-21: an RTS is fine at 15 if it
@@ -89,6 +90,8 @@ struct GlFrameStats { uint32_t sub_n = 0, sub_bytes = 0, sub_us = 0, img_n = 0, 
 void gl_frame_stats(GlFrameStats* out);
 uint64_t trace_opens();                                // Storm file opens so far (w3_trace.cpp)
 void gl_install_filters(d2rt::Cpu& c);   // redundant-GL-call stubs in front of the shims (w3_gl.cpp)
+void gl_install_fast(d2rt::Cpu& c);      // hot GL shims called straight from translated code (w3_gl.cpp)
+uint64_t gl_fast_calls();
 void install_dshow(d2rt::Bridge& br);    // stand-in DirectShow graph (w3_dshow.cpp)
 void set_default_window_size(int w, int h);   // CW_USEDEFAULT window size (sc_user32.cpp)
 std::string guest_stack(d2rt::Cpu& c);       // " module+0xoff ..." return addresses on the guest stack

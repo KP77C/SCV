@@ -308,6 +308,8 @@ void patch_module(const std::string& name, uint32_t base) {
     if (name == "mp3dec.asi" && g_cpu) { mp3_install(*g_cpu, base); return; }
     if (name != "game.dll" || !g_cpu) return;
     gl_install_filters(*g_cpu);
+    softfloat_install(*g_cpu, base);
+    gl_install_fast(*g_cpu);
     const uint32_t tab = base + 0x961ac8;   // RVA of the rate table in 1.27a's Game.dll
     const char* e = std::getenv("W3_AUDIO_HZ");
     const uint32_t want = e && std::atoi(e) > 0 ? (uint32_t)std::atoi(e) : 22050u;

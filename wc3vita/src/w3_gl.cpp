@@ -21,8 +21,12 @@
 #include "runtime/win32_shims_gdi32.h"
 #include "runtime/guest_str.h"
 #include "runtime/host_clock.h"
+#include "runtime/gil.h"
+#include "dynarec86/dyn86_intrin.h"
 
 #include <algorithm>
+#include <array>
+#include <utility>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -453,6 +457,73 @@ void gl_install_filters(Cpu& c) {
     }
     log("[not-bound] GL filters: %d stubs, %d import slots (W3_GL_FILTER=0 turns them off)", stubs, slots);
 }
+
+// ---- GL fast calls ------------------------------------------------------------
+// Each GL call the filters let through still leaves the translated code at a
+// trap slot: dispatcher exit, the run loop, the bridge, the shim, and back in
+// through the jump table (~2,800 times a frame in a fight). The translator can
+// instead call a native helper right where a block starts (dyn86_intrin.h),
+// and a trap slot is such a block start: registering a helper at the slot's
+// VA makes the call a plain native call from translated code, with the
+// stdcall RET done by the translator. The helper runs the very same shim
+// function the bridge would have run (the G() wrapper and its unit sync
+// included); returning 0 instead falls back to the normal trap.
+// W3_GLFAST=0 turns this off.
+namespace {
+constexpr int kFastMax = 40;
+struct FastGl { std::function<uint32_t(Cpu&)> fn; const char* name; uint64_t n; };
+FastGl g_fast[kFastMax];
+int g_fast_n = 0;
+bool g_fast_ok = true;      // cleared if the helper ever sees a CPU it does not expect
+uint64_t g_fast_checks = 0;
+
+template <int I>
+int gl_fast(void* emu, uint32_t esp) {
+    if (!g_fast_ok || dyn86_intrin_on != 1 || d2rt::gil::active()) return 0;
+    dyn86_intrin_setreg(emu, 4, esp);            // Cpu::arg() reads the call's stack through ESP
+    if (g_fast_checks < 256) {                   // the shim must see this very call's frame
+        ++g_fast_checks;
+        if (g_cpu->reg(d2rt::R_ESP) != esp) {
+            g_fast_ok = false;
+            log("[not-bound] [cause: GL fast call] the shim sees another CPU state; fast calls off");
+            return 0;
+        }
+    }
+    ++g_fast[I].n;
+    dyn86_intrin_setreg(emu, 0, g_fast[I].fn(*g_cpu));
+    return 1;
+}
+template <int... I>
+constexpr std::array<dyn86_intrin_fn, sizeof...(I)> fast_table(std::integer_sequence<int, I...>) { return { &gl_fast<I>... }; }
+const auto kFastFns = fast_table(std::make_integer_sequence<int, kFastMax>{});
+}  // namespace
+
+void gl_install_fast(Cpu&) {
+    const char* e = std::getenv("W3_GLFAST");
+    if ((e && e[0] == '0') || !g_br || g_fast_n) return;
+    static const char* const kNames[] = {
+        "glDrawElements", "glLightfv", "glLightf", "glVertexPointer", "glTexCoordPointer", "glNormalPointer",
+        "glColorPointer", "glLoadMatrixf", "glMatrixMode", "glBindTexture", "glMaterialfv", "glEnable", "glDisable",
+        "glEnableClientState", "glDisableClientState", "glTexEnvi", "glBlendFunc", "glAlphaFunc", "glDepthMask",
+        "glDepthFunc", "glNormal3fv", "glColor4f", "glColor4ub", "glColor4fv", "glTexParameteri", "glScissor",
+        "glViewport", "glPushMatrix", "glPopMatrix", "glLoadIdentity", "glMultMatrixf", "glFogfv", "glFogf",
+        "glPolygonOffset", "glCullFace", "glFrontFace", "glTexEnvf", "glTexEnvfv", "glDrawArrays" };
+    int n = 0;
+    for (const char* name : kNames) {
+        if (g_fast_n >= kFastMax) break;
+        const uint32_t trap = g_br->shim_trap_existing("OPENGL32.dll", name);
+        const d2rt::Shim* s = g_br->find_shim("OPENGL32.dll", name);
+        if (!trap || !s || !s->fn || !s->stdcall_cleanup) continue;
+        FastGl& f = g_fast[g_fast_n];
+        f.fn = s->fn; f.name = name; f.n = 0;
+        if (!dyn86_intrin_add(trap, kFastFns[g_fast_n], (uint16_t)(4 * s->argc), 0, DYN86_IR_AX, name)) { f.fn = nullptr; continue; }
+        ++g_fast_n; ++n;
+    }
+    if (n) dyn86_intrin_on = 1;
+    log("[not-bound] GL fast calls: %d entry points called straight from translated code (W3_GLFAST=0 turns this off)", n);
+}
+
+uint64_t gl_fast_calls() { uint64_t t = 0; for (int i = 0; i < g_fast_n; ++i) t += g_fast[i].n; return t; }
 
 // W3_GL_FILTER_CHECK=1 (host test): at every draw, compare what the stubs'
 // records claim with the GL's real state; a mismatch means a filter would

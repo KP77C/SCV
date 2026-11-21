@@ -341,6 +341,15 @@ int main(int argc, char** argv) {
     // Miles refills WarCraft III's mixer ring from a timer thread that goes
     // longer than the rule's 300 ms at console frame rates.
     setenv("WX86_SON_STALE_MS", "0", 0);
+    // Translator speedups the Diablo II port ran with (its boot code armed
+    // them; this engine left them off): return-address prediction for
+    // CALL/RET (+6.8% on that console), the block-budget check moved out of
+    // the block entry, the memory base folded into absolute addresses, and
+    // chained POPs sharing one address. Each can be set to 0 in env.txt.
+    setenv("WX86_CALLRET", "1", 0);
+    setenv("WX86_BUDGETTAIL", "1", 0);
+    setenv("WX86_MMUFOLD", "1", 0);
+    setenv("WX86_MMUSTACK", "1", 0);
     // The ARM floating-point mode the guest's x87/SSE code runs under: the
     // Vita's default may differ from Linux's (flush-to-zero, default NaN).
     { uint32_t fpscr; asm volatile("vmrs %0, fpscr" : "=r"(fpscr)); log("[not-bound] fpscr 0x%08x", fpscr); }

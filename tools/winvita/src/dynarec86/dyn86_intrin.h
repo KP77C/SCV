@@ -107,7 +107,7 @@ typedef struct dyn86_intrin_s {
     unsigned long long served;  /* of which served (calls - served = fallbacks) */
 } dyn86_intrin_t;
 
-#define DYN86_INTRIN_MAX 16
+#define DYN86_INTRIN_MAX 64   /* WarCraft III: 5 float routines + ~25 GL entry points */
 
 /* 0 = nothing emitted (default, byte-for-byte the original code)
  * 1 = serve natively

@@ -10,7 +10,7 @@
 set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 WX="${WINX86:-$ROOT/../tools/winvita}"
-SRCS="$ROOT/src/boot.cpp $ROOT/src/sc_kernel32.cpp $ROOT/src/sc_misc.cpp $ROOT/src/sc_user32.cpp $ROOT/src/sc_ddraw.cpp $ROOT/src/sc_present.cpp $ROOT/src/sc_present_vita.cpp $ROOT/src/sc_input.cpp $ROOT/src/dx_shims.cpp $ROOT/src/w3_shims.cpp $ROOT/src/w3_gl.cpp $ROOT/src/w3_mp3.cpp $ROOT/src/w3_dshow.cpp $ROOT/src/w3_net.cpp $ROOT/src/w3_trace.cpp"
+SRCS="$ROOT/src/boot.cpp $ROOT/src/sc_kernel32.cpp $ROOT/src/sc_misc.cpp $ROOT/src/sc_user32.cpp $ROOT/src/sc_ddraw.cpp $ROOT/src/sc_present.cpp $ROOT/src/sc_present_vita.cpp $ROOT/src/sc_input.cpp $ROOT/src/dx_shims.cpp $ROOT/src/w3_shims.cpp $ROOT/src/w3_gl.cpp $ROOT/src/w3_mp3.cpp $ROOT/src/w3_dshow.cpp $ROOT/src/w3_net.cpp $ROOT/src/w3_trace.cpp $ROOT/src/w3_softfloat.cpp"
 
 if [ "${TARGET:-}" = vita ]; then
     export VITASDK="${VITASDK:-/usr/local/vitasdk}"; export PATH="$VITASDK/bin:$PATH"

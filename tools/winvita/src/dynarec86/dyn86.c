@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
+#include <stdio.h>
 
 #include "dyn86.h"
 #include "bridge.h"          /* table hasAlternate/getAlternate (alt_table.c) */
@@ -128,6 +129,28 @@ void dyn86_init(void)
         const char* f = getenv("WX86_FRAMEPROF"); if (!f) f = getenv("D2_FRAMEPROF");
         dyn86_jitprof = ((e && e[0] && e[0] != '0') || (f && f[0] && f[0] != '0')) ? 1 : 0;
         if (dyn86_jitprof) { jp_calibrate(); dyn86_jp_epoch_us = dyn86_jp_now_us(); }
+    }
+    /* Translator knobs (contracts at their definitions above and in
+     * shim/debug.h). The Diablo II port armed these from its own boot code
+     * (tools/rt_boot.cpp), which this engine does not have, so here they sat
+     * at 0 for every game. Read them once, before the first translation, so
+     * an application (or env.txt) can choose. WX86_<name>, or the original
+     * D2_<name>. Unset = the defaults above, i.e. the original code. */
+    {
+        static const struct { const char* wx; const char* d2; int* v; } k[] = {
+            { "WX86_CALLRET",    "D2_CALLRET",    &box86_dynarec_callret },
+            { "WX86_BUDGETTAIL", "D2_BUDGETTAIL", &box86_dynarec_budgettail },
+            { "WX86_FORWARD",    "D2_FORWARD",    &box86_dynarec_forward },
+            { "WX86_MMUFOLD",    "D2_MMUFOLD",    &dyn86_mmufold },
+            { "WX86_MMUSTACK",   "D2_MMUSTACK",   &dyn86_mmustack },
+        };
+        for (unsigned i = 0; i < sizeof k / sizeof k[0]; ++i) {
+            const char* s = getenv(k[i].wx); if (!s) s = getenv(k[i].d2);
+            if (s && *s) *k[i].v = (int)strtol(s, NULL, 0);
+        }
+        fprintf(stderr, "[dyn86] translator: callret=%d budgettail=%d forward=%d mmufold=%d mmustack=%d\n",
+                box86_dynarec_callret, box86_dynarec_budgettail, box86_dynarec_forward,
+                dyn86_mmufold, dyn86_mmustack);
     }
 }
 
