@@ -48,6 +48,7 @@
 extern "C" {
 extern uint64_t dyn86_jp_run_us, dyn86_jp_lookup_miss, dyn86_jp_created, dyn86_jp_recompiles, dyn86_jp_invalid, dyn86_jp_x86_insns, dyn86_sync_us;
 }
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -249,6 +250,11 @@ struct WaitSlot { std::atomic<uint32_t> type{0}; std::atomic<int> uid{0}; std::a
 WaitSlot g_waits[6];
 std::atomic<int> g_quit{0};
 std::atomic<bool> g_wipe_bars{false};
+// The last 4096 samples in order (the spike report reads one frame's worth):
+// a guest EIP, or kSampReady / kSampWait when the guest thread was not running.
+constexpr uint32_t kRing = 4096, kSampReady = 0xFFFFFFF1u, kSampWait = 0xFFFFFFF2u;
+uint32_t g_ring[kRing]; std::atomic<uint32_t> g_ring_n{0};
+void ring_push(uint32_t v) { const uint32_t i = g_ring_n.load(std::memory_order_relaxed); g_ring[i & (kRing - 1)] = v; g_ring_n.store(i + 1, std::memory_order_release); }
 void dx_sample_eip();
 int sampler_main(SceSize, void*) {
     wx86_vita_pin_self(SCE_KERNEL_CPU_MASK_USER_2, nullptr);
@@ -259,9 +265,9 @@ int sampler_main(SceSize, void*) {
         if (sceKernelGetThreadInfo(g_main_thread, &ti) < 0) continue;
         if (ti.status & SCE_THREAD_RUNNING) dx_sample_eip();
         if (ti.status & SCE_THREAD_RUNNING) g_st_run++;
-        else if (ti.status & SCE_THREAD_READY) g_st_ready++;
+        else if (ti.status & SCE_THREAD_READY) { g_st_ready++; ring_push(kSampReady); }
         else if (ti.status & SCE_THREAD_WAITING) {
-            g_st_wait++;
+            g_st_wait++; ring_push(kSampWait);
             int i = 0;
             for (; i < 6; ++i) if (g_waits[i].n.load() && g_waits[i].uid.load() == (int)ti.waitId && g_waits[i].type.load() == ti.waitType) break;
             if (i == 6) for (i = 0; i < 6; ++i) if (!g_waits[i].n.load()) { g_waits[i].uid = (int)ti.waitId; g_waits[i].type = ti.waitType; break; }
@@ -326,6 +332,7 @@ constexpr uint32_t kTrapLo = 0x0E900000u, kTrapHi = 0x0EA00000u;   // boot.cpp k
 void dx_sample_eip() {
     if (!g_ip) return;
     const uint32_t ip = *g_ip;
+    ring_push(ip);
     hot_add(ip);
     const int n = g_nmods.load();
     for (int i = 0; i < n; ++i) if (ip >= g_mods[i].lo && ip < g_mods[i].hi) { g_msamp[i]++; return; }
@@ -629,6 +636,59 @@ void window_report(uint64_t now) {
     g_win.clk_main = cm; g_win.clk_disp = cd;
 }
 
+// Spike report: a GL frame that takes over 2.5 times the median of the last
+// 31 (and at least 60 ms) is logged with where the guest was during it (the
+// sampler's EIPs), the blocks the JIT translated, Storm file opens and the
+// real texture uploads. At most 150 lines a run.
+void spike_check(uint64_t dt) {
+    static uint64_t hist[31]; static uint32_t nh = 0, ring_at = 0, lines = 0;
+    static uint64_t p_jit = 0, p_opens = 0; static uint32_t p_draws = 0;
+    const uint32_t ring_now = g_ring_n.load(std::memory_order_acquire);
+    GlFrameStats fs; gl_frame_stats(&fs);
+    const uint64_t jit = dyn86_jp_created, opens = trace_opens();
+    uint64_t srt[31]; const uint32_t k = nh < 31 ? nh : 31;
+    std::memcpy(srt, hist, k * sizeof srt[0]); std::sort(srt, srt + k);
+    const uint64_t med = k ? srt[k / 2] : 0;
+    if (k >= 15 && dt > med * 5 / 2 && dt > med + 60000 && lines < 150) {
+        ++lines;
+        struct B { uint32_t key, n; } b[96]; uint32_t nb = 0, tot = 0, ready = 0, wait = 0;
+        const uint32_t from = ring_now - ring_at > kRing ? ring_now - kRing : ring_at;
+        for (uint32_t i = from; i != ring_now; ++i) {
+            const uint32_t v = g_ring[i & (kRing - 1)]; ++tot;
+            if (v == kSampReady) { ++ready; continue; }
+            if (v == kSampWait) { ++wait; continue; }
+            const uint32_t key = (v >= kTrapLo && v < kTrapHi) ? (v & ~15u) | 1u : v >> 6; uint32_t j = 0;   // traps: by slot
+            for (; j < nb; ++j) if (b[j].key == key) { ++b[j].n; break; }
+            if (j == nb && nb < 96) b[nb++] = { key, 1 };
+        }
+        if (!tot) tot = 1;
+        char line[700];
+        int o = std::snprintf(line, sizeof line, "spike: %llu ms (median %llu ms), %u samples, waiting %u%%, ready %u%%; JIT %llu new blocks; %llu file opens; "
+            "texture uploads %u (%u KiB, %u ms), new images %u (%u KiB, %u ms), %u draws; where:",
+            (unsigned long long)(dt / 1000), (unsigned long long)(med / 1000), tot, wait * 100 / tot, ready * 100 / tot,
+            (unsigned long long)(jit - p_jit), (unsigned long long)(opens - p_opens),
+            fs.sub_n, fs.sub_bytes >> 10, fs.sub_us / 1000, fs.img_n, fs.img_bytes >> 10, fs.img_us / 1000, fs.draws - p_draws);
+        const int n = g_nmods.load();
+        for (int pass = 0; pass < 8 && o < (int)sizeof line - 48; ++pass) {
+            uint32_t best = nb;
+            for (uint32_t j = 0; j < nb; ++j) if (b[j].n && (best == nb || b[j].n > b[best].n)) best = j;
+            if (best == nb) break;
+            if (b[best].key & 1u) {   // a shim's trap slot
+                const char* tag = g_br ? g_br->trap_tag(b[best].key & ~15u) : nullptr;
+                o += std::snprintf(line + o, sizeof line - o, " %s %u%%", tag ? tag : "trap", b[best].n * 100 / tot);
+                b[best].n = 0; continue;
+            }
+            const uint32_t ip = b[best].key << 6;
+            const char* nm = "?"; uint32_t off = ip;
+            for (int i = 0; i < n; ++i) if (ip >= g_mods[i].lo && ip < g_mods[i].hi) { nm = g_mods[i].name; off = ip - g_mods[i].lo; }
+            o += std::snprintf(line + o, sizeof line - o, " %s+%x %u%%", nm, off, b[best].n * 100 / tot);
+            b[best].n = 0;
+        }
+        log("[not-bound] %s", line);
+    }
+    hist[nh++ % 31] = dt; ring_at = ring_now; p_jit = jit; p_opens = opens; p_draws = fs.draws;
+}
+
 void ime_step() {
     int st = g_ime_state.load();
     if (st == 1) {
@@ -807,6 +867,7 @@ void present(d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t
         if (last_swap) {
             const uint64_t dt = now - last_swap, budget = 16667u * g_interval + 1500u;
             ++g_win.frames; if (dt > budget) ++g_win.misses; if (dt > g_win.worst_us) g_win.worst_us = dt;
+            spike_check(dt);
         }
         last_swap = now;
         window_report(now);

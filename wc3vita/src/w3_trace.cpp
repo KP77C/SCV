@@ -153,6 +153,7 @@ bool hook(Cpu& cpu, d2rt::Bridge& br, d2rt::PeImage* storm, uint32_t ord, const 
 }  // namespace
 
 void trace_report(Cpu& c) { heartbeat(c, true); }
+uint64_t trace_opens() { return g_open_n; }
 
 // Memory line for the 10 s report (any thread: no hook state is read).
 void trace_mem_line() {

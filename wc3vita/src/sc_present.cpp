@@ -22,6 +22,7 @@
 #include "runtime/host_clock.h"
 #include "runtime/ds_emul.h"
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -149,6 +150,24 @@ static void present_pump(d2rt::Cpu& c) {
         if (g_br->prof_window(line, sizeof line, 16) > 0) log("[not-bound] shim time (300 frames):%s", line);
     }
     uint64_t now = wx86_now_us();
+    // W3_SPIKE=1 (host, with WX86_NATPROF=1): a frame that takes over twice the
+    // median of the last 31 is logged with the shims it spent time in and the
+    // blocks it translated, to find one-off stalls (a unit appearing, say).
+    static const bool spike = std::getenv("W3_SPIKE") && std::getenv("WX86_NATPROF");
+    if (spike && g_last_us) {
+        static uint64_t hist[31]; static unsigned nh = 0; static uint64_t pj = 0;
+        static char buf[8192];
+        const uint64_t dt = now - g_last_us, nj = dyn86_jp_created - pj; pj = dyn86_jp_created;
+        d2rt_natprof_lines(buf, sizeof buf, 10);   // also resets the per-frame window
+        GlFrameStats fs; gl_frame_stats(&fs);
+        uint64_t s[31]; unsigned k = nh < 31 ? nh : 31; std::memcpy(s, hist, k * sizeof s[0]);
+        std::sort(s, s + k);
+        if (k >= 15 && dt > 2 * s[k / 2])
+            log("[not-bound] spike: frame %llu took %llu ms (median %llu), %llu blocks translated, texture uploads %u (%u KiB), new images %u (%u KiB); shims:\n%s",
+                (unsigned long long)g_frames, (unsigned long long)(dt / 1000), (unsigned long long)(s[k / 2] / 1000),
+                (unsigned long long)nj, fs.sub_n, fs.sub_bytes >> 10, fs.img_n, fs.img_bytes >> 10, buf);
+        hist[nh++ % 31] = dt;
+    }
     start_stall_watch();
     ++g_frames; ++g_win_frames;
     if (!g_win_start) g_win_start = now;

@@ -59,8 +59,9 @@ uint32_t g_w = 960, g_h = 544;
 uint32_t g_w = 800, g_h = 600;
 #endif
 bool     g_current = false;
-uint64_t g_calls = 0, g_draws = 0, g_tris = 0;
-uint64_t g_sub_kept = 0, g_sub_calls = 0, g_sub_skips = 0, g_sub_skip_bytes = 0;   // texture upload dedupe (below)
+uint64_t g_calls = 0, g_draws = 0, g_tris = 0, g_swaps = 0;
+uint64_t g_sub_kept = 0, g_sub_calls = 0, g_sub_skips = 0, g_sub_skip_bytes = 0;
+GlFrameStats g_fs;   // this frame's real texture uploads (spike report)   // texture upload dedupe (below)
 #ifndef __vita__
 OSMesaContext g_ctx = nullptr;
 std::vector<uint8_t> g_fb;
@@ -251,6 +252,7 @@ void draw_card_overlay() {
 
 void swap(Cpu& c) {
     draw_card_overlay();
+    ++g_swaps;
     static uint64_t frames = 0, t0 = 0, last_calls = 0, last_draws = 0, last_tris = 0;
     ++frames;
     uint64_t now = wx86_now_us(); if (!t0) t0 = now;
@@ -513,6 +515,11 @@ uint32_t g_tex_bound[2] = { 0, 0 };   // texture bound to GL_TEXTURE_2D on units
 struct SubCopy { uint32_t level, x, y, w, h, fmt, type; std::vector<uint8_t> bytes; };
 std::map<uint32_t, std::vector<SubCopy>> g_sub_copies;   // by texture name
 const bool g_dedup_on = [] { const char* e = std::getenv("W3_TEX_DEDUP"); return !(e && *e == '0'); }();
+// Level-0 size of each texture (from glTexImage2D), for W3_TSI_LOG=1: logs the
+// first 400 sub-image uploads that are not repeats, with the texture's size.
+struct TexSize { uint32_t w = 0, h = 0, levels = 0; };
+std::map<uint32_t, TexSize> g_tex_size;
+const bool g_tsi_log = [] { const char* e = std::getenv("W3_TSI_LOG"); return e && *e == '1'; }();
 
 uint32_t texel_bytes(uint32_t fmt, uint32_t type) {
     uint32_t comps = 0;
@@ -574,6 +581,11 @@ bool sub_repeats(Cpu& c, uint32_t target, uint32_t level, uint32_t x, uint32_t y
     return false;
 }
 }  // namespace
+
+void gl_frame_stats(GlFrameStats* out) {
+    *out = g_fs; out->draws = (uint32_t)g_draws;   // draws: running total (the caller takes the difference)
+    g_fs = GlFrameStats();
+}
 
 void install_gl(d2rt::Bridge& br) {
     { uint32_t w, h; gl_render_size(&w, &h); }   // W3_RES -> g_w, g_h
@@ -701,14 +713,31 @@ void install_gl(d2rt::Bridge& br) {
 #endif
     G(br, "glTexImage2D", 9, [](Cpu& c) {
         if (c.arg(0) == GL_TEXTURE_2D) sub_forget(g_tex_bound[(g_gl_act - GL_TEXTURE0) & 1]);
+        if (g_tsi_log && c.arg(0) == GL_TEXTURE_2D) {
+            TexSize& t = g_tex_size[g_tex_bound[(g_gl_act - GL_TEXTURE0) & 1]];
+            if (c.arg(1) == 0) { t.w = c.arg(3); t.h = c.arg(4); t.levels = 1; } else if (c.arg(1) + 1 > t.levels) t.levels = c.arg(1) + 1;
+        }
+        const uint64_t t0 = wx86_now_us();
         glTexImage2D(c.arg(0), (GLint)c.arg(1), (GLint)c.arg(2), (GLsizei)c.arg(3), (GLsizei)c.arg(4), (GLint)c.arg(5),
                      c.arg(6), c.arg(7), P(c, c.arg(8)));
+        ++g_fs.img_n; g_fs.img_us += (uint32_t)(wx86_now_us() - t0);
+        g_fs.img_bytes += (c.arg(3) * c.arg(4) * (texel_bytes(c.arg(6), c.arg(7)) ? texel_bytes(c.arg(6), c.arg(7)) : 4));
         return 0u;
     });
     G(br, "glTexSubImage2D", 9, [](Cpu& c) {
         if (sub_repeats(c, c.arg(0), c.arg(1), c.arg(2), c.arg(3), c.arg(4), c.arg(5), c.arg(6), c.arg(7), c.arg(8))) return 0u;
+        if (g_tsi_log) {
+            static int n = 0;
+            const uint32_t tex = g_tex_bound[(g_gl_act - GL_TEXTURE0) & 1];
+            const TexSize& t = g_tex_size[tex];
+            if (n++ < 400) log("[not-bound] tsi: frame %llu tex %u (%ux%u, %u levels) level %u rect %u,%u %ux%u fmt 0x%x type 0x%x",
+                               (unsigned long long)g_swaps, tex, t.w, t.h, t.levels, c.arg(1), c.arg(2), c.arg(3), c.arg(4), c.arg(5), c.arg(6), c.arg(7));
+        }
+        const uint64_t t0 = wx86_now_us();
         glTexSubImage2D(c.arg(0), (GLint)c.arg(1), (GLint)c.arg(2), (GLint)c.arg(3), (GLsizei)c.arg(4), (GLsizei)c.arg(5),
                         c.arg(6), c.arg(7), P(c, c.arg(8)));
+        ++g_fs.sub_n; g_fs.sub_us += (uint32_t)(wx86_now_us() - t0);
+        g_fs.sub_bytes += (c.arg(4) * c.arg(5) * (texel_bytes(c.arg(6), c.arg(7)) ? texel_bytes(c.arg(6), c.arg(7)) : 4));
         return 0u;
     });
 

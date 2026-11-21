@@ -183,6 +183,13 @@ public:
     void redirect_next(uint32_t va);
     uint32_t take_redirect();          // 0 = none (consumes)
     uint32_t sentinel() const { return sentinel_; }
+    // The tag of the shim whose trap slot holds `va` (nullptr if none), to
+    // name trap addresses in sampled profiles. Guest thread only.
+    const char* trap_tag(uint32_t va) const {
+        if (va < trap_base_) return nullptr;
+        const uint32_t idx = (va - trap_base_) / 16;
+        return idx < slots_.size() ? slots_[idx].tagc : nullptr;
+    }
 
 private:
     struct Mod {

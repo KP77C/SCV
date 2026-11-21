@@ -75,6 +75,10 @@ void inline_hot_imports();               // TLS / last-error imports as guest x8
 void patch_module(const std::string& name, uint32_t base);   // data patches to a module just loaded (w3_shims.cpp)
 void mp3_install(d2rt::Cpu& c, uint32_t base);                 // w3_mp3.cpp: native MP3 for Mp3dec.asi
 void mp3_stats(uint64_t* opens, uint64_t* frames);
+// Per-frame GL counters for the spike report (w3_gl.cpp): read and cleared.
+struct GlFrameStats { uint32_t sub_n = 0, sub_bytes = 0, sub_us = 0, img_n = 0, img_bytes = 0, img_us = 0, draws = 0; };
+void gl_frame_stats(GlFrameStats* out);
+uint64_t trace_opens();                                // Storm file opens so far (w3_trace.cpp)
 void gl_install_filters(d2rt::Cpu& c);   // redundant-GL-call stubs in front of the shims (w3_gl.cpp)
 void install_dshow(d2rt::Bridge& br);    // stand-in DirectShow graph (w3_dshow.cpp)
 void set_default_window_size(int w, int h);   // CW_USEDEFAULT window size (sc_user32.cpp)
