@@ -267,9 +267,9 @@ bool make_context(Cpu& c) {
     // rasterises at the final size and nothing is scaled afterwards.
     // RAM: everything already belongs to the guest arena and our heap; leave
     // 24 MiB for the JIT pool to grow into, give vitaGL the rest and all VRAM.
-    if (!vglInitExtended(0x400000, 960, 544, 24 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE)) {
-        log("[not-bound] [cause: vglInitExtended failed]"); return false;
-    }
+    // (vglInitExtended's return value only says whether the resolution had to
+    // fall back; GL_FALSE is the normal case.)
+    vglInitExtended(0x400000, 960, 544, 24 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
     vglWaitVblankStart(GL_TRUE);
     glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT); vglSwapBuffers(GL_FALSE);
     glClear(GL_COLOR_BUFFER_BIT);
