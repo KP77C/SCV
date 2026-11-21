@@ -24,7 +24,7 @@ First Ghidra pass (no missed-function sweep yet): 23,262 functions, 21,434 of th
 | Range in `.text` | Contents | Functions | Bytes |
 |---|---|---|---|
 | `0x12000`-`0x470000` | Engine and game | 17,025 | 3,459,629 |
-| `0x470000`-`0x480000` | CppUnit-style unit tests (not needed) | 276 | 47,236 |
+| `0x470000`-`0x480000` | CppUnit-style unit tests, plus the launch code (`InitEngine`, `MainLoop`, see [boot.md](boot.md)) | 276 | 47,236 |
 | `0x480000`-`0x4d0000` | Havok 2.1.2 (`Tt*`, `hk*`) | 1,040 | 279,345 |
 | `0x4d0000`-`0x500000` | qhull (public source) | 742 | 177,565 |
 | `0x500000`-`0x510000` | C++ runtime (demangler etc.) | 235 | 53,903 |
@@ -43,7 +43,7 @@ After the sweep there are 54,673 functions and 5.30 MB of the 6.04 MB `.text` is
 | Range | Functions | Bytes | Under 16 bytes |
 |---|---|---|---|
 | Engine and game (`0x12000`-`0x470000`, `0x510000`-`0x580000`) | 32,150 | 4,467,951 | 9,094 |
-| Unit tests | 600 | 55,148 | 174 |
+| Unit tests and launch code | 600 | 55,148 | 174 |
 | Havok | 1,727 | 299,323 | 406 |
 | qhull | 833 | 184,521 | 74 |
 | C++ runtime | 437 | 58,390 | 146 |
