@@ -145,7 +145,7 @@ void apply_guest_arrays(Cpu& c) {
     g_real_key = -1;
 }
 
-inline int tsize(uint32_t type) { return type == GL_UNSIGNED_BYTE || type == GL_BYTE ? 1 : type == GL_SHORT || type == GL_UNSIGNED_SHORT ? 2 : type == GL_DOUBLE ? 8 : 4; }
+inline int tsize(uint32_t type) { return type == GL_UNSIGNED_BYTE || type == GL_BYTE ? 1 : type == GL_SHORT || type == GL_UNSIGNED_SHORT ? 2 : type == 0x140A /* GL_DOUBLE */ ? 8 : 4; }
 inline const uint8_t* arr_base(Cpu& c, const Arr& a) { return a.va ? (const uint8_t*)c.hostptr(a.va, 1) : nullptr; }
 inline int arr_stride(const Arr& a) { return a.stride ? a.stride : a.size * tsize(a.type); }
 
