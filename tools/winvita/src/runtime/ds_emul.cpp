@@ -58,6 +58,11 @@ struct Voice {
     uint32_t rate = kRate;
     uint32_t blockAlign = 4;
     bool     primary = false;
+    // DirectSound 3D (WX86_SON_3D=1): position and distances of a 3D voice.
+    bool     is3d = false;
+    int      mode3d = 0;                 // DS3DMODE_NORMAL 0, HEADRELATIVE 1, DISABLE 2
+    float    p3[3] = { 0, 0, 0 };
+    float    minD = 1.0f, maxD = 1e9f;
     bool     playing = false, looping = false;
     bool     alive = false;
     int32_t  volmB = 0, panmB = 0;
@@ -130,6 +135,14 @@ bool              g_built = false;           // vtables written into guest memor
 
 std::mutex        g_mx;                      // small host-side lock (never the GIL)
 std::vector<Voice> g_voices;
+// DirectSound 3D listener (WX86_SON_3D=1).
+struct Listener3D { float pos[3] = { 0, 0, 0 }, front[3] = { 0, 0, 1 }, top[3] = { 0, 1, 0 }, rolloff = 1.0f; };
+Listener3D g_lis;
+bool g_3d = false;
+constexpr uint32_t MAGIC_3DB = 0x42334453u;   // 'DS3B'
+constexpr uint32_t MAGIC_LIS = 0x4C334453u;   // 'DS3L'
+uint32_t g_vt3B[21] = {0}, g_vtLis[18] = {0};
+uint32_t g_vt3Bva = 0, g_vtLisva = 0;
 std::vector<size_t> g_freeVoices;
 // Object slots returned by non-owning voices: their buffer belongs to someone
 // else, so they have nothing to offer ordinary reuse (which picks by
@@ -200,8 +213,30 @@ void recompute_gains(Voice& v) {
     // DSBPAN: > 0 attenuates LEFT, < 0 attenuates RIGHT (DirectSound contract).
     if (v.panmB > 0)      l = (uint32_t)((uint64_t)base * gain_q16(-v.panmB) >> 16);
     else if (v.panmB < 0) r = (uint32_t)((uint64_t)base * gain_q16( v.panmB) >> 16);
+    if (v.is3d && v.mode3d != 2) {
+        // Distance: DirectSound's rolloff, minD / (minD + rolloff * (d - minD)),
+        // d clamped to maxD. Direction: constant-power pan on the listener's
+        // right axis (left-handed: right = top x front).
+        float rel[3];
+        for (int i = 0; i < 3; ++i) rel[i] = v.mode3d == 1 ? v.p3[i] : v.p3[i] - g_lis.pos[i];
+        float d = std::sqrt(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]);
+        float att = 1.0f;
+        const float dd = d < v.maxD ? d : v.maxD;
+        if (dd > v.minD) att = v.minD / (v.minD + g_lis.rolloff * (dd - v.minD));
+        const float* t = g_lis.top; const float* f = g_lis.front;
+        float rx = t[1] * f[2] - t[2] * f[1], ry = t[2] * f[0] - t[0] * f[2], rz = t[0] * f[1] - t[1] * f[0];
+        const float rl = std::sqrt(rx * rx + ry * ry + rz * rz);
+        float pan = 0;
+        if (d > 1e-4f && rl > 1e-6f) pan = (rel[0] * rx + rel[1] * ry + rel[2] * rz) / (d * rl);
+        if (pan > 1) pan = 1; if (pan < -1) pan = -1;
+        const float a = (pan + 1.0f) * 0.78539816f;
+        float gl = std::cos(a) * 1.41421356f, gr = std::sin(a) * 1.41421356f;
+        if (gl > 1) gl = 1; if (gr > 1) gr = 1;
+        l = (uint32_t)(l * att * gl); r = (uint32_t)(r * att * gr);
+    }
     v.gL = l; v.gR = r;
 }
+void recompute_all_3d() { for (Voice& v : g_voices) if (v.alive && v.is3d) recompute_gains(v); }
 
 Voice* voice_of(Cpu& c, uint32_t self) {          // called under g_mx
     if (!self) return nullptr;
@@ -449,6 +484,10 @@ void build_vtables(Cpu& c) {
     if (!g_vtDSva || !g_vtBufVA) { jpline("[son] MISC epuise : vtables non posees"); return; }
     c.write(g_vtDSva,  g_vtDS,  (uint32_t)sizeof g_vtDS);
     c.write(g_vtBufVA, g_vtBuf, (uint32_t)sizeof g_vtBuf);
+    g_vt3Bva  = wx86_scratch_alloc(sizeof g_vt3B);
+    g_vtLisva = wx86_scratch_alloc(sizeof g_vtLis);
+    if (g_vt3Bva)  c.write(g_vt3Bva,  g_vt3B,  (uint32_t)sizeof g_vt3B);
+    if (g_vtLisva) c.write(g_vtLisva, g_vtLis, (uint32_t)sizeof g_vtLis);
     g_built = true;
 }
 
@@ -457,9 +496,84 @@ uint32_t m_qi(Cpu& c) {                       // QueryInterface (both vtables)
     // Hardware 3D and EAX are refused: GetCaps reports dwMaxHw3DAllBuffers=0,
     // so a game's capability probe here typically falls back to its own 2D
     // stereo path, computing panning itself.
+    // WX86_SON_3D=1: IDirectSound3DListener on the primary buffer and
+    // IDirectSound3DBuffer on secondary buffers, mixed in software.
+    if (g_3d && c.arg(1) && c.arg(2)) {
+        static const uint8_t tail[12] = { 0x81, 0x49, 0xCE, 0x11, 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60 };
+        uint8_t g[16]; c.read(c.arg(1), g, 16);
+        uint32_t a; std::memcpy(&a, g, 4);
+        const uint32_t self = c.arg(0);
+        if (std::memcmp(g + 4, tail, 12) == 0 && c.read_u32(self + 8) == MAGIC_BUF) {
+            const uint32_t idx = c.read_u32(self + 4);
+            std::lock_guard<std::mutex> lk(g_mx);
+            if (idx < g_voices.size()) {
+                Voice& v = g_voices[idx];
+                if (a == 0x279AFA84u && v.primary) {
+                    c.write_u32(c.arg(2), alloc_obj(c, g_vtLisva, MAGIC_LIS, idx)); return DS_OK;
+                }
+                if (a == 0x279AFA86u && !v.primary) {
+                    v.is3d = true; recompute_gains(v);
+                    c.write_u32(c.arg(2), alloc_obj(c, g_vt3Bva, MAGIC_3DB, idx)); return DS_OK;
+                }
+            }
+        }
+    }
     if (uint32_t pp = c.arg(2)) c.write_u32(pp, 0);
     return E_NOINTERFACE;
 }
+
+// ---- DirectSound 3D (WX86_SON_3D=1) --------------------------------------------
+float fl(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+uint32_t fu(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+Voice* voice3d(Cpu& c, uint32_t self) {           // called under g_mx
+    if (!self || c.read_u32(self + 8) != MAGIC_3DB) return nullptr;
+    uint32_t i = c.read_u32(self + 4);
+    return i < g_voices.size() && g_voices[i].alive ? &g_voices[i] : nullptr;
+}
+uint32_t m3_ok(Cpu&) { return DS_OK; }
+uint32_t m3_release(Cpu& c) { uint32_t s = c.arg(0); uint32_t r = c.read_u32(s + 12); if (r) --r; c.write_u32(s + 12, r); return r; }
+void put_vec(Cpu& c, uint32_t p, const float* v) { if (p) for (int i = 0; i < 3; ++i) c.write_u32(p + 4 * i, fu(v[i])); }
+uint32_t mb_setpos(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); Voice* v = voice3d(c, c.arg(0)); if (!v) return DSERR_INVALIDPARAM;
+    v->p3[0] = fl(c.arg(1)); v->p3[1] = fl(c.arg(2)); v->p3[2] = fl(c.arg(3)); recompute_gains(*v); return DS_OK; }
+uint32_t mb_getpos(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); Voice* v = voice3d(c, c.arg(0)); if (!v) return DSERR_INVALIDPARAM; put_vec(c, c.arg(1), v->p3); return DS_OK; }
+uint32_t mb_setmin(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); Voice* v = voice3d(c, c.arg(0)); if (!v) return DSERR_INVALIDPARAM;
+    float f = fl(c.arg(1)); v->minD = f > 1e-4f ? f : 1e-4f; recompute_gains(*v); return DS_OK; }
+uint32_t mb_setmax(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); Voice* v = voice3d(c, c.arg(0)); if (!v) return DSERR_INVALIDPARAM;
+    v->maxD = fl(c.arg(1)); recompute_gains(*v); return DS_OK; }
+uint32_t mb_getmin(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); Voice* v = voice3d(c, c.arg(0)); if (!v) return DSERR_INVALIDPARAM; c.write_u32(c.arg(1), fu(v->minD)); return DS_OK; }
+uint32_t mb_getmax(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); Voice* v = voice3d(c, c.arg(0)); if (!v) return DSERR_INVALIDPARAM; c.write_u32(c.arg(1), fu(v->maxD)); return DS_OK; }
+uint32_t mb_setmode(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); Voice* v = voice3d(c, c.arg(0)); if (!v) return DSERR_INVALIDPARAM;
+    v->mode3d = (int)c.arg(1); recompute_gains(*v); return DS_OK; }
+uint32_t mb_getmode(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); Voice* v = voice3d(c, c.arg(0)); if (!v) return DSERR_INVALIDPARAM; c.write_u32(c.arg(1), (uint32_t)v->mode3d); return DS_OK; }
+// DS3DBUFFER: dwSize, vPosition 4, vVelocity 16, dwInsideConeAngle 28, dwOutsideConeAngle 32,
+// vConeOrientation 36, lConeOutsideVolume 48, flMinDistance 52, flMaxDistance 56, dwMode 60.
+uint32_t mb_getall(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); Voice* v = voice3d(c, c.arg(0)); uint32_t p = c.arg(1); if (!v || !p) return DSERR_INVALIDPARAM;
+    put_vec(c, p + 4, v->p3); const float z[3] = { 0, 0, 0 }, f[3] = { 0, 0, 1 }; put_vec(c, p + 16, z);
+    c.write_u32(p + 28, 360); c.write_u32(p + 32, 360); put_vec(c, p + 36, f); c.write_u32(p + 48, 0);
+    c.write_u32(p + 52, fu(v->minD)); c.write_u32(p + 56, fu(v->maxD)); c.write_u32(p + 60, (uint32_t)v->mode3d); return DS_OK; }
+uint32_t mb_setall(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); Voice* v = voice3d(c, c.arg(0)); uint32_t p = c.arg(1); if (!v || !p) return DSERR_INVALIDPARAM;
+    for (int i = 0; i < 3; ++i) v->p3[i] = fl(c.read_u32(p + 4 + 4 * i));
+    v->minD = fl(c.read_u32(p + 52)); if (v->minD < 1e-4f) v->minD = 1e-4f; v->maxD = fl(c.read_u32(p + 56)); v->mode3d = (int)c.read_u32(p + 60);
+    recompute_gains(*v); return DS_OK; }
+uint32_t mb_getconeangles(Cpu& c) { if (c.arg(1)) c.write_u32(c.arg(1), 360); if (c.arg(2)) c.write_u32(c.arg(2), 360); return DS_OK; }
+uint32_t mb_getvec0(Cpu& c) { const float z[3] = { 0, 0, 0 }; put_vec(c, c.arg(1), z); return DS_OK; }
+uint32_t mb_getconevol(Cpu& c) { if (c.arg(1)) c.write_u32(c.arg(1), 0); return DS_OK; }
+// Listener: DS3DLISTENER dwSize, vPosition 4, vVelocity 16, vOrientFront 28, vOrientTop 40,
+// flDistanceFactor 52, flRolloffFactor 56, flDopplerFactor 60.
+uint32_t ml_setpos(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); g_lis.pos[0] = fl(c.arg(1)); g_lis.pos[1] = fl(c.arg(2)); g_lis.pos[2] = fl(c.arg(3)); recompute_all_3d(); return DS_OK; }
+uint32_t ml_getpos(Cpu& c) { put_vec(c, c.arg(1), g_lis.pos); return DS_OK; }
+uint32_t ml_setorient(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx);
+    for (int i = 0; i < 3; ++i) { g_lis.front[i] = fl(c.arg(1 + i)); g_lis.top[i] = fl(c.arg(4 + i)); } recompute_all_3d(); return DS_OK; }
+uint32_t ml_getorient(Cpu& c) { put_vec(c, c.arg(1), g_lis.front); put_vec(c, c.arg(2), g_lis.top); return DS_OK; }
+uint32_t ml_setroll(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); g_lis.rolloff = fl(c.arg(1)); recompute_all_3d(); return DS_OK; }
+uint32_t ml_getroll(Cpu& c) { c.write_u32(c.arg(1), fu(g_lis.rolloff)); return DS_OK; }
+uint32_t ml_getone(Cpu& c) { c.write_u32(c.arg(1), fu(1.0f)); return DS_OK; }
+uint32_t ml_getall(Cpu& c) { uint32_t p = c.arg(1); if (!p) return DSERR_INVALIDPARAM; const float z[3] = { 0, 0, 0 };
+    put_vec(c, p + 4, g_lis.pos); put_vec(c, p + 16, z); put_vec(c, p + 28, g_lis.front); put_vec(c, p + 40, g_lis.top);
+    c.write_u32(p + 52, fu(1)); c.write_u32(p + 56, fu(g_lis.rolloff)); c.write_u32(p + 60, fu(1)); return DS_OK; }
+uint32_t ml_setall(Cpu& c) { std::lock_guard<std::mutex> lk(g_mx); uint32_t p = c.arg(1); if (!p) return DSERR_INVALIDPARAM;
+    for (int i = 0; i < 3; ++i) { g_lis.pos[i] = fl(c.read_u32(p + 4 + 4 * i)); g_lis.front[i] = fl(c.read_u32(p + 28 + 4 * i)); g_lis.top[i] = fl(c.read_u32(p + 40 + 4 * i)); }
+    g_lis.rolloff = fl(c.read_u32(p + 56)); recompute_all_3d(); return DS_OK; }
 uint32_t m_addref(Cpu& c) {
     uint32_t s = c.arg(0); if (!s) return 0;
     uint32_t r = c.read_u32(s + 12) + 1; c.write_u32(s + 12, r); return r;
@@ -1047,6 +1161,49 @@ void install(Bridge& br, Cpu& cpu, const HostOps& ops) {
     R(g_vtBuf, "IDSB_Stop",              0, m_buf_stop);
     R(g_vtBuf, "IDSB_Unlock",            4, m_buf_unlock);
     R(g_vtBuf, "IDSB_Restore",           0, m_buf_restore);
+    // DirectSound 3D (answered by QueryInterface only with WX86_SON_3D=1).
+    g_3d = std::getenv("WX86_SON_3D") != nullptr;
+    slot = 0;
+    R(g_vt3B, "IDS3DB_QueryInterface",     2, m_qi);
+    R(g_vt3B, "IDS3DB_AddRef",             0, m_addref);
+    R(g_vt3B, "IDS3DB_Release",            0, m3_release);
+    R(g_vt3B, "IDS3DB_GetAllParameters",   1, mb_getall);
+    R(g_vt3B, "IDS3DB_GetConeAngles",      2, mb_getconeangles);
+    R(g_vt3B, "IDS3DB_GetConeOrientation", 1, mb_getvec0);
+    R(g_vt3B, "IDS3DB_GetConeOutsideVolume",1, mb_getconevol);
+    R(g_vt3B, "IDS3DB_GetMaxDistance",     1, mb_getmax);
+    R(g_vt3B, "IDS3DB_GetMinDistance",     1, mb_getmin);
+    R(g_vt3B, "IDS3DB_GetMode",            1, mb_getmode);
+    R(g_vt3B, "IDS3DB_GetPosition",        1, mb_getpos);
+    R(g_vt3B, "IDS3DB_GetVelocity",        1, mb_getvec0);
+    R(g_vt3B, "IDS3DB_SetAllParameters",   2, mb_setall);
+    R(g_vt3B, "IDS3DB_SetConeAngles",      3, m3_ok);
+    R(g_vt3B, "IDS3DB_SetConeOrientation", 4, m3_ok);
+    R(g_vt3B, "IDS3DB_SetConeOutsideVolume",2, m3_ok);
+    R(g_vt3B, "IDS3DB_SetMaxDistance",     2, mb_setmax);
+    R(g_vt3B, "IDS3DB_SetMinDistance",     2, mb_setmin);
+    R(g_vt3B, "IDS3DB_SetMode",            2, mb_setmode);
+    R(g_vt3B, "IDS3DB_SetPosition",        4, mb_setpos);
+    R(g_vt3B, "IDS3DB_SetVelocity",        4, m3_ok);
+    slot = 0;
+    R(g_vtLis, "IDS3DL_QueryInterface",    2, m_qi);
+    R(g_vtLis, "IDS3DL_AddRef",            0, m_addref);
+    R(g_vtLis, "IDS3DL_Release",           0, m3_release);
+    R(g_vtLis, "IDS3DL_GetAllParameters",  1, ml_getall);
+    R(g_vtLis, "IDS3DL_GetDistanceFactor", 1, ml_getone);
+    R(g_vtLis, "IDS3DL_GetDopplerFactor",  1, ml_getone);
+    R(g_vtLis, "IDS3DL_GetOrientation",    2, ml_getorient);
+    R(g_vtLis, "IDS3DL_GetPosition",       1, ml_getpos);
+    R(g_vtLis, "IDS3DL_GetRolloffFactor",  1, ml_getroll);
+    R(g_vtLis, "IDS3DL_GetVelocity",       1, mb_getvec0);
+    R(g_vtLis, "IDS3DL_SetAllParameters",  2, ml_setall);
+    R(g_vtLis, "IDS3DL_SetDistanceFactor", 2, m3_ok);
+    R(g_vtLis, "IDS3DL_SetDopplerFactor",  2, m3_ok);
+    R(g_vtLis, "IDS3DL_SetOrientation",    7, ml_setorient);
+    R(g_vtLis, "IDS3DL_SetPosition",       4, ml_setpos);
+    R(g_vtLis, "IDS3DL_SetRolloffFactor",  2, ml_setroll);
+    R(g_vtLis, "IDS3DL_SetVelocity",       4, m3_ok);
+    R(g_vtLis, "IDS3DL_CommitDeferredSettings", 0, m3_ok);
 
     // --- the only 2 exports the guest binary imports (by ordinal) ------------
     { Shim s; s.argc = 3; s.stdcall_cleanup = true; s.tag = "DSOUND.dll!DirectSoundCreate";

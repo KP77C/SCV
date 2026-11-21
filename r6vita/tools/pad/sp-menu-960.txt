@@ -1,0 +1,33 @@
+# WarCraft III host test at the Vita's 960x544: sp-menu.txt scaled (the game stretches its
+# 4:3 interface over the window), then the command-card grid: hold D-pad up, step right, step down.
+0 0 128 128 128 128
+60 goto 816 131
+61 goto 820 128
+63 touch 820 128
+65 untouch
+90 goto 134 198
+91 goto 132 196
+92 touch 132 196
+94 untouch
+97 text Vita
+100 goto 307 198
+101 goto 305 196
+102 touch 305 196
+104 untouch
+# Single Player menu -> Custom Game
+115 goto 818 346
+116 goto 816 345
+117 touch 816 345
+119 untouch
+# Custom Game (Booty Bay, 1v1 vs Computer Normal) -> Start Game
+235 goto 828 448
+236 goto 826 446
+237 touch 826 446
+239 untouch
+# In game: command grid (D-pad up = 0x10), right stick right then down -> cell 5
+830 10 128 128 128 128
+840 10 128 128 255 128
+846 10 128 128 128 128
+850 10 128 128 128 255
+856 10 128 128 128 128
+880 0 128 128 128 128
