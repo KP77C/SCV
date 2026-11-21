@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <sched.h>
+#include <time.h>
 
 #include "box86context.h"
 #include "elfloader.h"
@@ -865,6 +866,12 @@ static int dyn86_clock_cold(dynablock_t* db)
 {
     return db->probed && getJumpAddress64((uintptr_t)db->x86_addr) != (uintptr_t)db->block;
 }
+static uint64_t dyn86_tick_last_us = 0;   /* last per-frame clock tick */
+static uint64_t dyn86_clock_now_us(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec*1000000u + (uint64_t)ts.tv_nsec/1000u;
+}
 static mmaplist_t* dyn86_walk_list = NULL;
 static int         dyn86_walk_chunk = 0;
 
@@ -896,6 +903,10 @@ int dyn86_jit_collect_victims(dynablock_t** out, int max)
      * attrape par l'empoisonnement, pas par le raisonnement. */
     int nslots = 0;
     for(mmaplist_t* v = mmaplist; v; v = v->next) nslots += NCHUNK;
+    { static int on = -1;
+      if(on < 0) { const char* e = getenv("WX86_JITCLOCK"); on = (e && *e=='0') ? 0 : 1; }
+      if(on) dyn86_clock_live = 1; }
+    const int walk_probes = dyn86_clock_live && dyn86_clock_now_us() - dyn86_tick_last_us > 500000u;
     mmaplist_t* list0 = list; int ci0 = ci;
     for(int pass = 0; pass < 2 && n == 0; ++pass) {
     if(pass) { list = list0; ci = ci0; if(!dyn86_clock_live) break; ++dyn86_clock_fallbacks; }
@@ -921,6 +932,19 @@ int dyn86_jit_collect_victims(dynablock_t** out, int max)
                          * anything if that finds none (progress first). */
                         if(!dyn86_clock_live || pass || dyn86_clock_cold(db))
                             out[n++] = db;
+                        else if(walk_probes && !db->probed && db->done && db->block && db->jmpnext) {
+                            /* The walk becomes the clock hand (build 12)
+                             * while no frame has ticked the clock for 0.5 s:
+                             * an unprobed block gets its second chance here,
+                             * so aging never stops during loads (K's build 11
+                             * log: loads froze the per-frame tick, then every
+                             * round fell back to random victims). Only then:
+                             * a pressure-driven hand turns fast and takes
+                             * warm code (host: ~2k retranslations per 5 s in
+                             * game against ~50 with the frame tick alone). */
+                            db->probed = 1;
+                            if(setJumpTableIfRef(db->x86_addr, db->jmpnext, db->block)) ++dyn86_clock_probes;
+                        }
                     }
                 }
                 m = NEXT_BLOCK(m);
@@ -937,6 +961,7 @@ int dyn86_jit_collect_victims(dynablock_t** out, int max)
 
 extern int dyn86_evict_armed(void);
 extern uint32_t dyn86_ev_rounds;
+void dyn86_jit_clock_tick_locked(int chunks);
 /* One slice of the clock: `chunks` arena chunks per call, probing every live
  * block in them. Inert until the first eviction round (the pool is full from
  * then on, on the Vita for good) and with WX86_JITCLOCK=0. */
@@ -947,6 +972,20 @@ void dyn86_jit_clock_tick(int chunks)
     if(!on || !dyn86_ev_rounds || !dyn86_evict_armed() || chunks <= 0)
         return;
     mutex_lock(&my_context->mutex_dyndump);
+    dyn86_tick_last_us = dyn86_clock_now_us();
+    dyn86_jit_clock_tick_locked(chunks);
+    mutex_unlock(&my_context->mutex_dyndump);
+}
+/* Same, with mutex_dyndump already held (the eviction round itself: the clock
+ * must keep turning while the game translates without presenting frames,
+ * i.e. during loads; K's build 11 log: probes froze at the first load and
+ * every later eviction fell back to random victims). */
+void dyn86_jit_clock_tick_locked(int chunks)
+{
+    static int on = -1;
+    if(on < 0) { const char* e = getenv("WX86_JITCLOCK"); on = (e && *e=='0') ? 0 : 1; }
+    if(!on || chunks <= 0)
+        return;
     mutex_lock(&mutex_dynarec);
     if(mmaplist) {
         mmaplist_t* list = mmaplist; int ci = 0;
@@ -978,7 +1017,6 @@ void dyn86_jit_clock_tick(int chunks)
         dyn86_clock_live = 1;
     }
     mutex_unlock(&mutex_dynarec);
-    mutex_unlock(&my_context->mutex_dyndump);
 }
 
 /* Recensement de l'arene (diagnostic d'eviction, build 16) : ou va la
