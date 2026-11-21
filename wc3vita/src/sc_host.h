@@ -76,6 +76,7 @@ void inline_hot_imports();               // TLS / last-error imports as guest x8
 void patch_module(const std::string& name, uint32_t base);   // data patches to a module just loaded (w3_shims.cpp)
 void mp3_install(d2rt::Cpu& c, uint32_t base);                 // w3_mp3.cpp: native MP3 for Mp3dec.asi
 void mp3_stats(uint64_t* opens, uint64_t* frames);
+void miles_install(d2rt::Cpu& c, uint32_t base);
 void softfloat_install(d2rt::Cpu& c, uint32_t base);           // w3_softfloat.cpp: Game.dll float routines served natively
 // Per-frame GL counters for the spike report (w3_gl.cpp): read and cleared.
 // The display lock: vblanks per frame from SC_FPS (60, 30, 20 or 15). WarCraft

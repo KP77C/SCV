@@ -136,7 +136,10 @@ extern "C" { extern uint64_t dyn86_jp_created, dyn86_jp_invalid; }
 extern "C" void d2ep_csv(const char* path) __attribute__((weak));
 extern "C" void d2ep_dump(const char* path, int topn) __attribute__((weak));
 extern "C" void d2ep_report(void (*out)(const char*)) __attribute__((weak));
+extern "C" void dyn86_jit_clock_tick(int chunks);
+extern "C" uint32_t dyn86_clock_probes, dyn86_clock_fallbacks;
 static void present_pump(d2rt::Cpu& c) {
+    dyn86_jit_clock_tick(1);   // JIT clock: unlink one arena chunk per frame (custommem.c)
     static const char* epcsv = std::getenv("W3_EPCSV");
     if (epcsv && d2ep_csv && g_frames && g_frames % 300 == 0) d2ep_csv(epcsv);
     // W3_EPDUMP=<file>: the emitted ARM of the 200 costliest blocks, at frame 1200.
@@ -182,8 +185,8 @@ static void present_pump(d2rt::Cpu& c) {
         if (d2rt::dsound::stat_line(line, sizeof line) > 0) log("[not-bound] %s", line);
         {   // JIT churn per window (WX86_JITPROFILE=1 arms the counters)
             static uint64_t p_new = 0, p_inv = 0;
-            log("[not-bound] jit(5s): new=%llu invalidated=%llu", (unsigned long long)(dyn86_jp_created - p_new),
-                (unsigned long long)(dyn86_jp_invalid - p_inv));
+            log("[not-bound] jit(5s): new=%llu invalidated=%llu clock probes=%u fallbacks=%u", (unsigned long long)(dyn86_jp_created - p_new),
+                (unsigned long long)(dyn86_jp_invalid - p_inv), dyn86_clock_probes, dyn86_clock_fallbacks);
             p_new = dyn86_jp_created; p_inv = dyn86_jp_invalid;
         }
         g_win_start = now; g_win_frames = 0;

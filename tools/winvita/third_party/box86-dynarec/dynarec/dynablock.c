@@ -623,6 +623,10 @@ static void dyn86_retire_wave(x86emu_t* self, int want)
         if(InvalidDynablock(g_retire[i], 0))   /* on tient deja mutex_dyndump */
             g_retire[k++] = g_retire[i];
     if(k <= 0) return;
+    {   /* WX86_JITEVLOG=1: one line per wave (host diagnosis of the bursts) */
+        static int lg = -1; if(lg < 0) { const char* e = getenv("WX86_JITEVLOG"); lg = (e && *e=='1'); }
+        if(lg) fprintf(stderr, "[jit] wave: want %d got %d (round %u)\n", want, k, dyn86_ev_rounds);
+    }
     g_retire_n = k;
     dyn86_ev_retired += (uint32_t)k;
     /* Instantane APRES le retrait : un fil qui entre dans DynaRun ensuite ne
@@ -820,6 +824,13 @@ static dynablock_t* internalDBGetBlock(x86emu_t* emu, uintptr_t addr, uintptr_t 
              * compter ici laisserait « sauvees=0 » sur des runs ou l'eviction
              * a tout porte, et le compteur mentirait par omission. */
             ++dyn86_ev_refills;
+            /* WarCraft III build 11: and the wave size goes back to its base,
+             * as dyn86_evict_round does on its own reclaims. Without this the
+             * wave doubled on every round whose reclaim happened HERE (the
+             * usual case), 64 -> 65536 within ten rounds, so each pressure
+             * episode retired the whole arena: K's build 9 battle log, 48 534
+             * blocks invalidated and 19 977 retranslated in 10 s. */
+            g_wave = dyn86_wave_base();
         }
     }
 
@@ -1007,6 +1018,7 @@ dynablock_t* DBGetBlock(x86emu_t* emu, uintptr_t addr, int create)
     int dyn86_retry = 0;
     for(;;) {
         db = internalDBGetBlock(emu, addr, addr, create, 1);
+        if(db) db->probed = 0;      /* JIT clock: this block is in use (custommem.c dyn86_jit_clock_tick) */
         if(db && db->done && db->block && getNeedTest(addr)) {
 #ifndef __vita__
             if(db->always_test)
@@ -1072,6 +1084,7 @@ dynablock_t* DBAlternateBlock(x86emu_t* emu, uintptr_t addr, uintptr_t filladdr)
     int dyn86_retry = 0;
     for(;;) {
         db = internalDBGetBlock(emu, addr, filladdr, create, 1);
+        if(db) db->probed = 0;
         if(db && db->done && db->block && getNeedTest(filladdr)) {
 #ifndef __vita__
             if(db->always_test)

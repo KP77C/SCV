@@ -841,6 +841,30 @@ void FreeDynarecMap(uintptr_t addr)
  * quelconques. Un chunk se parcourt donc TOUJOURS depuis son debut, ou la
  * chaine de marqueurs est valide par construction ; seul l'indice de chunk
  * tourne. */
+/* JIT CLOCK (WarCraft III build 11). The victim walk above has no idea
+ * which blocks are hot, so once the pool is full each eviction throws out
+ * random blocks, hot ones included; they come straight back, need room, and
+ * evict more: K's build 9 battle log shows 20 000 retranslations in 10 s.
+ * A second-chance clock fixes that without emitting a single instruction:
+ * dyn86_jit_clock_tick() (called once per presented frame) walks a slice of
+ * the arena and UNLINKS each block it passes (its jump-table entry goes to
+ * the block's own jmpnext stub, exactly box86's "dirty" mark), setting
+ * db->probed. Any transfer to it then goes through LinkNext -> DBGetBlock,
+ * which clears probed and, the hash being unchanged, links it back. A block
+ * still probed one lap later was not reached for a whole lap: cold. Blocks
+ * returned to by D2_CALLRET's native return addresses are not seen by this
+ * (they bypass the table); that only costs a retranslation, the grace period
+ * keeps it safe. WX86_JITCLOCK=0 = the old walk. */
+int      dyn86_clock_live = 0;       /* the tick has run at least once */
+uint32_t dyn86_clock_fallbacks = 0;  /* walks that found no cold block */
+uint32_t dyn86_clock_probes = 0;     /* unlinks made by the tick */
+static mmaplist_t* dyn86_tick_list = NULL;
+static int         dyn86_tick_chunk = 0;
+uintptr_t getJumpAddress64(uintptr_t addr);
+static int dyn86_clock_cold(dynablock_t* db)
+{
+    return db->probed && getJumpAddress64((uintptr_t)db->x86_addr) != (uintptr_t)db->block;
+}
 static mmaplist_t* dyn86_walk_list = NULL;
 static int         dyn86_walk_chunk = 0;
 
@@ -872,6 +896,9 @@ int dyn86_jit_collect_victims(dynablock_t** out, int max)
      * attrape par l'empoisonnement, pas par le raisonnement. */
     int nslots = 0;
     for(mmaplist_t* v = mmaplist; v; v = v->next) nslots += NCHUNK;
+    mmaplist_t* list0 = list; int ci0 = ci;
+    for(int pass = 0; pass < 2 && n == 0; ++pass) {
+    if(pass) { list = list0; ci = ci0; if(!dyn86_clock_live) break; ++dyn86_clock_fallbacks; }
     int visited = 0;
     const int maxvisit = nslots;
     while(n < max && visited < maxvisit) {
@@ -887,8 +914,14 @@ int dyn86_jit_collect_victims(dynablock_t** out, int max)
                      * `previous` ou a la vague en cours). Le reprendre le
                      * mettrait deux fois dans la file, donc le libererait
                      * deux fois. */
-                    if(db && !db->gone && db->actual_block)
-                        out[n++] = db;
+                    if(db && !db->gone && db->actual_block) {
+                        /* JIT clock (dyn86_jit_clock_tick): once the tick
+                         * runs, only blocks it unlinked and that nobody
+                         * reached since are taken; a fallback pass takes
+                         * anything if that finds none (progress first). */
+                        if(!dyn86_clock_live || pass || dyn86_clock_cold(db))
+                            out[n++] = db;
+                    }
                 }
                 m = NEXT_BLOCK(m);
             }
@@ -896,9 +929,56 @@ int dyn86_jit_collect_victims(dynablock_t** out, int max)
         ++ci;
         if(ci >= NCHUNK) { ci = 0; list = list->next ? list->next : mmaplist; }
     }
+    }
     dyn86_walk_list = list; dyn86_walk_chunk = ci;
     mutex_unlock(&mutex_dynarec);
     return n;
+}
+
+extern int dyn86_evict_armed(void);
+extern uint32_t dyn86_ev_rounds;
+/* One slice of the clock: `chunks` arena chunks per call, probing every live
+ * block in them. Inert until the first eviction round (the pool is full from
+ * then on, on the Vita for good) and with WX86_JITCLOCK=0. */
+void dyn86_jit_clock_tick(int chunks)
+{
+    static int on = -1;
+    if(on < 0) { const char* e = getenv("WX86_JITCLOCK"); on = (e && *e=='0') ? 0 : 1; }
+    if(!on || !dyn86_ev_rounds || !dyn86_evict_armed() || chunks <= 0)
+        return;
+    mutex_lock(&my_context->mutex_dyndump);
+    mutex_lock(&mutex_dynarec);
+    if(mmaplist) {
+        mmaplist_t* list = mmaplist; int ci = 0;
+        if(dyn86_tick_list)
+            for(mmaplist_t* v = mmaplist; v; v = v->next)
+                if(v==dyn86_tick_list) { list = v; ci = dyn86_tick_chunk; break; }
+        if(ci < 0 || ci >= NCHUNK) ci = 0;
+        for(int k = 0; k < chunks; ++k) {
+            blocklist_t* ch = &list->chunks[ci];
+            if(ch->size && ch->block) {
+                blockmark_t* m = (blockmark_t*)ch->block;
+                blockmark_t* last = LAST_BLOCK(ch->block, ch->size);
+                while(m < last) {
+                    if(m->next.fill) {
+                        dynablock_t* db = *(dynablock_t**)((uintptr_t)m + sizeof(blockmark_t));
+                        if(db && !db->gone && db->done && db->block && db->jmpnext && !db->probed
+                           && db->actual_block == (void*)((uintptr_t)m + sizeof(blockmark_t))) {
+                            db->probed = 1;
+                            if(setJumpTableIfRef(db->x86_addr, db->jmpnext, db->block)) ++dyn86_clock_probes;
+                        }
+                    }
+                    m = NEXT_BLOCK(m);
+                }
+            }
+            ++ci;
+            if(ci >= NCHUNK) { ci = 0; list = list->next ? list->next : mmaplist; }
+        }
+        dyn86_tick_list = list; dyn86_tick_chunk = ci;
+        dyn86_clock_live = 1;
+    }
+    mutex_unlock(&mutex_dynarec);
+    mutex_unlock(&my_context->mutex_dyndump);
 }
 
 /* Recensement de l'arene (diagnostic d'eviction, build 16) : ou va la

@@ -46,6 +46,8 @@
 #include <atomic>
 #include "runtime/prof.h"
 extern "C" {
+extern "C" void dyn86_jit_clock_tick(int chunks);
+extern "C" uint32_t dyn86_clock_probes, dyn86_clock_fallbacks;
 extern uint64_t dyn86_jp_run_us, dyn86_jp_lookup_miss, dyn86_jp_created, dyn86_jp_recompiles, dyn86_jp_invalid, dyn86_jp_x86_insns, dyn86_sync_us;
 }
 #include <algorithm>
@@ -620,12 +622,12 @@ void window_report(uint64_t now) {
     {
         static uint64_t p_run = 0, p_trap = 0, p_jrun = 0, p_miss = 0, p_new = 0, p_rec = 0, p_inv = 0, p_ins = 0, p_sync = 0;
         const uint64_t run = d2rt::prof::run_ns / 1000, trap = d2rt::prof::trap_ns / 1000;
-        log("[not-bound] guest time (10 s): in cpu->run %llu ms (of which shims %llu ms), dynarec run %llu ms; JIT: %llu misses, %llu new blocks, %llu recompiles, %llu invalidated, %llu x86 insns translated, cache sync %llu ms",
+        log("[not-bound] guest time (10 s): in cpu->run %llu ms (of which shims %llu ms), dynarec run %llu ms; JIT: %llu misses, %llu new blocks, %llu recompiles, %llu invalidated, %llu x86 insns translated, cache sync %llu ms; clock probes %u, cold-walk fallbacks %u",
             (unsigned long long)((run - p_run) / 1000), (unsigned long long)((trap - p_trap) / 1000),
             (unsigned long long)((dyn86_jp_run_us - p_jrun) / 1000), (unsigned long long)(dyn86_jp_lookup_miss - p_miss),
             (unsigned long long)(dyn86_jp_created - p_new), (unsigned long long)(dyn86_jp_recompiles - p_rec),
             (unsigned long long)(dyn86_jp_invalid - p_inv), (unsigned long long)(dyn86_jp_x86_insns - p_ins),
-            (unsigned long long)((dyn86_sync_us - p_sync) / 1000));
+            (unsigned long long)((dyn86_sync_us - p_sync) / 1000), dyn86_clock_probes, dyn86_clock_fallbacks);
         p_run = run; p_trap = trap; p_jrun = dyn86_jp_run_us; p_miss = dyn86_jp_lookup_miss; p_new = dyn86_jp_created;
         p_rec = dyn86_jp_recompiles; p_inv = dyn86_jp_invalid; p_ins = dyn86_jp_x86_insns; p_sync = dyn86_sync_us;
     }
@@ -861,6 +863,7 @@ void present(d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t
     static uint64_t last_us = 0;
     const uint64_t now = wx86_now_us();
     g_guest_presents.fetch_add(1);
+    dyn86_jit_clock_tick(1);   // JIT clock: unlink one arena chunk per frame (custommem.c)
     if (g_gl) {   // one GL frame was just shown (vglSwapBuffers)
         ime_step();   // no display thread in GL mode: vglSwapBuffers(GL_TRUE) draws the dialog
         static uint64_t last_swap = 0;

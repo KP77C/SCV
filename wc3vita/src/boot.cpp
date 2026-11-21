@@ -663,6 +663,9 @@ int main(int argc, char** argv) {
     // DllMain(DLL_PROCESS_ATTACH) of every statically loaded DLL, deepest
     // dependency first, before the exe runs, as Windows does. Windows passes
     // a NON-NULL lpReserved for static loads (NULL only for LoadLibrary).
+    // Native stand-ins inside statically loaded DLLs go in before any of
+    // their code is translated, i.e. before the DllMains.
+    if (d2rt::PeImage* m = br.module("mss32.dll")) sc::miles_install(*cpu, m->load_base());
     {
         uint32_t reserved = wx86_scratch_alloc(0x400);
         for (d2rt::PeImage* pi : init_order) {

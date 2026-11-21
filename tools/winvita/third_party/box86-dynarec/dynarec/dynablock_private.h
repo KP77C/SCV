@@ -18,6 +18,7 @@ typedef struct dynablock_s {
     uint8_t         gone;
     uint8_t         always_test;
     uint8_t         dirty;      // if need to be tested as soon as it's created
+    uint8_t         probed;     // WX86 JIT clock: unlinked to test for reuse; cleared by DBGetBlock
     int             isize;
     instsize_t*     instsize;
     void*           jmpnext;    // a branch jmpnext code when block is marked

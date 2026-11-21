@@ -139,4 +139,38 @@ void softfloat_install(d2rt::Cpu& c, uint32_t base) {
         n, mode == 2 ? " [plumbing only: always fall back]" : "");
 }
 
+// Miles (mss32.dll 1.27a, pref 0x21100000): the MMX check at 2113cfea runs on
+// EVERY Miles API call (the API lock asks it whether to use the MMX mixer):
+// pushfd/popfd to test the ID bit, then cpuid. Through the translator that is
+// a flags round trip and a cpuid helper per call; K's build 10 battle log
+// has the block right after it at 21-27% of the guest core. The answer never
+// changes: it is the emulated CPU's own (shim_impl.c my_cpuid, leaf 1),
+// so it is served here with the registers the guest code leaves: EAX = 1
+// (MMX present), ECX/EDX = cpuid leaf 1, EBX/ESI/EDI/flags as on entry.
+// W3_MILES_MMX=0 leaves Miles' code alone.
+extern "C" void wx86_cpuid_features(uint32_t* edx, uint32_t* ecx);
+namespace {
+uint32_t g_mmx_edx = 0, g_mmx_ecx = 0; unsigned long long g_mmx_n = 0;
+int h_miles_mmx(void* emu, uint32_t) {
+    if (dyn86_intrin_on != 1) return 0;
+    dyn86_intrin_setreg(emu, 0, (g_mmx_edx & 0x800000u) ? 1u : 0u);
+    dyn86_intrin_setreg(emu, 1, g_mmx_ecx);
+    dyn86_intrin_setreg(emu, 2, g_mmx_edx);
+    if (++g_mmx_n == 1000000ull) log("[not-bound] miles: MMX check served natively 1000000 times");
+    return 1;
+}
+}  // namespace
+void miles_install(d2rt::Cpu& c, uint32_t base) {
+    const char* e = std::getenv("W3_MILES_MMX");
+    if (e && *e == '0') { log("[not-bound] miles: MMX check left to Miles (W3_MILES_MMX=0)"); return; }
+    if (!dyn86_membase) return;
+    const uint32_t va = 0x2113cfeau - 0x21100000u + base;
+    if (fnv(c, va, 61) != 0x9af4ef3bu) { log("[not-bound] [cause: unknown mss32.dll] miles: MMX check at 0x%08x not recognised, left alone", va); return; }
+    wx86_cpuid_features(&g_mmx_edx, &g_mmx_ecx);
+    if (dyn86_intrin_add(va, &h_miles_mmx, 0, 0, DYN86_IR_AX | DYN86_IR_CX | DYN86_IR_DX, "miles_mmx")) {
+        if (!dyn86_intrin_on) dyn86_intrin_on = 1;
+        log("[not-bound] miles: MMX check at 0x%08x served natively (W3_MILES_MMX=0 turns this off)", va);
+    }
+}
+
 }  // namespace sc
