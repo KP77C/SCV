@@ -72,7 +72,13 @@ void dyn86_mark_volatile_code(uintptr_t addr, uintptr_t size);
 // volatile (PROT_NEVERCLEAN) memory one instruction long, so code that
 // rewrites an instruction further down its own block (Fire.dll's water and
 // fire painters) sees the new bytes, as a real x86 does.
-int dyn86_smc_single(void);   // port addition: always re-validate code here
+int dyn86_smc_single(void);
+// In volatile memory: should the block end after the instruction [ip, next)?
+// WX86_SMC_SINGLE=2: always (one instruction per block). =1: only when the
+// instruction carries a 32-bit address that lands in volatile memory, i.e. a
+// possible patch of nearby code (Unreal's self-patching painters write their
+// own displacements through absolute addresses).
+int dyn86_smc_stop_after(uintptr_t ip, uintptr_t next);   // port addition: always re-validate code here
 int isprotectedDB(uintptr_t addr, size_t size);
 #endif
 void* find32bitBlock(size_t size);

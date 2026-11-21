@@ -1,23 +1,33 @@
 diff --git a/tools/winvita/third_party/box86-dynarec/custommem.c b/tools/winvita/third_party/box86-dynarec/custommem.c
-index f4e2893..a731890 100644
+index f4e2893..cdbbb38 100644
 --- a/tools/winvita/third_party/box86-dynarec/custommem.c
 +++ b/tools/winvita/third_party/box86-dynarec/custommem.c
-@@ -1246,6 +1246,13 @@ int checkInHotPage(uintptr_t addr)
+@@ -1246,6 +1246,23 @@ int checkInHotPage(uintptr_t addr)
  // With no SIGSEGV-based SMC detection, such pages get PROT_NEVERCLEAN: blocks
  // translated there are always_test (re-hashed on every lookup, never
  // direct-linked), so a rewrite is picked up on the next entry.
 +int dyn86_smc_single(void)
 +{
 +    static int v = -1;
-+    if (v < 0) { const char* e = getenv("WX86_SMC_SINGLE"); v = (e && e[0] == '1') ? 1 : 0; }
++    if (v < 0) { const char* e = getenv("WX86_SMC_SINGLE"); v = (e && (e[0] == '1' || e[0] == '2')) ? e[0] - '0' : 0; }
 +    return v;
++}
++
++int dyn86_smc_stop_after(uintptr_t ip, uintptr_t next)
++{
++    if (dyn86_smc_single() == 2) return 1;
++    for (uintptr_t p = ip; p + 4 <= next; ++p) {
++        uint32_t v; memcpy(&v, (const void*)DYN86_G2H(p), 4);
++        if (v >= 0x10000 && (getProtection(v) & PROT_NEVERCLEAN)) return 1;
++    }
++    return 0;
 +}
 +
  void dyn86_mark_volatile_code(uintptr_t addr, uintptr_t size)
  {
      uintptr_t cur = addr & ~(box86_pagesize-1);
 diff --git a/tools/winvita/third_party/box86-dynarec/dynarec/dynarec_arm_pass.c b/tools/winvita/third_party/box86-dynarec/dynarec/dynarec_arm_pass.c
-index 25b335c..2e9e3e3 100755
+index 25b335c..d13288a 100755
 --- a/tools/winvita/third_party/box86-dynarec/dynarec/dynarec_arm_pass.c
 +++ b/tools/winvita/third_party/box86-dynarec/dynarec/dynarec_arm_pass.c
 @@ -548,7 +548,8 @@ uintptr_t arm_pass(dynarec_arm_t* dyn, uintptr_t addr)
@@ -26,15 +36,15 @@ index 25b335c..2e9e3e3 100755
          if((ok>0) && (((box86_dynarec_bigblock<stopblock) && !isJumpTableDefault((void*)addr)) 
 -            || (addr>=box86_nodynarec_start && addr<box86_nodynarec_end)))
 +            || (addr>=box86_nodynarec_start && addr<box86_nodynarec_end)
-+            || (dyn86_smc_single() && (getProtection(addr)&PROT_NEVERCLEAN))))
++            || (dyn86_smc_single() && (getProtection(addr)&PROT_NEVERCLEAN) && dyn86_smc_stop_after(ip, addr))))
          #else
          if((ok>0) && (ninst==dyn->size))
          #endif
 diff --git a/tools/winvita/third_party/box86-dynarec/include/custommem.h b/tools/winvita/third_party/box86-dynarec/include/custommem.h
-index 60f8eef..9d989ae 100644
+index 60f8eef..0a30ec7 100644
 --- a/tools/winvita/third_party/box86-dynarec/include/custommem.h
 +++ b/tools/winvita/third_party/box86-dynarec/include/custommem.h
-@@ -67,7 +67,12 @@ void loadProtectionFromMap();
+@@ -67,7 +67,18 @@ void loadProtectionFromMap();
  #ifdef DYNAREC
  void protectDB(uintptr_t addr, size_t size);
  void unprotectDB(uintptr_t addr, size_t size, int mark);    // if mark==0, the blocks are not marked as potentially dirty
@@ -44,7 +54,13 @@ index 60f8eef..9d989ae 100644
 +// volatile (PROT_NEVERCLEAN) memory one instruction long, so code that
 +// rewrites an instruction further down its own block (Fire.dll's water and
 +// fire painters) sees the new bytes, as a real x86 does.
-+int dyn86_smc_single(void);   // port addition: always re-validate code here
++int dyn86_smc_single(void);
++// In volatile memory: should the block end after the instruction [ip, next)?
++// WX86_SMC_SINGLE=2: always (one instruction per block). =1: only when the
++// instruction carries a 32-bit address that lands in volatile memory, i.e. a
++// possible patch of nearby code (Unreal's self-patching painters write their
++// own displacements through absolute addresses).
++int dyn86_smc_stop_after(uintptr_t ip, uintptr_t next);   // port addition: always re-validate code here
  int isprotectedDB(uintptr_t addr, size_t size);
  #endif
  void* find32bitBlock(size_t size);
