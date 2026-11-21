@@ -51,3 +51,11 @@ All `.d2u` packages are Unreal package version 95, licensee 69 (Republic Command
 ## Data
 
 Maps are Ion Storm formats, not `.unr`: 50 `.gmp` plus 62 `.xbd` on Xbox (603 MB), `.ibd` on PC (1.2 GB). Textures and static meshes ship as `.zip`. Videos are Bink (`VideoTextures`, 255 MB on Xbox).
+
+## Classes
+
+Native classes register through one UClass constructor at `0x2570b0` (args: ..., size, flags, ..., `"Name"`, `"System"`, class flags, InternalConstructor, StaticConstructor). Each class has a getter that builds it (`<Name>_GetPrivateStaticClass`), a small `StaticClass` function of the form `if (!G) { G = Get("Package"); Init(); }`, and an InternalConstructor that jumps to the C++ constructor, which stores the vtable.
+
+`tools/ghidra/FindClasses.java` finds 266 classes (`symbols/classes.csv`): Engine 157, DX2Game 29, AICore 26, DX2AI 6, XboxDrv 2, plus Core (package name not a plain string), D3DDrv, Editor, GamePhysics and DX2GamePhysics. `tools/ghidra/ClassVtables.java` recovers 237 constructors and vtables (`symbols/vtables.csv`). The base class column is the first call in the constructor and is wrong where LTCG inlined the parent constructor. Actor-derived vtables have 93 slots.
+
+The Ghidra project with these names applied is kept outside the repo (K's project files, `iwvita/ghidra/`).
