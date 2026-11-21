@@ -305,9 +305,23 @@ void build_module_ranges() {
     }
     g_nmods.store(n);
 }
+// Hot spots: 64-byte code buckets, counted in a small open-addressed table
+// (written only by the sampler thread; read and cleared by the 10 s log).
+constexpr uint32_t kHot = 4096;
+std::atomic<uint32_t> g_hot_key[kHot], g_hot_n[kHot];
+void hot_add(uint32_t ip) {
+    const uint32_t key = (ip >> 6) | 0x80000000u;
+    uint32_t h = (key * 2654435761u) >> 20;
+    for (uint32_t i = 0; i < 16; ++i, h = (h + 1) & (kHot - 1)) {
+        const uint32_t k = g_hot_key[h].load(std::memory_order_relaxed);
+        if (k == key) { g_hot_n[h].fetch_add(1, std::memory_order_relaxed); return; }
+        if (!k) { g_hot_key[h].store(key, std::memory_order_relaxed); g_hot_n[h].store(1, std::memory_order_relaxed); return; }
+    }
+}
 void dx_sample_eip() {
     if (!g_ip) return;
     const uint32_t ip = *g_ip;
+    hot_add(ip);
     const int n = g_nmods.load();
     for (int i = 0; i < n; ++i) if (ip >= g_mods[i].lo && ip < g_mods[i].hi) { g_msamp[i]++; return; }
     if (ip >= 0x0D100000u && ip < 0x0D800000u) { g_msamp[kMaxMods]++; return; }
@@ -551,6 +565,25 @@ void window_report(uint64_t now) {
                 k += std::snprintf(line + k, sizeof line - k, " %s %u%%", nm, v[best] * 100 / t);
                 v[best] = 0;
                 if (k >= (int)sizeof line - 40) break;
+            }
+            log("[not-bound] %s", line);
+        }
+        {   // the 16 hottest 64-byte code spots, as module+offset
+            uint32_t key[kHot], cnt[kHot], tot = 0;
+            for (uint32_t i = 0; i < kHot; ++i) { key[i] = g_hot_key[i].exchange(0); cnt[i] = g_hot_n[i].exchange(0); tot += cnt[i]; }
+            if (!tot) tot = 1;
+            int k = std::snprintf(line, sizeof line, "hot spots (%u samples):", tot);
+            const int n = g_nmods.load();
+            for (int pass = 0; pass < 16; ++pass) {
+                uint32_t best = kHot;
+                for (uint32_t i = 0; i < kHot; ++i) if (key[i] && cnt[i] && (best == kHot || cnt[i] > cnt[best])) best = i;
+                if (best == kHot) break;
+                const uint32_t ip = (key[best] & 0x7FFFFFFFu) << 6;
+                const char* nm = "?"; uint32_t off = ip;
+                for (int i = 0; i < n; ++i) if (ip >= g_mods[i].lo && ip < g_mods[i].hi) { nm = g_mods[i].name; off = ip - g_mods[i].lo; }
+                k += std::snprintf(line + k, sizeof line - k, " %s+%x %u.%u%%", nm, off, cnt[best] * 100 / tot, cnt[best] * 1000 / tot % 10);
+                cnt[best] = 0;
+                if (k >= (int)sizeof line - 48) break;
             }
             log("[not-bound] %s", line);
         }

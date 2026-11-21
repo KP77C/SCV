@@ -19,6 +19,7 @@
 #include "runtime/guest_str.h"
 #include "runtime/host_clock.h"
 #include "runtime/win32_shims_wait.h"
+#include "runtime/win32_shims_kernel32.h"
 
 #include <cstring>
 #include <deque>
@@ -50,7 +51,8 @@ struct Timer { uint32_t hwnd, id, period_ms, proc; uint64_t due_ms; };
 
 std::map<std::string, WndClass> g_classes;    // lower-case name -> class
 std::map<uint32_t, Wnd>         g_wnds;       // hwnd -> window
-std::deque<Msg>                 g_queue;
+std::deque<Msg>                 g_queue;      // the UI thread's queue (window messages)
+std::map<uint32_t, std::deque<Msg>> g_tqueue; // PostThreadMessageA queues, by guest thread id
 std::map<uint64_t, Timer>       g_timers;     // (hwnd << 32 | id) -> timer
 struct Accel { uint8_t fvirt; uint16_t key, cmd; };
 std::map<uint32_t, std::vector<Accel>> g_accels;   // accelerator handle -> entries
@@ -120,10 +122,27 @@ bool msg_matches(const Msg& m, uint32_t hwnd, uint32_t lo, uint32_t hi) {
     return true;
 }
 
+// Scheduler id of the calling guest thread (1 = the game's main/UI thread).
+uint32_t cur_sched_id() { auto* s = wx86_sched(); auto* t = s ? s->current() : nullptr; return t ? t->id : 1u; }
+
 bool take_msg(uint32_t hwnd, uint32_t lo, uint32_t hi, bool remove, Msg& out) {
+    // Thread messages first (Galaxy's decoder thread lives on these). A worker
+    // thread never sees the UI thread's window messages: on Windows each
+    // thread has its own queue, and a worker that took them would steal the
+    // game's input and timers.
+    const uint32_t sid = cur_sched_id();
+    auto tq = g_tqueue.find(wx86_win_tid(sid));
+    if (tq != g_tqueue.end())
+        for (auto it = tq->second.begin(); it != tq->second.end(); ++it)
+            if (msg_matches(*it, hwnd, lo, hi)) { out = *it; if (remove) tq->second.erase(it); return true; }
+    static const bool strict = !std::getenv("DX_TQ_LOOSE");
+    if (strict && sid != 1u) return false;
     pump_timers();
     for (auto it = g_queue.begin(); it != g_queue.end(); ++it)
-        if (msg_matches(*it, hwnd, lo, hi)) { out = *it; if (remove) g_queue.erase(it); return true; }
+        if (msg_matches(*it, hwnd, lo, hi)) {
+            out = *it;
+            if (sid != 1u && std::getenv("DX_TQ_LOG")) log("[tq] thread %u took msg 0x%x hwnd 0x%x wp 0x%x (filter hwnd 0x%x)", sid, out.msg, out.hwnd, out.wp, hwnd);
+            if (remove) g_queue.erase(it); return true; }
     if (g_quit) { out = { 0, WM_QUIT, g_quit_code, 0 }; if (remove) g_quit = false; return true; }
     return false;
 }
@@ -251,6 +270,15 @@ void install_user32(d2rt::Bridge& br) {
         }
         if (!w.parent) {
             g_active = g_focus = h;
+        }
+        // Deus Ex: the activation messages a new top-level window gets are
+        // NOT posted. In every build so far they were never delivered (Galaxy's
+        // sound thread took them off the shared queue before per-thread queues
+        // existed), and once delivered, Unreal's viewport faults on them
+        // ("General protection fault" just after the intro). DX_ACTIVATE_MSGS=1
+        // posts them again.
+        static const bool act = std::getenv("DX_ACTIVATE_MSGS") != nullptr;
+        if (!w.parent && act) {
             post(h, WM_ACTIVATEAPP, 1, 0);
             post(h, WM_ACTIVATE, 1, 0);
             post(h, WM_SETFOCUS, 0, 0);
@@ -482,6 +510,14 @@ void install_user32(d2rt::Bridge& br) {
         if (!ch) return 0;
         if ((key_state(0x11) & 0x8000u) && ch > 0x20) return 0;   // Ctrl+key: no character
         g_queue.push_front({ hwnd, msg == 0x0100 ? 0x0102u : 0x0106u, ch, lp });   // WM_CHAR / WM_SYSCHAR
+        return 1;
+    });
+    // PostThreadMessageA(tid, msg, wp, lp): into that thread's own queue.
+    U(br, "PostThreadMessageA", 4, [](Cpu& c) -> uint32_t {
+        if (!wx86_sched_tid(c.arg(0))) return 0;
+        static int said = 0;
+        if (said < 3) { ++said; log("[not-bound] PostThreadMessageA(tid %u, msg 0x%x, wp %u)", c.arg(0), c.arg(1), c.arg(2)); }
+        g_tqueue[c.arg(0)].push_back({ 0, c.arg(1), c.arg(2), c.arg(3) });
         return 1;
     });
     U(br, "PostMessageA", 4, [](Cpu& c) { post(c.arg(0), c.arg(1), c.arg(2), c.arg(3)); return 1u; });

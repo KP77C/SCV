@@ -272,6 +272,7 @@ static void make_port_ini() {
         // Textures go up as plain RGBA, not as palettes with a lookup table.
         { "OpenGLDrv.OpenGLRenderDevice", "UsePalette", "0" },
         { "OpenGLDrv.OpenGLRenderDevice", "ShareLists", "0" },
+        { "OpenGLDrv.OpenGLRenderDevice", "DetailTextures", "False" },   // an extra pass per surface, barely visible at 725x544
     };
     std::string text(src.begin(), src.end()), res, section;
     size_t i = 0;

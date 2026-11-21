@@ -102,6 +102,16 @@ extern unsigned long dyn86_nopend_dropped, dyn86_nopend_kept, dyn86_nopend_seen;
  *       mesure en mode 3 doit publier `ring:` (dessins et sommets par image) a
  *       cote des img/s, et etre jetee si la charge a bouge.
  */
+#if STEP == 0
+#ifndef DYN86_NOTE_LONG_BLOCK
+#define DYN86_NOTE_LONG_BLOCK
+static void dyn86_note_long_block(uintptr_t a)
+{
+    static int said = 0;
+    if(said++ < 3) printf_log(LOG_NONE, "dynarec: block at %p cut at %d x86 instructions (MAX_INSTS)\n", (void*)a, MAX_INSTS - 64);
+}
+#endif
+#endif
 static int d2_nopend_is_call(dynarec_arm_t* dyn, int ninst)
 {
     if(ninst < 0 || ninst >= dyn->size) return 0;
@@ -549,6 +559,12 @@ uintptr_t arm_pass(dynarec_arm_t* dyn, uintptr_t addr)
         memset(&dyn->insts[ninst], 0, sizeof(instruction_arm_t));
         if((ok>0) && (((box86_dynarec_bigblock<stopblock) && !isJumpTableDefault((void*)addr)) 
             || (addr>=box86_nodynarec_start && addr<box86_nodynarec_end)
+            // Port: the instruction arrays are static, MAX_INSTS long, and
+            // nothing else bounds a block. Galaxy's MP3 decoder (Deus Ex
+            // speech) is one straight run of x87 code longer than that: it
+            // overflowed static_insts into static_jmps and the translator
+            // crashed in get_first_jump. End the block well before the end.
+            || (ninst >= MAX_INSTS - 64 && (dyn86_note_long_block(init_addr), 1))
             || (dyn86_smc_single() && (getProtection(addr)&PROT_NEVERCLEAN) && dyn86_smc_stop_after(ip, addr))))
         #else
         if((ok>0) && (ninst==dyn->size))

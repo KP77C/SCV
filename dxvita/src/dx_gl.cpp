@@ -62,6 +62,7 @@ inline float GF(const uint32_t* A, int i) { float f; std::memcpy(&f, &A[i], 4); 
 inline double GD(const uint32_t* A, int i) { uint64_t v = A[i] | ((uint64_t)A[i + 1] << 32); double d; std::memcpy(&d, &v, 8); return d; }
 inline void* GP(Cpu& c, uint32_t va) { return va ? c.hostptr(va, 1) : nullptr; }
 
+uint64_t g_tex_texels = 0, g_tex_us = 0;   // texture uploads since the last stats line
 uint32_t g_bn = 0;      // vertices waiting in the draw batch (see below)
 void batch_flush();
 
@@ -296,11 +297,15 @@ void stats_line() {
     std::sort(v.rbegin(), v.rend());
     std::string s; uint64_t total = 0;
     for (auto& p : v) total += p.first;
-    for (size_t i = 0; i < v.size() && i < 14; ++i) s += " " + v[i].second + "=" + std::to_string(v[i].first / 300);
+    for (size_t i = 0; i < v.size() && i < 32; ++i) s += " " + v[i].second + "=" + std::to_string(v[i].first / 300);
     log("[not-bound] GL calls per frame (300-frame avg): total %llu,%s", (unsigned long long)(total / 300), s.c_str());
     if (g_swap_us || g_frame_us)
         log("[not-bound] GL frame: %.2f ms game+GL calls, %.2f ms in vglSwapBuffers (GPU wait + vblank)",
             g_frame_us / 300.0 / 1000.0, g_swap_us / 300.0 / 1000.0);
+    if (g_tex_texels)
+        log("[not-bound] GL textures: %llu texels uploaded per frame, %.2f ms per frame inside the upload calls",
+            (unsigned long long)(g_tex_texels / 300), g_tex_us / 300.0 / 1000.0);
+    g_tex_texels = g_tex_us = 0;
     g_swap_us = g_frame_us = 0;
     if (g_st_draws)
         log("[not-bound] GL batching: %llu game draws -> %llu GPU draws batched + %llu direct (per frame)",
@@ -374,6 +379,18 @@ void install_gl(d2rt::Bridge& br) {
         return 0;
     });
 #endif
+    // Texture uploads, counted in texels and time (the per-frame cost of
+    // OpenGlDrv converting and re-sending textures shows up here).
+    G("glTexImage2D", 9, [](Cpu& c, const uint32_t* A) -> uint32_t {
+        GLCOUNT("glTexImage2D"); const uint64_t t0 = wx86_now_us();
+        glTexImage2D((GLenum)A[0], (GLint)A[1], (GLint)A[2], (GLsizei)A[3], (GLsizei)A[4], (GLint)A[5], (GLenum)A[6], (GLenum)A[7], (GLvoid*)GP(c, A[8]));
+        g_tex_texels += (uint64_t)A[3] * A[4]; g_tex_us += wx86_now_us() - t0; return 0;
+    });
+    G("glTexSubImage2D", 9, [](Cpu& c, const uint32_t* A) -> uint32_t {
+        GLCOUNT("glTexSubImage2D"); const uint64_t t0 = wx86_now_us();
+        glTexSubImage2D((GLenum)A[0], (GLint)A[1], (GLint)A[2], (GLint)A[3], (GLsizei)A[4], (GLsizei)A[5], (GLenum)A[6], (GLenum)A[7], (GLvoid*)GP(c, A[8]));
+        g_tex_texels += (uint64_t)A[4] * A[5]; g_tex_us += wx86_now_us() - t0; return 0;
+    });
     G("glGetPointerv", 2, [](Cpu&, const uint32_t*) -> uint32_t { gl_missing("glGetPointerv"); return 0; });
     G("glGetString", 1, [](Cpu& c, const uint32_t* A) -> uint32_t { return gl_string(c, A[0]); });
 
