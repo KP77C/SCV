@@ -128,7 +128,7 @@ index 827f6f3..ed0896d 100644
    target_link_options(deusex PRIVATE -static-libstdc++ -static-libgcc)
  endif()
 diff --git a/src/audio/audio.cc b/src/audio/audio.cc
-index 4e79963..b3c7c91 100644
+index 4e79963..ee98bc4 100644
 --- a/src/audio/audio.cc
 +++ b/src/audio/audio.cc
 @@ -10,6 +10,13 @@
@@ -244,10 +244,22 @@ index 4e79963..b3c7c91 100644
          return result;
      }
  
-@@ -793,6 +844,22 @@ namespace dx::audio {
+@@ -792,7 +843,34 @@ namespace dx::audio {
+         if (it != s.sounds.end()) {
              return it->second;
          }
++        sound->ensureBytes();
          std::shared_ptr<const DecodedSound> result = decodeBytes(sound->bytes);
++        // The decoded copy is what plays; the package bytes come back from
++        // disk if the decoded copy is ever dropped. Always on the Vita;
++        // DX_RELEASE_PIXELS turns it on elsewhere for testing.
++#ifdef __vita__
++        sound->releaseBytes();
++#else
++        if (std::getenv("DX_RELEASE_PIXELS")) {
++            sound->releaseBytes();
++        }
++#endif
 +        // Decoded sounds are kept for reuse, but only up to a budget: past it,
 +        // the ones not playing right now are dropped (decoded again if needed).
 +        constexpr size_t budget = 32u << 20;
@@ -267,7 +279,7 @@ index 4e79963..b3c7c91 100644
          s.sounds.emplace(sound, result);
          if (result) {
              sound->duration = result->duration();
-@@ -971,6 +1038,22 @@ namespace dx::audio {
+@@ -971,6 +1049,22 @@ namespace dx::audio {
              return true;
          }
          readSettings(s);
@@ -290,7 +302,7 @@ index 4e79963..b3c7c91 100644
          ma_device_config config = ma_device_config_init(ma_device_type_playback);
          config.playback.format = ma_format_f32;
          config.playback.channels = 2;
-@@ -1001,6 +1084,7 @@ namespace dx::audio {
+@@ -1001,6 +1095,7 @@ namespace dx::audio {
          s.active = true;
          s.offline = false;
          return true;
@@ -298,7 +310,7 @@ index 4e79963..b3c7c91 100644
      }
  
      bool initializeOffline(uint32_t sampleRate)
-@@ -1011,6 +1095,7 @@ namespace dx::audio {
+@@ -1011,6 +1106,7 @@ namespace dx::audio {
          }
          readSettings(s);
          s.sounds.clear();
@@ -306,7 +318,7 @@ index 4e79963..b3c7c91 100644
          s.modules.clear();
          s.rate = sampleRate;
          s.active = true;
-@@ -1025,11 +1110,18 @@ namespace dx::audio {
+@@ -1025,11 +1121,18 @@ namespace dx::audio {
              return;
          }
          if (!s.offline) {
@@ -325,7 +337,7 @@ index 4e79963..b3c7c91 100644
          }
          s.active = false;
          s.offline = false;
-@@ -1051,6 +1143,7 @@ namespace dx::audio {
+@@ -1051,6 +1154,7 @@ namespace dx::audio {
          s.viewer = {};
          s.ear = {};
          s.sounds.clear();
@@ -334,7 +346,7 @@ index 4e79963..b3c7c91 100644
      }
  
 diff --git a/src/core/objects.cc b/src/core/objects.cc
-index d5f4d4a..3f7a37a 100644
+index d5f4d4a..948f3a8 100644
 --- a/src/core/objects.cc
 +++ b/src/core/objects.cc
 @@ -639,7 +639,8 @@ namespace dx {
@@ -347,8 +359,82 @@ index d5f4d4a..3f7a37a 100644
                  int32_t stackNode = 0;
                  int32_t stackState = 0;
                  int32_t stackOffset = -1;
+@@ -682,6 +683,37 @@ namespace dx {
+             object->postLoad();
+         }
+ 
++        bool reserialize(UObject* object)
++        {
++            if (!object || !object->linker || object->exportRef <= 0) {
++                return false;
++            }
++            Linker& linker = *object->linker;
++            const ExportEntry& entry = linker.file().exportAt(object->exportRef);
++            if (entry.size <= 0) {
++                return false;
++            }
++            try {
++                std::vector<uint8_t> scratch;
++                Reader reader = linker.file().exportReader(static_cast<size_t>(entry.offset), static_cast<size_t>(entry.size), scratch);
++                if (entry.flags & RF_HasStackFlag) {
++                    int32_t stackNode = reader.index();
++                    reader.index();
++                    reader.u64();
++                    reader.i32();
++                    if (stackNode != 0) {
++                        reader.index();
++                    }
++                }
++                readTaggedProperties(nullptr, nullptr, reader, linker);
++                object->serialize(reader, linker);
++                return true;
++            } catch (const std::exception& error) {
++                std::fprintf(stderr, "warning: failed reloading %s: %s\n", object->fullName().c_str(), error.what());
++                return false;
++            }
++        }
++
+         void allocateData(UObject* object)
+         {
+             UClass* cls = object->cls;
+diff --git a/src/core/objects.h b/src/core/objects.h
+index 8c72219..705595c 100644
+--- a/src/core/objects.h
++++ b/src/core/objects.h
+@@ -23,6 +23,8 @@ namespace dx {
+         Name readName(Reader& reader);
+         int32_t findExport(Name objectName, Name className, std::string_view group) const;
+         const Package& file() const;
++        // Exports created so far (null where not yet created).
++        const std::vector<UObject*>& exportedObjects() const { return exports; }
+ 
+         Name packageName;
+         UObject* packageObject = nullptr;
+@@ -74,6 +76,10 @@ namespace dx {
+         uint64_t destroyCount();
+         Name uniqueName(UClass* cls);
+         void readTaggedProperties(UStruct* structType, uint8_t* data, Reader& reader, Linker& linker);
++        // Reads an already loaded object's native data (serialize) again from
++        // its package, skipping its properties. Used to bring back texture and
++        // sound data that was dropped from memory. False if it has no export.
++        bool reserialize(UObject* object);
+         void syncObjectProperties(UObject* object);
+         UClass* classClass();
+         UClass* objectClass();
+diff --git a/src/deusex/menus.cc b/src/deusex/menus.cc
+index adc3df3..6116255 100644
+--- a/src/deusex/menus.cc
++++ b/src/deusex/menus.cc
+@@ -26,6 +26,7 @@ namespace dx::deusex {
+         std::vector<uint8_t> pixels(static_cast<size_t>(width * height) * 4);
+         for (int i = 0; i < cols * rows; i++) {
+             UTexture* tile = tiles[static_cast<size_t>(i)];
++            tile->ensurePixels();
+             bool raw = tile->format() == 5;
+             std::vector<uint8_t> rgba = raw ? std::vector<uint8_t>() : tile->rgba(0);
+             int tileWidth = static_cast<int>(tile->width());
 diff --git a/src/engine/package.cc b/src/engine/package.cc
-index 2291142..dbc8b5c 100644
+index 2291142..1a93682 100644
 --- a/src/engine/package.cc
 +++ b/src/engine/package.cc
 @@ -1,3 +1,5 @@
@@ -431,7 +517,7 @@ index 2291142..dbc8b5c 100644
          }
          bytes.resize(static_cast<size_t>(std::filesystem::file_size(path)));
 +        if (std::getenv("DX_PACKAGE_LOG")) {
-+            std::printf("package %s: %zu KiB\n", path.string().c_str(), bytes.size() / 1024);
++            std::printf("package %s: %u KiB\n", path.string().c_str(), static_cast<unsigned>(bytes.size() / 1024));
 +        }
          file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
          if (!file) {
@@ -542,6 +628,302 @@ index 41cb909..7ae8228 100644
 +        size_t base = 0;
      };
  }
+diff --git a/src/engine/resources.cc b/src/engine/resources.cc
+index 813acde..cb1116d 100644
+--- a/src/engine/resources.cc
++++ b/src/engine/resources.cc
+@@ -4,6 +4,9 @@
+ #include "engine/reader.h"
+ 
+ #include <stdexcept>
++#include <algorithm>
++#include <cstdlib>
++#include <cstdio>
+ 
+ namespace dx {
+     namespace {
+@@ -25,7 +28,10 @@ namespace dx {
+             return static_cast<size_t>(count);
+         }
+ 
+-        void readMips(Reader& reader, std::vector<TextureMip>& mips, uint16_t version)
++        // Set while ensurePixels/ensureBytes read data back in.
++        bool loadingData = false;
++
++        void readMips(Reader& reader, std::vector<TextureMip>& mips, uint16_t version, bool skipData)
+         {
+             uint8_t count = reader.u8();
+             mips.resize(count);
+@@ -33,8 +39,15 @@ namespace dx {
+                 if (version > 61) {
+                     reader.u32();
+                 }
+-                mip.data.resize(readCount(reader));
+-                reader.bytes(mip.data.data(), mip.data.size());
++                size_t size = static_cast<size_t>(readCount(reader));
++                mip.size = static_cast<uint32_t>(size);
++                if (skipData) {
++                    std::vector<uint8_t>().swap(mip.data);
++                    reader.seek(reader.tell() + size);
++                } else {
++                    mip.data.resize(size);
++                    reader.bytes(mip.data.data(), mip.data.size());
++                }
+                 mip.width = reader.u32();
+                 mip.height = reader.u32();
+                 mip.ubits = reader.u8();
+@@ -105,11 +118,130 @@ namespace dx {
+     void UTexture::serialize(Reader& reader, Linker& source)
+     {
+         uint16_t version = source.file().version();
+-        readMips(reader, mips, version);
++        bool skip = !loadingData && lazyResourceData() && !source.savedGame && exportRef > 0;
++        readMips(reader, mips, version, skip);
+         uint8_t* hasComp = propertyAddress(Name("bHasComp"));
+         if (hasComp && *reinterpret_cast<uint32_t*>(hasComp)) {
+-            readMips(reader, compressedMips, version);
++            readMips(reader, compressedMips, version, skip);
+         }
++        released = skip;
++    }
++
++    bool lazyResourceData()
++    {
++#ifdef __vita__
++        return true;
++#else
++        static const bool lazy = std::getenv("DX_RELEASE_PIXELS") != nullptr;
++        return lazy;
++#endif
++    }
++
++    void releaseLevelData(Linker* linker)
++    {
++        if (!linker || !lazyResourceData()) {
++            return;
++        }
++        size_t freed = 0;
++        auto drop = [&freed](auto& vector) {
++            freed += vector.capacity() * sizeof(vector[0]);
++            std::remove_reference_t<decltype(vector)>().swap(vector);
++        };
++        for (UObject* object : linker->exportedObjects()) {
++            if (!object || !object->loaded) {
++                continue;
++            }
++            if (UModel* model = cast<UModel>(object)) {
++                drop(model->vectors);
++                drop(model->points);
++                drop(model->nodes);
++                drop(model->surfs);
++                drop(model->verts);
++                drop(model->zones);
++                drop(model->lightMaps);
++                drop(model->lightBits);
++                drop(model->nodeBounds);
++                drop(model->leafHulls);
++                drop(model->leaves);
++                drop(model->lights);
++                model->revision++;
++            } else if (UPolys* polys = cast<UPolys>(object)) {
++                drop(polys->polys);
++            } else if (UTexture* texture = cast<UTexture>(object)) {
++                texture->releasePixels();
++            } else if (USound* sound = cast<USound>(object)) {
++                sound->releaseBytes();
++            }
++        }
++        std::printf("memory: freed %u KiB of the previous map\n", static_cast<unsigned>(freed / 1024));
++    }
++
++    namespace {
++        // Running total of texture and sound data dropped from memory,
++        // logged every 16 MiB.
++        void countReleased(size_t bytes)
++        {
++            static size_t total = 0;
++            static size_t calls = 0;
++            if (std::getenv("DX_RELEASE_TRACE") && ++calls < 20) { std::printf("release %u bytes\n", static_cast<unsigned>(bytes)); }
++            size_t before = total >> 24;
++            total += bytes;
++            if ((total >> 24) != before) {
++                std::printf("memory: %u MiB of texture/sound data released so far\n", static_cast<unsigned>(total >> 20));
++            }
++        }
++    }
++
++    void UTexture::releasePixels()
++    {
++        if (released || !linker || linker->savedGame || exportRef <= 0) {
++            return;
++        }
++        size_t freed = 0;
++        for (TextureMip& mip : mips) {
++            freed += mip.data.capacity();
++            std::vector<uint8_t>().swap(mip.data);
++        }
++        for (TextureMip& mip : compressedMips) {
++            freed += mip.data.capacity();
++        }
++        std::vector<TextureMip>().swap(compressedMips);
++        released = true;
++        countReleased(freed);
++    }
++
++    void UTexture::ensurePixels() const
++    {
++        if (!released) {
++            return;
++        }
++        UTexture* self = const_cast<UTexture*>(this);
++        self->released = false;
++        loadingData = true;
++        objects::reserialize(self);
++        loadingData = false;
++    }
++
++    void USound::releaseBytes()
++    {
++        if (released || !linker || linker->savedGame || exportRef <= 0) {
++            return;
++        }
++        size_t freed = bytes.capacity();
++        std::vector<uint8_t>().swap(bytes);
++        released = true;
++        countReleased(freed);
++    }
++
++    void USound::ensureBytes()
++    {
++        if (!released) {
++            return;
++        }
++        released = false;
++        loadingData = true;
++        objects::reserialize(this);
++        loadingData = false;
+     }
+ 
+     uint8_t UTexture::format() const
+@@ -154,13 +286,15 @@ namespace dx {
+             return false;
+         }
+         size_t pixels = static_cast<size_t>(mips[0].width) * mips[0].height;
++        // Works without the pixels being in memory (size is kept).
++        size_t stored = std::max<size_t>(mips[0].data.size(), mips[0].size);
+         switch (format()) {
+         case 0:
+-            return mips[0].data.size() >= pixels && palette() && palette()->colors.size() >= 256;
++            return stored >= pixels && palette() && palette()->colors.size() >= 256;
+         case 3:
+-            return mips[0].data.size() >= pixels / 2;
++            return stored >= pixels / 2;
+         case 5:
+-            return mips[0].data.size() >= pixels * 4;
++            return stored >= pixels * 4;
+         default:
+             return false;
+         }
+@@ -168,6 +302,7 @@ namespace dx {
+ 
+     std::vector<uint8_t> UTexture::rgba(size_t mipIndex) const
+     {
++        ensurePixels();
+         const TextureMip& mip = mips.at(mipIndex);
+         size_t pixels = static_cast<size_t>(mip.width) * mip.height;
+         std::vector<uint8_t> out(pixels * 4);
+@@ -249,8 +384,15 @@ namespace dx {
+     {
+         format = source.readName(reader);
+         reader.u32();
+-        bytes.resize(readCount(reader));
+-        reader.bytes(bytes.data(), bytes.size());
++        size_t size = static_cast<size_t>(readCount(reader));
++        released = !loadingData && lazyResourceData() && !source.savedGame && exportRef > 0;
++        if (released) {
++            std::vector<uint8_t>().swap(bytes);
++            reader.seek(reader.tell() + size);
++        } else {
++            bytes.resize(size);
++            reader.bytes(bytes.data(), bytes.size());
++        }
+     }
+ 
+     void UMusic::serialize(Reader& reader, Linker& source)
+diff --git a/src/engine/resources.h b/src/engine/resources.h
+index a8ab11b..d8a2203 100644
+--- a/src/engine/resources.h
++++ b/src/engine/resources.h
+@@ -20,9 +20,22 @@ namespace dx {
+         uint32_t height = 0;
+         uint8_t ubits = 0;
+         uint8_t vbits = 0;
++        // Byte count stored in the package; stays set when data is dropped.
++        uint32_t size = 0;
+         std::vector<uint8_t> data;
+     };
+ 
++    // When true, texture pixels and sound bytes are not kept after loading:
++    // they are read from the package when first needed (always on the Vita;
++    // DX_RELEASE_PIXELS turns it on elsewhere).
++    bool lazyResourceData();
++
++    // After travel: drops the big native data (BSP, lightmaps, pixels, sound
++    // bytes) of a map package that is no longer the current level. The
++    // objects stay, empty, since nothing frees objects. Only when
++    // lazyResourceData() is on.
++    void releaseLevelData(Linker* linker);
++
+     class UTexture : public UObject {
+     public:
+         void serialize(Reader& reader, Linker& source) override;
+@@ -35,9 +48,19 @@ namespace dx {
+         bool decodable() const;
+         std::vector<uint8_t> rgba(size_t mip) const;
+ 
++        // Memory saving (PS Vita): once a texture is on the GPU its pixel data
++        // can be dropped (sizes stay) and read back from the package when
++        // something needs it again (ensurePixels).
++        void releasePixels();
++        void ensurePixels() const;
++        bool pixelsReleased() const { return released; }
++
+         std::vector<TextureMip> mips;
+         std::vector<TextureMip> compressedMips;
+         uint32_t revision = 1;
++
++    private:
++        bool released = false;
+     };
+ 
+     struct FontCharacter {
+@@ -69,6 +92,14 @@ namespace dx {
+         std::vector<uint8_t> bytes;
+         float duration = -1;
+         void* decoded = nullptr;
++
++        // As for textures: the encoded bytes can be dropped once decoded and
++        // read back from the package when the sound is decoded again.
++        void releaseBytes();
++        void ensureBytes();
++
++    private:
++        bool released = false;
+     };
+ 
+     class UMusic : public UObject {
+diff --git a/src/engine/savegame.cc b/src/engine/savegame.cc
+index 35522e3..b3e2e3e 100644
+--- a/src/engine/savegame.cc
++++ b/src/engine/savegame.cc
+@@ -472,6 +472,7 @@ namespace dx {
+                 if (!texture) {
+                     return;
+                 }
++                texture->ensurePixels();
+                 data.index(static_cast<int32_t>(texture->mips.size()));
+                 for (const TextureMip& mip : texture->mips) {
+                     size_t skip = out.beginLazyArray(data);
 diff --git a/src/engine/world.cc b/src/engine/world.cc
 index 37f990c..8db1030 100644
 --- a/src/engine/world.cc
@@ -555,11 +937,31 @@ index 37f990c..8db1030 100644
  #else
          gethostname(host, sizeof(host) - 1);
  #endif
+diff --git a/src/extension/consys.cc b/src/extension/consys.cc
+index 2f57c6e..0ddc37a 100644
+--- a/src/extension/consys.cc
++++ b/src/extension/consys.cc
+@@ -86,6 +86,7 @@ namespace dx::extension {
+                 return 0.0f;
+             }
+             objects::ensureLoaded(sound);
++            sound->ensureBytes();
+             const std::vector<uint8_t>& bytes = sound->bytes;
+             uint32_t header = 0;
+             if (!readU32(bytes, 0, header)) {
 diff --git a/src/game/main.cc b/src/game/main.cc
-index f4ca511..d26d181 100644
+index f4ca511..4636475 100644
 --- a/src/game/main.cc
 +++ b/src/game/main.cc
-@@ -22,6 +22,27 @@
+@@ -15,6 +15,7 @@
+ #include "extension/extension.h"
+ #include "render/lighting.h"
+ #include "render/scene_renderer.h"
++#include "render/gl_device.h"
+ #ifdef DX_NETWORKING
+ #include "net/gns_transport.h"
+ #endif
+@@ -22,6 +23,27 @@
  #include <SDL.h>
  #include <glad/gl.h>
  
@@ -587,7 +989,24 @@ index f4ca511..d26d181 100644
  #ifndef _WIN32
  #include <sys/select.h>
  #include <unistd.h>
-@@ -1174,8 +1195,123 @@ namespace {
+@@ -1066,13 +1088,16 @@ namespace {
+             if (world && world->level) {
+                 previousTravelInfo = world->level->travelInfo;
+             }
++            dx::Linker* previousLevel = nullptr;
+             if (world && world->level) {
++                previousLevel = dx::objects::findLinker(world->level->outermost()->name);
+                 dx::objects::unloadPackage(world->level->outermost()->name);
+             }
+             if (driver) {
+                 driver->setWorld(nullptr);
+             }
+             world.reset();
++            dx::releaseLevelData(previousLevel);
+             canvasObject = nullptr;
+             world = std::make_unique<dx::World>();
+             world->netMode = netMode;
+@@ -1174,8 +1199,123 @@ namespace {
              dx::console::key(key, action, 0);
          }
  
@@ -711,7 +1130,7 @@ index f4ca511..d26d181 100644
              SDL_Event event;
              while (SDL_PollEvent(&event)) {
                  switch (event.type) {
-@@ -1432,6 +1568,9 @@ namespace {
+@@ -1432,6 +1572,9 @@ namespace {
  
          void step()
          {
@@ -721,23 +1140,23 @@ index f4ca511..d26d181 100644
              processEvents();
              bool gui = dx::extension::wantsMouse();
              if (gui != guiMode) {
-@@ -1439,7 +1578,15 @@ namespace {
+@@ -1439,7 +1582,15 @@ namespace {
                  SDL_SetRelativeMouseMode(gui ? SDL_FALSE : SDL_TRUE);
                  float cursorX = 0;
                  float cursorY = 0;
 +#ifdef __vita__
-+                if (gui && dx::extension::cursorPosition(cursorX, cursorY)) {
+                 if (gui && dx::extension::cursorPosition(cursorX, cursorY)) {
 +                    vitaCursorX = cursorX;
 +                    vitaCursorY = cursorY;
 +                }
 +                if (false) {
 +#else
-                 if (gui && dx::extension::cursorPosition(cursorX, cursorY)) {
++                if (gui && dx::extension::cursorPosition(cursorX, cursorY)) {
 +#endif
                      int windowWidth = 0;
                      int windowHeight = 0;
                      SDL_GetWindowSize(window, &windowWidth, &windowHeight);
-@@ -1477,6 +1624,9 @@ namespace {
+@@ -1477,6 +1628,9 @@ namespace {
              int width = 0;
              int height = 0;
              SDL_GL_GetDrawableSize(window, &width, &height);
@@ -747,7 +1166,7 @@ index f4ca511..d26d181 100644
              render(width, height);
              renderer->applyBrightness(static_cast<float>(std::atof(dx::config::system().get(videoSection(), "Brightness").value_or("0.5").c_str())));
              dx::audio::update(viewLocation, viewRotation, delta);
-@@ -1511,7 +1661,13 @@ namespace {
+@@ -1511,7 +1665,22 @@ namespace {
                  }
                  running = false;
              }
@@ -758,10 +1177,19 @@ index f4ca511..d26d181 100644
 +#ifdef __vita__
 +            vita::mark(vita::Mark::SwapDone);
 +#endif
++#ifndef __vita__
++            static const bool drawReport = std::getenv("DX_DRAW_STATS") != nullptr;
++            static uint32_t reportFrames = 0;
++            if (drawReport && ++reportFrames == 150) {
++                std::printf("draw stats: %u draws, %u texture binds, %u flag changes per frame\n", dx::drawStats.draws / reportFrames, dx::drawStats.textures / reportFrames, dx::drawStats.flags / reportFrames);
++                dx::drawStats = dx::DrawStats {};
++                reportFrames = 0;
++            }
++#endif
              limitFrameRate();
              if (options.fps > 0) {
                  SDL_Delay(static_cast<uint32_t>(1000 / options.fps));
-@@ -1665,6 +1821,37 @@ int main(int argc, char** argv)
+@@ -1665,6 +1834,37 @@ int main(int argc, char** argv)
      if (options.dedicated || options.headless) {
          return runHeadless(options);
      }
@@ -799,7 +1227,7 @@ index f4ca511..d26d181 100644
      if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
          std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
          return 1;
-@@ -1756,4 +1943,5 @@ int main(int argc, char** argv)
+@@ -1756,4 +1956,5 @@ int main(int argc, char** argv)
      SDL_Quit();
      return result;
  #endif
@@ -807,13 +1235,14 @@ index f4ca511..d26d181 100644
  }
 diff --git a/src/game/vita_platform.cc b/src/game/vita_platform.cc
 new file mode 100644
-index 0000000..0f1848f
+index 0000000..5760c6a
 --- /dev/null
 +++ b/src/game/vita_platform.cc
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,200 @@
 +#ifdef __vita__
 +
 +#include "game/vita_platform.h"
++#include "render/gl_device.h"
 +
 +#include <psp2/ctrl.h>
 +#include <psp2/kernel/processmgr.h>
@@ -835,7 +1264,7 @@ index 0000000..0f1848f
 +// takes what is left for the GPU, then borrows from this heap if it runs out.
 +extern "C" {
 +int setenv(const char* name, const char* value, int overwrite);
-+unsigned int _newlib_heap_size_user = 240 * 1024 * 1024;
++unsigned int _newlib_heap_size_user = 256 * 1024 * 1024;
 +// UnrealScript calls nest deeply; the default 256 KiB main stack is too small.
 +unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 +}
@@ -934,7 +1363,7 @@ index 0000000..0f1848f
 +        glClearColor(0, 0, 0, 1);
 +        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 +        vglSwapBuffers(GL_FALSE);
-+        std::printf("GPU ready: VRAM %zu KiB free, GPU RAM %zu KiB free\n", vglMemFree(VGL_MEM_VRAM) / 1024, vglMemFree(VGL_MEM_RAM) / 1024);
++        std::printf("GPU ready: VRAM %u KiB free, GPU RAM %u KiB free\n", static_cast<unsigned>(vglMemFree(VGL_MEM_VRAM) / 1024), static_cast<unsigned>(vglMemFree(VGL_MEM_RAM) / 1024));
 +    }
 +
 +    void readPad(Pad& pad)
@@ -994,12 +1423,14 @@ index 0000000..0f1848f
 +                SceKernelFreeMemorySizeInfo free {};
 +                free.size = sizeof(free);
 +                sceKernelGetFreeMemorySize(&free);
-+                std::printf("speed: %.1f fps | per frame: game %.1f ms, drawing %.1f ms, GPU wait+swap %.1f ms, worst frame %.0f ms | heap used %d MiB | VRAM free %zu MiB, GPU RAM free %zu MiB, system free %d MiB\n",
++                std::printf("speed: %.1f fps | per frame: game %.1f ms, drawing %.1f ms, GPU wait+swap %.1f ms, worst frame %.0f ms | %u draws, %u texture binds | heap used %d MiB | VRAM free %u MiB, GPU RAM free %u MiB, system free %d MiB\n",
 +                    n / window, timing.tick / n, timing.render / n, timing.swap / n, timing.worst,
-+                    heap.uordblks / (1024 * 1024), vglMemFree(VGL_MEM_VRAM) / (1024 * 1024), vglMemFree(VGL_MEM_RAM) / (1024 * 1024),
++                    dx::drawStats.draws / static_cast<unsigned>(n), dx::drawStats.textures / static_cast<unsigned>(n),
++                    heap.uordblks / (1024 * 1024), static_cast<unsigned>(vglMemFree(VGL_MEM_VRAM) / (1024 * 1024)), static_cast<unsigned>(vglMemFree(VGL_MEM_RAM) / (1024 * 1024)),
 +                    free.size_user / (1024 * 1024));
 +                timing = Timing {};
 +                timing.windowStart = t;
++                dx::drawStats = dx::DrawStats {};
 +            }
 +            break;
 +        }
@@ -1050,10 +1481,15 @@ index 0000000..7aa2a1c
 +
 +#endif
 diff --git a/src/render/gl_device.cc b/src/render/gl_device.cc
-index 38db00b..9de74d2 100644
+index 38db00b..8e57d76 100644
 --- a/src/render/gl_device.cc
 +++ b/src/render/gl_device.cc
-@@ -6,8 +6,12 @@ namespace dx {
+@@ -3,11 +3,17 @@
+ #include <glad/gl.h>
+ 
+ namespace dx {
++    DrawStats drawStats;
++
      GLRenderDevice::GLRenderDevice()
      {
          shader = std::make_unique<UberShader>();
@@ -1066,7 +1502,7 @@ index 38db00b..9de74d2 100644
          textures = std::make_unique<TextureCache>();
          canvasImpl = std::make_unique<GLCanvas>(*shader, *textures);
      }
-@@ -16,6 +20,9 @@ namespace dx {
+@@ -16,6 +22,9 @@ namespace dx {
  
      bool GLRenderDevice::drawingToWindow()
      {
@@ -1076,7 +1512,7 @@ index 38db00b..9de74d2 100644
          GLint boundFramebuffer = 0;
          glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &boundFramebuffer);
          return boundFramebuffer == 0;
-@@ -23,21 +30,35 @@ namespace dx {
+@@ -23,21 +32,35 @@ namespace dx {
  
      void GLRenderDevice::bindGammaTarget(int width, int height)
      {
@@ -1112,7 +1548,7 @@ index 38db00b..9de74d2 100644
          bool occluding = ambientOcclusion != OcclusionQuality::Off;
          if (occluding && !occlusionPass) {
              occlusionPass = std::make_unique<OcclusionPass>();
-@@ -53,11 +74,17 @@ namespace dx {
+@@ -53,11 +76,17 @@ namespace dx {
  
      void GLRenderDevice::endScene(int width, int height, bool fxaa)
      {
@@ -1130,7 +1566,7 @@ index 38db00b..9de74d2 100644
          scenePass->clearMask();
      }
  
-@@ -78,6 +105,9 @@ namespace dx {
+@@ -78,6 +107,9 @@ namespace dx {
  
      void GLRenderDevice::applyOcclusion(float nearPlane, float farPlane, float tanHalfWidth, float tanHalfHeight)
      {
@@ -1140,7 +1576,7 @@ index 38db00b..9de74d2 100644
          if (!scenePass->occluding()) {
              return;
          }
-@@ -181,7 +211,7 @@ namespace dx {
+@@ -181,7 +213,7 @@ namespace dx {
  
      void GLRenderDevice::setWireframe(bool enabled)
      {
@@ -1149,7 +1585,7 @@ index 38db00b..9de74d2 100644
          glPolygonMode(GL_FRONT_AND_BACK, enabled ? GL_LINE : GL_FILL);
  #else
          static_cast<void>(enabled);
-@@ -201,12 +231,13 @@ namespace dx {
+@@ -201,12 +233,13 @@ namespace dx {
      void GLRenderDevice::setBlend(BlendMode mode)
      {
          shader->setBlend(mode);
@@ -1165,7 +1601,39 @@ index 38db00b..9de74d2 100644
          for (int32_t i = 0; i < 8; i++) {
              if (i < count) {
                  glEnable(static_cast<GLenum>(GL_CLIP_DISTANCE0 + i));
-@@ -302,7 +333,9 @@ namespace dx {
+@@ -230,6 +263,7 @@ namespace dx {
+ 
+     void GLRenderDevice::setFlags(int32_t flags)
+     {
++        drawStats.flags++;
+         shader->setFlags(flags);
+     }
+ 
+@@ -265,6 +299,7 @@ namespace dx {
+ 
+     void GLRenderDevice::bindTexture(uint32_t texture)
+     {
++        drawStats.textures++;
+         shader->bindTexture(texture);
+     }
+ 
+@@ -275,6 +310,7 @@ namespace dx {
+ 
+     void GLRenderDevice::draw(const std::vector<GLVertex>& vertices, Primitive primitive)
+     {
++        drawStats.draws++;
+         shader->draw(vertices, primitive == Primitive::Lines ? GL_LINES : GL_TRIANGLES);
+     }
+ 
+@@ -285,6 +321,7 @@ namespace dx {
+ 
+     void GLRenderDevice::drawRange(int32_t first, int32_t count)
+     {
++        drawStats.draws++;
+         shader->drawRange(first, count);
+     }
+ 
+@@ -302,7 +339,9 @@ namespace dx {
          if (found == staticBuffers.end()) {
              return;
          }
@@ -1175,7 +1643,17 @@ index 38db00b..9de74d2 100644
          glDeleteBuffers(1, &found->second);
          staticBuffers.erase(found);
      }
-@@ -322,6 +355,30 @@ namespace dx {
+@@ -314,14 +353,40 @@ namespace dx {
+ 
+     void GLRenderDevice::drawStatic(uint32_t geometry, int32_t first, int32_t count)
+     {
++        drawStats.draws++;
+         shader->drawStatic(geometry, first, count);
+     }
+ 
+     void GLRenderDevice::drawStaticRanges(uint32_t geometry, const int32_t* firsts, const int32_t* counts, int32_t ranges)
+     {
++        drawStats.draws += static_cast<uint32_t>(ranges);
          shader->drawStaticRanges(geometry, firsts, counts, ranges);
      }
  
@@ -1206,7 +1684,7 @@ index 38db00b..9de74d2 100644
      uint32_t GLRenderDevice::createQuery()
      {
          GLuint query = 0;
-@@ -356,6 +413,7 @@ namespace dx {
+@@ -356,6 +421,7 @@ namespace dx {
          visible = result != 0;
          return true;
      }
@@ -1214,7 +1692,7 @@ index 38db00b..9de74d2 100644
  
      void GLRenderDevice::beginTextureFrame(double time)
      {
-@@ -394,7 +452,9 @@ namespace dx {
+@@ -394,7 +460,9 @@ namespace dx {
          glGenTextures(1, &id);
          glBindTexture(GL_TEXTURE_2D, id);
          glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
@@ -1224,6 +1702,26 @@ index 38db00b..9de74d2 100644
          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+diff --git a/src/render/gl_device.h b/src/render/gl_device.h
+index 0c3512e..f5a0700 100644
+--- a/src/render/gl_device.h
++++ b/src/render/gl_device.h
+@@ -9,6 +9,15 @@
+ #include <unordered_map>
+ 
+ namespace dx {
++    // Draw calls and state changes sent to the GPU since the last reset
++    // (for speed reports).
++    struct DrawStats {
++        uint32_t draws = 0;
++        uint32_t textures = 0;
++        uint32_t flags = 0;
++    };
++    extern DrawStats drawStats;
++
+     class GLRenderDevice : public RenderDevice {
+     public:
+         GLRenderDevice();
 diff --git a/src/render/gl_shader.cc b/src/render/gl_shader.cc
 index 5a458c2..9a24e4e 100644
 --- a/src/render/gl_shader.cc
@@ -1298,11 +1796,71 @@ index 66508ac..eee4a26 100644
      };
  
      class GammaPass {
+diff --git a/src/render/procedural.cc b/src/render/procedural.cc
+index 60247eb..6f234b1 100644
+--- a/src/render/procedural.cc
++++ b/src/render/procedural.cc
+@@ -228,6 +228,9 @@ namespace dx {
+         {
+             objects::ensureLoaded(object);
+             UTexture* texture = cast<UTexture>(object);
++            if (texture) {
++                texture->ensurePixels();
++            }
+             if (!texture || texture->mips.empty() || texture->format() != 0) {
+                 return nullptr;
+             }
 diff --git a/src/render/scene_renderer.cc b/src/render/scene_renderer.cc
-index 259a101..6b4162a 100644
+index 259a101..47e9abf 100644
 --- a/src/render/scene_renderer.cc
 +++ b/src/render/scene_renderer.cc
-@@ -3326,6 +3326,12 @@ namespace dx {
+@@ -8,6 +8,7 @@
+ #include "render/lighting.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <bit>
+ #include <chrono>
+ #include <cmath>
+@@ -43,6 +44,19 @@ namespace dx {
+         constexpr uint32_t PF_Unlit = 0x00400000;
+         constexpr uint32_t PF_Portal = 0x04000000;
+         constexpr uint32_t PF_Mirrored = 0x08000000;
++
++        // Mirror reflections draw the whole scene again for each mirror. The
++        // Vita draws mirrors as plain surfaces unless DX_MIRRORS=1.
++        bool mirrorReflections()
++        {
++#ifdef __vita__
++            static const bool enabled = std::getenv("DX_MIRRORS") != nullptr;
++            return enabled;
++#else
++            static const bool enabled = std::getenv("DX_NO_MIRRORS") == nullptr;
++            return enabled;
++#endif
++        }
+         constexpr int32_t MaxFrameRecursion = 4;
+ 
+         constexpr uint8_t DT_Sprite = 1;
+@@ -586,7 +600,7 @@ namespace dx {
+             bottom = std::clamp(bottom, -1.0f, static_cast<float>(viewportHeight) + 1.0f);
+             return spans.rectVisible(static_cast<int32_t>(std::floor(left)) - 1, static_cast<int32_t>(std::floor(top)) - 1, static_cast<int32_t>(std::ceil(right)) + 1, static_cast<int32_t>(std::ceil(bottom)) + 1);
+         };
+-        bool mirrorsActive = view.recursion < MaxFrameRecursion - 1;
++        bool mirrorsActive = mirrorReflections() && view.recursion < MaxFrameRecursion - 1;
+         const std::vector<BspNode>& nodes = model->nodes;
+         int32_t sequence = 0;
+         Vector clipA[64];
+@@ -1259,7 +1273,7 @@ namespace dx {
+             });
+         }
+         bool skyActive = levelData.hasBackdrop;
+-        bool mirrorsActive = view.recursion < MaxFrameRecursion - 1;
++        bool mirrorsActive = mirrorReflections() && view.recursion < MaxFrameRecursion - 1;
+         if (translucentPass) {
+             std::vector<TranslucentSurface>& surfaces = scratchTranslucentSurfaces;
+             surfaces.clear();
+@@ -3326,6 +3340,12 @@ namespace dx {
          occlusionBoxes.clear();
          occlusionIssued.clear();
          occlusionUnconfirmed.clear();
@@ -1315,8 +1873,17 @@ index 259a101..6b4162a 100644
          size_t kept = 0;
          for (UObject* actor : candidates) {
              bool keep = true;
+@@ -3541,7 +3561,7 @@ namespace dx {
+             device->setDepthWrite(true);
+             device->clear(false, true, 1.0f);
+         }
+-        if (!levelData.mirrors.empty() && !wireframe) {
++        if (!levelData.mirrors.empty() && !wireframe && mirrorReflections()) {
+             drawMirrors(view, actors);
+             device->setDepthWrite(true);
+             device->clear(false, true, 1.0f);
 diff --git a/src/render/texture_cache.cc b/src/render/texture_cache.cc
-index 4640c7c..e7a626f 100644
+index 4640c7c..60c2510 100644
 --- a/src/render/texture_cache.cc
 +++ b/src/render/texture_cache.cc
 @@ -7,6 +7,8 @@
@@ -1338,19 +1905,33 @@ index 4640c7c..e7a626f 100644
              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
              if (smooth) {
-@@ -209,6 +213,11 @@ namespace dx {
+@@ -209,6 +213,25 @@ namespace dx {
          }
          glGenTextures(1, &info.id);
          glBindTexture(GL_TEXTURE_2D, info.id);
 +#ifdef __vita__
 +        if (uploadVita(texture, info)) {
++            // The GPU has its own copy now; the package copy is read again
++            // only if something on the CPU side needs the pixels.
++            texture->releasePixels();
 +            return true;
 +        }
 +#endif
++        static const bool releaseAfterUpload = std::getenv("DX_RELEASE_PIXELS") != nullptr;
++        struct ReleaseLater {
++            UTexture* texture;
++            bool enabled;
++            ~ReleaseLater()
++            {
++                if (enabled) {
++                    texture->releasePixels();
++                }
++            }
++        } releaseLater { texture, releaseAfterUpload };
          int32_t levels = 0;
          for (size_t mip = 0; mip < texture->mips.size(); mip++) {
              const TextureMip& level = texture->mips[mip];
-@@ -252,6 +261,106 @@ namespace dx {
+@@ -252,6 +275,107 @@ namespace dx {
          return true;
      }
  
@@ -1367,6 +1948,7 @@ index 4640c7c..e7a626f 100644
 +        if (format != 0 && format != 3) {
 +            return false;
 +        }
++        texture->ensurePixels();
 +        static const uint32_t skipWanted = [] {
 +            const char* value = std::getenv("DX_TEXTURE_SKIP");
 +            return value ? static_cast<uint32_t>(std::atoi(value)) : 0u;
@@ -1473,10 +2055,10 @@ index e839bb5..9d65bc3 100644
          std::unordered_map<UTexture*, GLTextureInfo> maskedTextures;
 diff --git a/src/render/vita_shader.cc b/src/render/vita_shader.cc
 new file mode 100644
-index 0000000..b57bd2f
+index 0000000..c705539
 --- /dev/null
 +++ b/src/render/vita_shader.cc
-@@ -0,0 +1,534 @@
+@@ -0,0 +1,543 @@
 +// PS Vita version of UberShader (render/gl_shader.h).
 +//
 +// The PC build draws everything with one GLSL program that tests uFlags for
@@ -1730,7 +2312,7 @@ index 0000000..b57bd2f
 +            seen = 0xffffffffu;
 +        }
 +        cache.emplace_back(key, entry);
-+        std::printf("Vita shader 0x%03x ready (%zu built)\n", static_cast<unsigned>(key), cache.size());
++        std::printf("Vita shader 0x%03x ready (%u built)\n", static_cast<unsigned>(key), static_cast<unsigned>(cache.size()));
 +        return *entry;
 +    }
 +
@@ -2004,8 +2586,17 @@ index 0000000..b57bd2f
 +    {
 +        apply();
 +        bindStatic(geometry);
-+        for (int32_t i = 0; i < ranges; i++) {
-+            glDrawArrays(GL_TRIANGLES, firsts[i], counts[i]);
++        // Ranges that follow each other in the buffer go out as one draw.
++        int32_t i = 0;
++        while (i < ranges) {
++            int32_t first = firsts[i];
++            int32_t count = counts[i];
++            i++;
++            while (i < ranges && firsts[i] == first + count) {
++                count += counts[i];
++                i++;
++            }
++            glDrawArrays(GL_TRIANGLES, first, count);
 +        }
 +    }
 +}
