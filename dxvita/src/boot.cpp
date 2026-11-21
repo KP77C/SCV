@@ -337,6 +337,8 @@ int main(int argc, char** argv) {
         // DeusEx.exe has relocations and its preferred base (0x10900000) is
         // outside the arena: place it in the module window like a DLL.
         setenv("WX86_RELOC_EXE", "1", 1);
+        // Fire.dll rewrites instructions inside its own blocks (see custommem.h).
+        setenv("WX86_SMC_SINGLE", "1", 0);
     }
     make_port_ini();
     d2rt::Cpu* cpu = d2rt::make_cpu_box86();
@@ -352,6 +354,7 @@ int main(int argc, char** argv) {
     // Anything else (KERNEL32, USER32 ...) is a shim. DllMains run later in
     // dependency order (deepest first), as the Windows loader does.
     std::vector<d2rt::PeImage*> init_order;
+    std::vector<std::pair<uint32_t, std::pair<std::string, std::vector<uint8_t>>>> static_files;
     {
         std::set<std::string> seen;
         std::function<bool(const std::string&)> load = [&](const std::string& f) -> bool {
@@ -362,6 +365,7 @@ int main(int argc, char** argv) {
             d2rt::PeImage* pi = br.add_module(f, bytes, err);
             if (!pi) { log("[not-bound] [cause: load error] %s: %s", f.c_str(), err.c_str()); return false; }
             register_module(f, pi->load_base());
+            static_files.emplace_back(pi->load_base(), std::make_pair(f, bytes));
             log("[not-bound] loaded %-14s base=0x%08x size=0x%07x entry=0x%08x imports=%zu",
                 f.c_str(), pi->load_base(), pi->image_size(), pi->entry_va(), pi->imports().size());
             std::set<std::string> deps;
@@ -426,6 +430,8 @@ int main(int argc, char** argv) {
     });
 
     if (!br.commit(err)) { log("[not-bound] [cause: map error] commit: %s", err.c_str()); return 1; }
+    for (auto& sf : static_files) mark_writable_sections(*cpu, sf.first, sf.second.second, sf.second.first);
+    static_files.clear();
     if (!br.link(err))   { log("[not-bound] [cause: link error] link: %s", err.c_str()); return 1; }
     log("[not-bound] linked: %u imports routed to the catch-all shim", br.unresolved_count());
 

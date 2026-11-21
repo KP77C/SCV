@@ -32,6 +32,8 @@ constexpr const char* kExeName = "DeusEx.exe";
 void register_module(const std::string& key, uint32_t base);
 // Load base of the exe (GetModuleHandle(NULL)).
 uint32_t exe_base();
+// Mark a loaded image's writable sections as volatile code (sc_kernel32.cpp).
+void mark_writable_sections(d2rt::Cpu& c, uint32_t base, const std::vector<uint8_t>& file, const std::string& name);
 // Run guest stdcall `fn` to completion from inside a shim; returns its EAX (sc_user32.cpp).
 uint32_t guest_call(d2rt::Cpu& c, uint32_t fn, std::initializer_list<uint32_t> args);
 // Write every mapped, in-use guest region to <dir>/mem_<addr>.bin (boot.cpp).

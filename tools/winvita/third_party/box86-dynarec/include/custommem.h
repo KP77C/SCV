@@ -67,7 +67,12 @@ void loadProtectionFromMap();
 #ifdef DYNAREC
 void protectDB(uintptr_t addr, size_t size);
 void unprotectDB(uintptr_t addr, size_t size, int mark);    // if mark==0, the blocks are not marked as potentially dirty
-void dyn86_mark_volatile_code(uintptr_t addr, uintptr_t size);   // port addition: always re-validate code here
+void dyn86_mark_volatile_code(uintptr_t addr, uintptr_t size);
+// Port addition (Deus Ex): WX86_SMC_SINGLE=1 makes every block translated in
+// volatile (PROT_NEVERCLEAN) memory one instruction long, so code that
+// rewrites an instruction further down its own block (Fire.dll's water and
+// fire painters) sees the new bytes, as a real x86 does.
+int dyn86_smc_single(void);   // port addition: always re-validate code here
 int isprotectedDB(uintptr_t addr, size_t size);
 #endif
 void* find32bitBlock(size_t size);

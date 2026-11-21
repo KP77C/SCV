@@ -234,6 +234,25 @@ std::vector<std::string> pe_import_dlls(const std::vector<uint8_t>& f) {
     return out;
 }
 
+// Deus Ex's Fire.dll keeps its water/fire renderers in .data and rewrites
+// their displacements as it runs (self-modifying code). The dynarec has no
+// write-fault SMC detection, so code in writable sections must be marked
+// volatile (re-validated on every entry). Data that never runs costs nothing.
+void mark_writable_sections_impl(Cpu& c, uint32_t base, const std::vector<uint8_t>& f, const std::string& name) {
+    auto u16 = [&](size_t o) -> uint32_t { return o + 2 <= f.size() ? (uint32_t)(f[o] | f[o + 1] << 8) : 0; };
+    auto u32 = [&](size_t o) -> uint32_t { return o + 4 <= f.size() ? (u16(o) | u16(o + 2) << 16) : 0; };
+    if (f.size() < 0x40) return;
+    const uint32_t pe = u32(0x3c), ns = u16(pe + 6), so = u16(pe + 20);
+    for (uint32_t i = 0; i < ns; ++i) {
+        size_t o = pe + 24 + so + i * 40;
+        uint32_t vs = u32(o + 8), va = u32(o + 12), ch = u32(o + 36);
+        if ((ch & 0x80000000u) && vs) {       // IMAGE_SCN_MEM_WRITE
+            c.mark_volatile_code(base + va, vs);
+            if (std::getenv("DX_TRACE_SMC")) log("[not-bound] %s: writable section 0x%08x+0x%x marked volatile", name.c_str(), base + va, vs);
+        }
+    }
+}
+
 uint32_t load_library(Cpu& c, const std::string& name) {
     std::string lb = lower(with_dll_ext(basename_of(name)));
     auto it = g_modkey.find(lb);
@@ -260,6 +279,7 @@ uint32_t load_library(Cpu& c, const std::string& name) {
     d2rt::PeImage* pi = g_br->load_library_runtime(lb, bytes, err);
     if (!pi) { log("[not-bound] [cause: load error] LoadLibraryA(%s): %s", name.c_str(), err.c_str()); return 0; }
     g_modkey[lb] = lb; g_modbase[pi->load_base()] = lb;
+    mark_writable_sections_impl(c, pi->load_base(), bytes, lb);
     log("[not-bound] LoadLibraryA(%s) -> 0x%08x", name.c_str(), pi->load_base());
     if (lb == "smackw32.dll" && std::getenv("SC_TRACE_SMK")) {
         // Debug: observe Smacker's sound-service routine (entry = base+0x8e20,
@@ -933,5 +953,8 @@ void register_module(const std::string& key, uint32_t base) {
     if (lb == "deusex.exe") g_exe_base = base;
 }
 uint32_t exe_base() { return g_exe_base; }
+void mark_writable_sections(d2rt::Cpu& c, uint32_t base, const std::vector<uint8_t>& f, const std::string& name) {
+    mark_writable_sections_impl(c, base, f, name);
+}
 
 }  // namespace sc

@@ -1246,6 +1246,13 @@ int checkInHotPage(uintptr_t addr)
 // With no SIGSEGV-based SMC detection, such pages get PROT_NEVERCLEAN: blocks
 // translated there are always_test (re-hashed on every lookup, never
 // direct-linked), so a rewrite is picked up on the next entry.
+int dyn86_smc_single(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("WX86_SMC_SINGLE"); v = (e && e[0] == '1') ? 1 : 0; }
+    return v;
+}
+
 void dyn86_mark_volatile_code(uintptr_t addr, uintptr_t size)
 {
     uintptr_t cur = addr & ~(box86_pagesize-1);

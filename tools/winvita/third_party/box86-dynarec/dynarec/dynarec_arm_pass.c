@@ -548,7 +548,8 @@ uintptr_t arm_pass(dynarec_arm_t* dyn, uintptr_t addr)
         #if STEP == 0
         memset(&dyn->insts[ninst], 0, sizeof(instruction_arm_t));
         if((ok>0) && (((box86_dynarec_bigblock<stopblock) && !isJumpTableDefault((void*)addr)) 
-            || (addr>=box86_nodynarec_start && addr<box86_nodynarec_end)))
+            || (addr>=box86_nodynarec_start && addr<box86_nodynarec_end)
+            || (dyn86_smc_single() && (getProtection(addr)&PROT_NEVERCLEAN))))
         #else
         if((ok>0) && (ninst==dyn->size))
         #endif
