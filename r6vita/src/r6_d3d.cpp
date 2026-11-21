@@ -449,9 +449,10 @@ void apply_state(Cpu& c) {
     // Blending.
     if (g_rs[27]) { glEnable(GL_BLEND); glBlendFunc(gl_blend(g_rs[19], true), gl_blend(g_rs[20], false)); }
     else glDisable(GL_BLEND);
-    // Culling (D3D counter-clockwise on screen = GL back face).
+    // Culling. D3DCULL_CCW (3) keeps the faces that are clockwise on screen; checked
+    // against the game (the tutorial range draws whole with CULL_CCW -> GL_FRONT here).
     if (g_rs[22] == 1) glDisable(GL_CULL_FACE);
-    else { glEnable(GL_CULL_FACE); glFrontFace(GL_CCW); glCullFace(g_rs[22] == 3 ? GL_BACK : GL_FRONT); }
+    else { glEnable(GL_CULL_FACE); glFrontFace(GL_CCW); glCullFace(g_rs[22] == 3 ? GL_FRONT : GL_BACK); }
     glShadeModel(g_rs[9] == 1 ? GL_FLAT : GL_SMOOTH);
     // Textures, stages 0 and 1.
     Surf* t0 = stage_surf(0);
@@ -497,6 +498,11 @@ void apply_state(Cpu& c) {
     else glDisable(GL_ALPHA_TEST);
     glDisable(GL_LIGHTING);
     glDisable(GL_FOG);
+    // R6_DBG bits, to find what hides geometry: 1 no depth test, 2 no culling, 4 no texture.
+    static const unsigned dbg = std::getenv("R6_DBG") ? (unsigned)std::strtoul(std::getenv("R6_DBG"), nullptr, 0) : 0;
+    if (dbg & 1) glDisable(GL_DEPTH_TEST);
+    if (dbg & 2) glDisable(GL_CULL_FACE);
+    if (dbg & 4) { glActiveTexture(GL_TEXTURE1); glDisable(GL_TEXTURE_2D); glActiveTexture(GL_TEXTURE0); glDisable(GL_TEXTURE_2D); }
 }
 
 // ---- render-target sync ------------------------------------------------------------
@@ -575,6 +581,13 @@ void present_frame(Cpu& c) {
             (unsigned long long)(g_readbacks - last_rb), (unsigned long long)(g_uploads - last_up), (unsigned long long)(g_tex_uploads - last_tex),
             (unsigned long long)g_blt_gl, (unsigned long long)g_blt_mem);
         t0 = now; last_flips = g_flips; last_draws = g_draw_calls; last_tris = g_tris; last_rb = g_readbacks; last_up = g_uploads; last_tex = g_tex_uploads;
+    }
+    {
+        static const long at = std::getenv("R6_DUMP_AT") ? std::atol(std::getenv("R6_DUMP_AT")) : -1;
+        if (at > 0 && g_flips >= 1000 && (long)((g_flips - 1) % at) == 0) {
+            uint8_t px[4] = {}; glReadPixels(320, 300, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            log("[dump] present: px(320,300 gl) %02x%02x%02x", px[0], px[1], px[2]);
+        }
     }
     // The offscreen frame, scaled into the window.
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -680,6 +693,18 @@ void draw(Cpu& c, uint32_t prim, const VDecl& d, uint32_t nverts, const uint16_t
             else { tc[2 * i] = 0; tc[2 * i + 1] = 0; }
         }
     }
+    {   // R6_DUMP_AT=<n>: log the draws of every n-th frame (after 1000) (vertex data and the states that hide geometry)
+        static const long at = std::getenv("R6_DUMP_AT") ? std::atol(std::getenv("R6_DUMP_AT")) : -1;
+        if (at > 0 && g_flips >= 1000 && (long)(g_flips % at) == 0) {   // every <at>-th flip
+            log("[dump] prim %u fvf %x verts %u idx %u | zen %u zfn %u zw %u cull %u ablend %u src %u dst %u atest %u aref %x afn %u fog %u tex %d",
+                prim, d.fvf, nverts, idx ? nidx : 0, g_rs[7], g_rs[23], g_rs[14], g_rs[22], g_rs[27], g_rs[19], g_rs[20], g_rs[15], g_rs[24], g_rs[25], g_rs[28], (int)g_stage_tex[0]);
+            for (uint32_t i = 0; i < nverts && i < 3; ++i) {
+                const float* p = (const float*)(d.pos.p + i * d.pos.stride);
+                uint32_t cd = 0; if (d.diff.p) std::memcpy(&cd, d.diff.p + i * d.diff.stride, 4);
+                log("[dump]   v%u %.2f %.2f %.4f %.4f col %08x uv %.3f %.3f", i, p[0], p[1], p[2], d.rhw ? p[3] : 1.f, cd, tc0[2 * i], tc0[2 * i + 1]);
+            }
+        }
+    }
     const float rw = (float)g_rt->w, rh = (float)g_rt->h;
     if (d.rhw) {
         // Screen pixels (D3D pixel centres on integers) -> clip space; the
@@ -709,6 +734,21 @@ void draw(Cpu& c, uint32_t prim, const VDecl& d, uint32_t nverts, const uint16_t
     glDisableClientState(GL_COLOR_ARRAY);
     ++g_draw_calls; g_tris += tris;
     g_gl_dirty = true;
+    {
+        static const long at = std::getenv("R6_DUMP_AT") ? std::atol(std::getenv("R6_DUMP_AT")) : -1;
+        if (at > 0 && g_flips >= 1000 && (long)(g_flips % at) == 0) {
+            uint8_t px[4] = {}; GLint fb = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+            glReadPixels(320, 300, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            log("[dump]   after: px(320,300 gl) %02x%02x%02x fb %d err %x", px[0], px[1], px[2], fb, glGetError());
+            GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp); GLboolean cm[4]; glGetBooleanv(GL_COLOR_WRITEMASK, cm);
+            GLfloat mv[16], pj[16], dr[2]; glGetFloatv(GL_MODELVIEW_MATRIX, mv); glGetFloatv(GL_PROJECTION_MATRIX, pj); glGetFloatv(GL_DEPTH_RANGE, dr);
+            const float* v = pos.data(); float cl[4];
+            for (int r = 0; r < 4; ++r) cl[r] = mv[r] * v[0] + mv[4 + r] * v[1] + mv[8 + r] * v[2] + mv[12 + r] * v[3];
+            log("[dump]   vp %d %d %d %d mask %d%d%d%d scis %d sten %d alpha %d blend %d tex0 %d dr %.2f-%.2f clip(v0) %.2f %.2f %.2f %.2f pj00 %.2f",
+                vp[0], vp[1], vp[2], vp[3], cm[0], cm[1], cm[2], cm[3], glIsEnabled(GL_SCISSOR_TEST), glIsEnabled(GL_STENCIL_TEST), glIsEnabled(GL_ALPHA_TEST),
+                glIsEnabled(GL_BLEND), glIsEnabled(GL_TEXTURE_2D), dr[0], dr[1], cl[0], cl[1], cl[2], cl[3], pj[0]);
+        }
+    }
 }
 
 // Clear the render target's GL frame (rects in render-target pixels).

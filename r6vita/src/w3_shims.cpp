@@ -228,7 +228,7 @@ void seed_registry() {
         const std::string key = k;
         const char* sw = std::getenv("R6_SOFTWARE");
         const char* res = std::getenv("R6_RES");
-        reg_seed_sz(key, "SoftwareOnly", sw && sw[0] == '0' ? "FALSE" : "TRUE");
+        reg_seed_sz(key, "SoftwareOnly", sw && sw[0] == '1' ? "TRUE" : "FALSE");   // TRUE = the game's own software rasterizer (R6_SOFTWARE=1)
         reg_seed_sz(key, "VideoResolution", res && *res ? res : "640x480");
         reg_seed_sz(key, "FullScreen", "TRUE");
         reg_seed_sz(key, "UseForceFeedbackMouse", "FALSE");   // the FEELit mouse driver switches the cursor to absolute mode
