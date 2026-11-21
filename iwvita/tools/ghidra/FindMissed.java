@@ -16,7 +16,7 @@ public class FindMissed extends GhidraScript {
     for(MemoryBlock b:m.getBlocks()) if(b.getStart().getOffset()==0x12000) text=b;
     println("text "+text.getSize()+" covered before "+cover(text));
     int made=0;
-    for(MemoryBlock b:m.getBlocks()){ if(b.isExecute()||b.getStart().getOffset()<0x663720)continue;
+    for(MemoryBlock b:m.getBlocks()){ if(b.getStart().getOffset()<0x663720||b.getName().startsWith("_elf"))continue;
       for(Address a=b.getStart(); a.compareTo(b.getEnd().subtract(3))<0; a=a.add(4)){
         long v; try{v=m.getInt(a)&0xffffffffL;}catch(Exception e){continue;}
         if(v<0x12000||v>=0x12000+text.getSize())continue;

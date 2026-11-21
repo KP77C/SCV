@@ -9,7 +9,7 @@ segs=[(base,0,hdrsz,hdrsz,4,'HEADERS')]
 for i in range(nsec):
     fl,v,vs,raw,rs,np=struct.unpack_from('<IIIIII',d,secp-base+i*56)
     name=d[np-base:np-base+16].split(b'\0')[0].decode()
-    perm=4|(2 if fl&1 else 0)|(1 if fl&4 else 0)
+    perm=4|(2 if fl&1 else 0)|(1 if v<0x663720 and fl&4 else 0)
     segs.append((v,raw,rs,vs,perm,name))
 print('entry',hex(entry),'thunk',hex(thunk))
 n=len(segs); phoff=52; dataoff=phoff+32*n

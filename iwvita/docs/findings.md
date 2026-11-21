@@ -36,7 +36,24 @@ For comparison, Republic Commando (deltasquad) counted 12,356 functions / 2.7 MB
 
 ## Missed functions
 
-`tools/ghidra/FindMissed.java` adds functions at code pointers found in the data sections (105) and at 16-byte aligned starts after `CC`/`90` padding between functions (9,661). Most new ones are small accessors and thunks reached only through vtables: 5,125 are under 16 bytes. After the sweep there are 33,036 functions and 4.76 MB of the 6.04 MB `.text` is inside functions (79%, from 72%). The rest is mostly jump tables, padding and data.
+`tools/ghidra/FindMissed.java` adds functions at code pointers in the data sections and at 16-byte aligned starts after `CC`/`90` padding. The XBE marks every section executable, so `FixBlocks.java` first clears the execute flag on `.rdata` and later (`xbe2elf.py` now does this on import).
+
+After the sweep there are 54,673 functions and 5.30 MB of the 6.04 MB `.text` is inside functions (88%, from 72%).
+
+| Range | Functions | Bytes | Under 16 bytes |
+|---|---|---|---|
+| Engine and game (`0x12000`-`0x470000`, `0x510000`-`0x580000`) | 32,150 | 4,467,951 | 9,094 |
+| Unit tests | 600 | 55,148 | 174 |
+| Havok | 1,727 | 299,323 | 406 |
+| qhull | 833 | 184,521 | 74 |
+| C++ runtime | 437 | 58,390 | 146 |
+| `0x580000`-`0x5d3980`: mostly SEH unwind funclets (`LEA ECX,[EBP-x]; JMP dtor`) and XAPI | 17,097 | 232,497 | 14,283 |
+
+The unwind funclets are compiler generated and need no source. Leaving out functions under 16 bytes (accessors and thunks), the engine and game come to about 23,000 functions and 4.4 MB, against Republic Commando's 12,356 functions and 2.7 MB.
+
+## Natives
+
+`tools/ghidra/NameNatives.java` names the natives listed as `{"int<Class>exec<Name>", function}` pairs in `.data`: 253, all `UObject` (`symbols/core-natives.txt`). No other class registers natives this way, which fits the packages having almost no script code.
 
 ## Packages
 
