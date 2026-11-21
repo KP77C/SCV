@@ -29,7 +29,7 @@ EOF
 ( cd "$W/math-neon" && make -s -j8 >/dev/null && cp libmathneon.a "$P/lib/" && cp source/math_neon.h "$P/include/" )
 ( cd "$W/vitaShaRK" && make -s -j8 CFLAGS="-g -Wl,-q -O2 -ffast-math -mtune=cortex-a9 -mfpu=neon -ftree-vectorize -I$P/include" >/dev/null \
     && cp libvitashark.a "$P/lib/" && cp source/vitashark.h "$P/include/" )
-( cd "$W/vitaGL" && C_INCLUDE_PATH="$P/include" CPLUS_INCLUDE_PATH="$P/include" make -s -j8 >/dev/null \
+( cd "$W/vitaGL" && make -s clean >/dev/null 2>&1;  C_INCLUDE_PATH="$P/include" CPLUS_INCLUDE_PATH="$P/include" make -s -j8 NO_SPLASHSCREEN=1 >/dev/null \
     && cp libvitaGL.a "$P/lib/" && cp source/vitaGL.h "$P/include/" )
 arm-vita-eabi-nm --defined-only "$P/lib/libvitaGL.a" 2>/dev/null | awk '$2=="T"{print $3}' | grep -E '^(gl|vgl)' | sort -u > "$P/vgl_syms.txt"
 echo "built $P"

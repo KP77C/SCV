@@ -103,9 +103,11 @@ bool make_current() {
     // display scales them to the screen. RAM: the guest arena, our heap and
     // the JIT pool are already allocated; leave 24 MiB for the JIT pool's
     // second segment and system allocations, give vitaGL the rest and VRAM.
-    if (!vglInitExtended(0x400000, (int)g_w, (int)g_h, 24 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE)) {
-        log("[not-bound] [cause: vglInitExtended failed] %ux%u", g_w, g_h); return false;
-    }
+    // vglInitExtended's return value is not a failure flag: GL_TRUE only
+    // says the size was above the display's maximum and was lowered (the
+    // Deus Ex port's build 3 quit at boot by treating GL_FALSE as failure).
+    if (vglInitExtended(0x400000, (int)g_w, (int)g_h, 24 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE))
+        log("[not-bound] vitaGL lowered the render size %ux%u to the display maximum", g_w, g_h);
     const char* f = std::getenv("SC_FPS");
     const int interval = (f && std::atoi(f) == 60) ? 1 : 2;   // locked 30 fps by default (K)
     eglSwapInterval(nullptr, interval);
