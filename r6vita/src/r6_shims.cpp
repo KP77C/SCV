@@ -8,6 +8,8 @@
 
 #include "runtime/guest_scratch.h"
 #include "runtime/guest_str.h"
+#include "runtime/win32_shims_window.h"
+#include "runtime/win32_shims_gdi32.h"
 
 #include <cstring>
 #include <deque>
@@ -54,6 +56,7 @@ bool is_sys(Cpu& c, uint32_t g, uint32_t first) {
 
 uint8_t g_keys[256];
 int32_t g_mdx = 0, g_mdy = 0, g_mdz = 0;
+int g_lastx = -1, g_lasty = -1;   // where the game thinks its cursor is (its SetCursorPos calls), so moves become deltas from there
 uint8_t g_mbtn[4];
 struct Ev { uint32_t ofs, data, ts; };
 std::deque<Ev> g_kev, g_mev;
@@ -94,7 +97,6 @@ void dinput_feed(uint32_t msg, uint32_t wp, uint32_t lp) {
         if (g_kev.size() > 256) g_kev.pop_front();
     };
     auto btn = [&](int b, bool down) { g_mbtn[b] = down ? 0x80 : 0; g_mev.push_back({ 12u + b, down ? 0x80u : 0u, ts }); if (g_mev.size() > 256) g_mev.pop_front(); };
-    static int lastx = -1, lasty = -1;
     switch (msg) {
     case 0x100: case 0x104: key(true); break;
     case 0x101: case 0x105: key(false); break;
@@ -103,6 +105,7 @@ void dinput_feed(uint32_t msg, uint32_t wp, uint32_t lp) {
     case 0x207: btn(2, true); break; case 0x208: btn(2, false); break;
     case 0x200: {
         const int x = (int16_t)(lp & 0xFFFF), y = (int16_t)(lp >> 16);
+        int& lastx = g_lastx; int& lasty = g_lasty;
         if (lastx >= 0) {
             const int dx = x - lastx, dy = y - lasty;
             g_mdx += dx; g_mdy += dy;
@@ -137,6 +140,15 @@ uint32_t rd32(const Mmio& m, uint32_t at) { if (at + 4 > m.data.size()) return 0
 }  // namespace
 
 void install_r6(d2rt::Bridge& br) {
+    {   // The game keeps its own cursor, moved by DirectInput deltas, and syncs the system cursor to it.
+        Shim s; s.argc = 2; s.stdcall_cleanup = true; s.tag = "USER32.dll!SetCursorPos";
+        s.fn = [](Cpu& c) {
+            uint32_t ax = c.arg(0), ay = c.arg(1);
+            if (ax >= wx86_screen_w() || ay >= wx86_screen_h()) { ax = wx86_screen_w() / 2; ay = wx86_screen_h() / 2; }   // the first call passes an unset position
+            wx86_set_cursor(ax, ay); uint32_t x, y; wx86_get_cursor(&x, &y); g_lastx = (int)x; g_lasty = (int)y;
+            if (std::getenv("R6_TRACE_DI")) log("[di] SetCursorPos(%d,%d)", (int)c.arg(0), (int)c.arg(1)); return 1u; };
+        br.register_shim("USER32.dll", "SetCursorPos", s);
+    }
     // mmioOpenA(name, info, flags): read-only, the whole file in host memory.
     W(br, "mmioOpenA", 3, [](Cpu& c) -> uint32_t {
         std::string g = wx86_gread_mb(c, c.arg(0), -1);
@@ -228,6 +240,7 @@ void install_r6(d2rt::Bridge& br) {
             while (n < want && !q.empty()) {
                 const Ev e = q.front();
                 if (out) { c.write_u32(out + n * sz, e.ofs); c.write_u32(out + n * sz + 4, e.data); c.write_u32(out + n * sz + 8, e.ts); c.write_u32(out + n * sz + 12, e.ts); }
+                { static const bool tr = std::getenv("R6_TRACE_DI") != nullptr; if (tr) log("[di]   ev %s ofs=%u data=%d", is_kbd(c) ? "kbd" : "mouse", e.ofs, (int)e.data); }
                 if (!(flags & 1)) q.pop_front();                 // DIGDD_PEEK
                 ++n;
                 if (flags & 1) break;

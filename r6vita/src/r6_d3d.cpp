@@ -1037,6 +1037,8 @@ void install_d3d(d2rt::Bridge& br) {
                 const uint32_t flags = c.arg(4), fx = c.arg(5);
                 int dr[4]; read_rect(c, c.arg(1), dr, *dst);
                 int sr[4] = { 0, 0, 0, 0 }; if (src) read_rect(c, c.arg(3), sr, *src);
+                if (g_trace) log("[d3d]   blt #%u%s%s [%d,%d,%d,%d] <- #%u%s%s [%d,%d,%d,%d] fl=%x ck=%d", dst->id, dst->primary ? "P" : "", dst == g_rt ? "R" : "",
+                                 dr[0], dr[1], dr[2], dr[3], src ? src->id : 0, src && src->primary ? "P" : "", src == g_rt ? "R" : "", sr[0], sr[1], sr[2], sr[3], flags, src ? (int)src->ck : 0);
                 if (flags & 0x400) return do_blt(c, dst, dr, nullptr, sr, false, true, fx ? c.read_u32(fx + 80) : 0);
                 if (flags & 0x20000) return do_blt(c, dst, dr, nullptr, sr, false, true, 0);   // DEPTHFILL
                 return do_blt(c, dst, dr, src, sr, (flags & 0x8000) != 0, false, 0); } },

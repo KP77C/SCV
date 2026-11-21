@@ -231,6 +231,8 @@ void seed_registry() {
         reg_seed_sz(key, "SoftwareOnly", sw && sw[0] == '0' ? "FALSE" : "TRUE");
         reg_seed_sz(key, "VideoResolution", res && *res ? res : "640x480");
         reg_seed_sz(key, "FullScreen", "TRUE");
+        reg_seed_sz(key, "UseForceFeedbackMouse", "FALSE");   // the FEELit mouse driver switches the cursor to absolute mode
+        reg_seed_sz(key, "UseForceFeedback", "FALSE");
         static const char* const kSz[][2] = {
             { "UseShellGamma", "TRUE" }, { "ShellGammaValue", "1.000000" }, { "UseActionGamma", "TRUE" },
             { "ActionGammaValue", "10.000000" }, { "ShowFog", "FALSE" }, { "ShowWeatherFX", "FALSE" },

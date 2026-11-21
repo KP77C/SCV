@@ -983,14 +983,16 @@ void install_kernel32(d2rt::Bridge& br) {
         auto it = wx86_file_maps().find(c.arg(0));
         if (it == wx86_file_maps().end()) { wx86_set_lasterr(c, ERROR_INVALID_HANDLE); return 0; }
         uint32_t off = c.arg(3), n = c.arg(4) ? c.arg(4) : it->second.size - off;
-        uint32_t va = wx86_scratch_alloc((n + 0xFFF) & ~0xFFFu);
-        if (!va) { log("[RAM-bound] [cause: scratch exhaustion] MapViewOfFile %u bytes", n); return 0; }
+        uint32_t va = surf_alloc((n + 0xFFF) & ~0xFFFu);   // freed by UnmapViewOfFile (the engine maps many small files)
+        if (!va) { log("[RAM-bound] [cause: VirtualAlloc pool exhausted] MapViewOfFile %u bytes", n); return 0; }
         std::vector<uint8_t> data = read_file(it->second.path);
         if (off < data.size()) c.write(va, data.data() + off, std::min<uint32_t>(n, (uint32_t)data.size() - off));
         it->second.view = va;
         return va;
     });
-    K(br, "UnmapViewOfFile", 1, [](Cpu&) { return 1u; });
+    K(br, "UnmapViewOfFile", 1, [](Cpu& c) {
+        for (auto& m : wx86_file_maps()) if (m.second.view == c.arg(0)) m.second.view = 0;
+        surf_free(c.arg(0)); return 1u; });
 }
 
 void register_module(const std::string& key, uint32_t base) {
