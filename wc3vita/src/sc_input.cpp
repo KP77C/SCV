@@ -1,4 +1,6 @@
-// sc_input.cpp — K's control scheme (2026-11-20), see sc_input.h.
+// sc_input.cpp — K's StarCraft control scheme (2026-11-20), see sc_input.h,
+// with the command grid adapted to WarCraft III (K 2026-11-21: StarCraft
+// controls, changed only where WarCraft III needs it).
 //
 //   Right stick   cursor (L held: faster)
 //   Touch screen  cursor under the finger; tap = left click, touch and move = drag
@@ -12,7 +14,8 @@
 //   D-pad left + face/L/R  Ctrl+1-6 (Cross 1, Square 2, Triangle 3, Circle 4, L 5, R 6)
 //   D-pad down + face/L/R  1-6
 //   L + cursor at a screen edge: scroll (without L the cursor stops 2 px short)
-//   D-pad up      hold: 3x3 command grid, right stick picks the cell,
+//   D-pad up      hold: WarCraft III's 4x3 command card, the right stick
+//                 steps the highlight one button per push (held: repeats),
 //                 R clicks it (grid stays up until D-pad up is released)
 //   Select        Enter             L+Select on-screen keyboard (no Enter)
 //   Start         F10               L+Start Escape
@@ -51,9 +54,18 @@ uint32_t g_sh_owned = 0;         // shoulder buttons currently sending a digit (
 bool     g_stick_hold = false;   // after a grid click, ignore the right stick until it recentres
 double   g_fx = 320, g_fy = 240; // sub-pixel cursor
 
-// Centres of the 3x3 command card at 640x480, row-major. Rows 0-1 measured on
-// Zeratul's card in Protoss mission 1; row 2 follows the same spacing.
-constexpr int kCardX0 = 522, kCardDX = 46, kCardY0 = 376, kCardDY = 39;
+// WarCraft III's command card: 4 columns x 3 rows at the bottom right.
+// The game stretches its 4:3 interface over the whole window, so the buttons
+// sit at the same fraction of the screen at every render size. Measured on
+// an 800x600 frame: cell centres x = 636 + 43.7c, y = 486 + 43.7r (cells
+// about 41 px). Cells are numbered row-major, 0 = top left.
+constexpr int kCardCols = 4, kCardRows = 3;
+constexpr double kCardX0 = 636.0 / 800, kCardDX = 43.67 / 800, kCardY0 = 486.0 / 600, kCardDY = 43.7 / 600;
+int card_x(int cell) { return (int)((kCardX0 + kCardDX * (cell % kCardCols)) * (kMaxX + 1) + 0.5); }
+int card_y(int cell) { return (int)((kCardY0 + kCardDY * (cell / kCardCols)) * (kMaxY + 1) + 0.5); }
+// Right-stick stepping: a push past 0.6 moves one cell; holding it repeats
+// after 350 ms, then every 160 ms; the stick re-arms below 0.3.
+int      g_step_dx = 0, g_step_dy = 0; uint64_t g_step_next_us = 0;
 
 uint32_t scan(uint32_t vk) {
     switch (vk) {
@@ -118,21 +130,40 @@ double axis(uint8_t v) {
     if (std::fabs(d) < dz) return 0;
     return (d > 0 ? d - dz : d + dz) / (1 - dz);
 }
-int grid_cell(const Pad& p) {
-    double x = axis(p.rx), y = axis(p.ry);
-    int col = x < -0.5 ? 0 : x > 0.5 ? 2 : 1, row = y < -0.5 ? 0 : y > 0.5 ? 2 : 1;
-    return row * 3 + col;
+void card_step(const Pad& p) {
+    const double x = axis(p.rx), y = axis(p.ry);
+    const int dx = x > 0.6 ? 1 : x < -0.6 ? -1 : 0, dy = y > 0.6 ? 1 : y < -0.6 ? -1 : 0;
+    const bool rest = std::fabs(x) < 0.3 && std::fabs(y) < 0.3;
+    const uint64_t now = g_clock_us;
+    if (rest) { g_step_dx = g_step_dy = 0; return; }
+    if (!dx && !dy) return;                           // between the thresholds: no change
+    bool step;
+    if (dx != g_step_dx || dy != g_step_dy) { step = true; g_step_next_us = now + 350000; }
+    else if (now >= g_step_next_us) { step = true; g_step_next_us = now + 160000; }
+    else step = false;
+    g_step_dx = dx; g_step_dy = dy;
+    if (!step) return;
+    int col = g_cell % kCardCols + dx, row = g_cell / kCardCols + dy;
+    col = col < 0 ? 0 : col >= kCardCols ? kCardCols - 1 : col;
+    row = row < 0 ? 0 : row >= kCardRows ? kCardRows - 1 : row;
+    g_cell = row * kCardCols + col;
 }
 }  // namespace
 
 uint32_t key_state(uint32_t vk) { return g_down[vk & 0xFF] ? 0x8000u : 0u; }
 bool input_grid_active(int* cell) { if (cell) *cell = g_cell; return g_grid; }
+int  input_card_cells() { return kCardCols * kCardRows; }
+void input_card_rect(int cell, int* x, int* y, int* w, int* h) {
+    const int cw = (int)(41.0 / 800 * (kMaxX + 1) + 0.5), ch = (int)(41.0 / 600 * (kMaxY + 1) + 0.5);
+    *x = card_x(cell) - cw / 2; *y = card_y(cell) - ch / 2; *w = cw; *h = ch;
+}
 bool input_take_ime_request() { bool r = g_ime; g_ime = false; return r; }
 void input_text(const std::string& s) {
     for (unsigned char ch : s) if (ch >= 0x20 && ch < 0x7F) post_input(WM_CHAR, ch, 1);
 }
 
 void input_set_screen(int w, int h) { if (w > 1 && h > 1) { kMaxX = w - 1; kMaxY = h - 1; } }
+void input_screen(int* w, int* h) { if (w) *w = kMaxX + 1; if (h) *h = kMaxY + 1; }
 
 void input_warp(int x, int y) { move_to(x, y); g_fx = x; g_fy = y; }
 
@@ -145,8 +176,10 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     // Command grid: hold D-pad up, pick with the right stick, press R to
     // click the cell (K, 2026-11-20). The grid stays up while D-pad up is
     // held, so several buttons can be pressed in a row; releasing closes it.
-    if (pressed & kBtnGrid) { g_grid = true; g_cell = 4; }
-    if (g_grid) g_cell = grid_cell(p);
+    // WarCraft III's card has 12 buttons, more than the stick's 8 directions
+    // and centre, so the stick steps a highlight that starts top left (Move).
+    if (pressed & kBtnGrid) { g_grid = true; g_cell = 0; g_step_dx = g_step_dy = 0; }
+    else if (g_grid) card_step(p);
     if ((released & kBtnGrid) && g_grid) g_grid = false;
     // Shoulders as digits (K, build 18): D-pad left + L/R = Ctrl+5/6 (Ctrl is
     // already held by D-pad left), D-pad down + L/R = 5/6 (K, build 20). D-pad up
@@ -164,7 +197,7 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     if ((pressed & PAD_R) && g_grid && !(g_sh_owned & PAD_R)) {
         g_r_grid = true;                      // this R press belongs to the grid, not to the mouse
         uint32_t ox, oy; wx86_get_cursor(&ox, &oy);
-        move_to(kCardX0 + kCardDX * (g_cell % 3), kCardY0 + kCardDY * (g_cell / 3));
+        move_to(card_x(g_cell), card_y(g_cell));
         lbutton(true); lbutton(false);
         move_to((int)ox, (int)oy);
         g_fx = ox; g_fy = oy;

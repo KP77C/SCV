@@ -12,18 +12,24 @@ if [ "${TARGET:-}" = vita ]; then
     OUT="$ROOT/build-vita"; mkdir -p "$OUT/sce_sys"
     WXLIB="$WX/build-vita/libwinx86_vita${WXTAG:-}.a"   # WXTAG=_prof: engine built with PROF_COUNTERS
     [ -f "$WXLIB" ] || { echo "missing $WXLIB"; exit 1; }
+    # vitaGL draws the game's OpenGL (tools/build_vitagl.sh builds it into build-vita/vgl).
+    VGL="$OUT/vgl/prefix"
+    [ -f "$VGL/lib/libvitaGL.a" ] || "$ROOT/tools/build_vitagl.sh"
     arm-vita-eabi-g++ -O2 -g -std=gnu++17 -marm -march=armv7-a+simd -mfpu=neon -mfloat-abi=hard -D__vita__ ${WXTAG:+-DPROF_COUNTERS} \
-      -I"$WX/src" -I"$WX/src/dynarec86/shim/vita" -Wall -Wno-unused-parameter $SRCS \
+      -I"$WX/src" -I"$WX/src/dynarec86/shim/vita" -I"$VGL/include" -Wall -Wno-unused-parameter $SRCS \
       -Wl,--whole-archive "$WXLIB" -Wl,--no-whole-archive \
+      -L"$VGL/lib" -lvitaGL -lvitashark -lmathneon \
       -lSceShaccCg_stub_weak -lSceGxm_stub -lSceDisplay_stub -lSceCtrl_stub -lSceTouch_stub -lSceCommonDialog_stub -lSceAppUtil_stub \
       -lSceAppMgr_stub -lSceAudio_stub -lScePower_stub -lSceSysmodule_stub -lSceKernelDmacMgr_stub -lSceIme_stub \
-      -lSceNet_stub -lSceNetCtl_stub -lSceRtc_stub -lpthread -lm -Wl,-q \
+      -lSceNet_stub -lSceNetCtl_stub -lSceRtc_stub -lpthread -lm -Wl,-q -Wl,--defsym,__sce_headroom=0x4000 \
       -o "$OUT/w3vita.elf"
+    # __sce_headroom leaves room after the code for the SCE module tables that
+    # vita-elf-create appends (it fails when the code ends just below 64 KiB).
     # -Wl,-q keeps the relocations: the Vita loader places the module wherever
     # it likes, and vita-elf-create turns these into its own relocation table.
     vita-elf-create "$OUT/w3vita.elf" "$OUT/w3vita.velf"
     vita-make-fself "$OUT/w3vita.velf" "$OUT/eboot.bin"
-    # ATTRIBUTE2=12: the extended user memory budget (no DMR), for K's 304 MiB.
+    # ATTRIBUTE2=12: the extended user memory budget (no DMR).
     vita-mksfoex -s TITLE_ID=W3VITA001 -s STITLE="WarCraft III Vita" -d ATTRIBUTE2=12 "WarCraft III Vita" "$OUT/sce_sys/param.sfo"
     # Optional art (icon0.png, livearea/contents/{bg,startup}.png + template.xml):
     # not in the repository, since it is the owner's local artwork.

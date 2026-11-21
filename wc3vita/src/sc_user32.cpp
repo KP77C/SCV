@@ -631,6 +631,14 @@ void post_input(uint32_t msg, uint32_t wp, uint32_t lp) {
     uint32_t h = g_capture ? g_capture : g_focus ? g_focus : g_active;
     static const bool tr = std::getenv("SC_TRACE_INPUT") != nullptr;
     if (tr && msg != 0x0200) log("[not-bound] input msg 0x%04x wp=0x%x lp=0x%08x -> hwnd 0x%x (focus 0x%x capture 0x%x)", msg, wp, lp, h, g_focus, g_capture);
+    // Windows sends WM_LBUTTONDBLCLK only to a window whose class has
+    // CS_DBLCLKS; any other window gets a second WM_LBUTTONDOWN and times the
+    // double click itself (WarCraft III does).
+    if (msg == 0x0203 && h) {
+        auto w = g_wnds.find(h);
+        auto k = w == g_wnds.end() ? g_classes.end() : g_classes.find(w->second.cls);
+        if (k == g_classes.end() || !(k->second.style & 0x0008u)) msg = 0x0201;
+    }
     if (h) post(h, msg, wp, lp);
 }
 

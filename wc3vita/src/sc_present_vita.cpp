@@ -48,6 +48,7 @@
 extern "C" {
 extern uint64_t dyn86_jp_run_us, dyn86_jp_lookup_miss, dyn86_jp_created, dyn86_jp_recompiles, dyn86_jp_invalid, dyn86_jp_x86_insns, dyn86_sync_us;
 }
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -186,7 +187,7 @@ struct DisplayData { void* addr; };
 SceGxmContext* g_ctx = nullptr;
 SceGxmRenderTarget* g_rt = nullptr;
 SceGxmShaderPatcher* g_patcher = nullptr;
-Block g_color_mem[kBuffers], g_depth_mem, g_tex_mem, g_vtx_mem, g_rings[3], g_usse_ring, g_pat_buf, g_pat_vusse, g_pat_fusse;
+Block g_color_mem[kBuffers], g_depth_mem, g_tex_mem, g_tex32_mem, g_vtx_mem, g_rings[3], g_usse_ring, g_pat_buf, g_pat_vusse, g_pat_fusse;
 SceGxmColorSurface g_color[kBuffers];
 SceGxmSyncObject* g_sync[kBuffers];
 SceGxmDepthStencilSurface g_depth;
@@ -194,6 +195,8 @@ SceGxmVertexProgram* g_vp_tex = nullptr; SceGxmFragmentProgram* g_fp_tex = nullp
 SceGxmVertexProgram* g_vp_col = nullptr; SceGxmFragmentProgram* g_fp_col = nullptr;
 SceGxmTexture g_tex[kSlots];
 uint8_t* g_tex_pix[kSlots]; uint32_t* g_tex_pal[kSlots];
+// Deus Ex draws 32-bit frames (SoftDrv into a DIB section): BGRX texels.
+SceGxmTexture g_tex32[kSlots]; uint8_t* g_tex32_pix[kSlots];
 struct ColVtx { float x, y; uint8_t r, g, b, a; };
 ColVtx* g_ovl[kSlots];
 uint16_t* g_quad_idx; float* g_quad_vtx; uint16_t* g_ovl_idx;
@@ -201,11 +204,13 @@ SceGxmNotification g_notif[kSlots];
 int g_back = 0, g_front = kBuffers - 1;
 int g_interval = 1;                    // vblanks per frame: 1 = 60 Hz, 2 = 30 Hz
 bool g_ok = false;
+bool g_gl = false;                     // vitaGL owns the GPU (OpenGL renderer)
 
 // Guest -> display thread hand-off. The surface is read racily, exactly as a
 // real card scans out a DirectDraw primary; the palette is double-buffered by
 // sequence number.
-std::atomic<uint32_t> g_src_va{0}, g_src_pitch{0}, g_pal_seq{0};
+std::atomic<uint32_t> g_src_va{0}, g_src_pitch{0}, g_pal_seq{0}, g_src_bpp{8}, g_f32_seq{0};
+uint8_t* g_f32[2] = { nullptr, nullptr };   // 32-bit frames copied out on the guest thread
 uint32_t g_pal[2][256];
 std::atomic<uint64_t> g_guest_presents{0};
 std::atomic<bool> g_grid_on{false}; std::atomic<int> g_grid_cell{4};
@@ -244,6 +249,7 @@ struct WaitSlot { std::atomic<uint32_t> type{0}; std::atomic<int> uid{0}; std::a
 WaitSlot g_waits[6];
 std::atomic<int> g_quit{0};
 std::atomic<bool> g_wipe_bars{false};
+void dx_sample_eip();
 int sampler_main(SceSize, void*) {
     wx86_vita_pin_self(SCE_KERNEL_CPU_MASK_USER_2, nullptr);
     while (!g_quit.load()) {
@@ -251,6 +257,7 @@ int sampler_main(SceSize, void*) {
         if (g_main_thread < 0) continue;
         SceKernelThreadInfo ti; std::memset(&ti, 0, sizeof ti); ti.size = sizeof ti;
         if (sceKernelGetThreadInfo(g_main_thread, &ti) < 0) continue;
+        if (ti.status & SCE_THREAD_RUNNING) dx_sample_eip();
         if (ti.status & SCE_THREAD_RUNNING) g_st_run++;
         else if (ti.status & SCE_THREAD_READY) g_st_ready++;
         else if (ti.status & SCE_THREAD_WAITING) {
@@ -275,8 +282,37 @@ void wait_name(int uid, char* out, unsigned n) {
 
 // Where the guest is: its EIP sampled once per displayed frame.
 const volatile uint32_t* g_ip = nullptr;
-uint32_t g_samples[6];   // exe, storm, other DLLs, inside a shim (host code), generated/heap code, other
+uint32_t g_samples[6];   // (StarCraft buckets, unused here)
 uint32_t g_storm_lo = 0, g_storm_hi = 0;
+// Where the guest spends its time, by module: sampled at ~1 kHz from core 2.
+// The EIP the engine keeps is the start of the last block it dispatched, so
+// this is a block-level picture, good enough to rank modules.
+struct ModRange { uint32_t lo = 0, hi = 0; const char* name = ""; };
+constexpr int kMaxMods = 16;
+ModRange g_mods[kMaxMods]; std::atomic<int> g_nmods{0};
+std::atomic<uint32_t> g_msamp[kMaxMods + 3];   // modules, then: shims, other memory, no sample
+void build_module_ranges() {
+    static const char* names[] = { "DeusEx.exe", "Core.dll", "Engine.dll", "Render.dll", "OpenGLDrv.dll", "SoftDrv.dll",
+                                   "DeusEx.dll", "Extension.dll", "ConSys.dll", "Fire.dll", "Galaxy.dll", "WinDrv.dll",
+                                   "Window.dll", "MSVCRT.dll", "IpDrv.dll" };
+    int n = 0;
+    for (const char* nm : names) {
+        if (n >= kMaxMods || !g_br) break;
+        std::string lo = nm; for (char& ch : lo) ch = (char)std::tolower((unsigned char)ch);
+        d2rt::PeImage* m = g_br->module(nm); if (!m) m = g_br->module(lo);
+        if (!m) continue;
+        g_mods[n].lo = m->load_base(); g_mods[n].hi = m->load_base() + m->image_size(); g_mods[n].name = nm; ++n;
+    }
+    g_nmods.store(n);
+}
+void dx_sample_eip() {
+    if (!g_ip) return;
+    const uint32_t ip = *g_ip;
+    const int n = g_nmods.load();
+    for (int i = 0; i < n; ++i) if (ip >= g_mods[i].lo && ip < g_mods[i].hi) { g_msamp[i]++; return; }
+    if (ip >= 0x0D100000u && ip < 0x0D800000u) { g_msamp[kMaxMods]++; return; }
+    g_msamp[kMaxMods + 1]++;
+}
 
 void display_cb(const void* data) {
     const DisplayData* d = (const DisplayData*)data;
@@ -387,6 +423,18 @@ bool gpu_init() {
         sceGxmTextureSetUAddrMode(&g_tex[i], SCE_GXM_TEXTURE_ADDR_CLAMP);
         sceGxmTextureSetVAddrMode(&g_tex[i], SCE_GXM_TEXTURE_ADDR_CLAMP);
     }
+    if (!alloc_gpu(g_tex32_mem, CD, kSlots * pix * 4, RO, "dx_frames32")) return false;
+    for (int i = 0; i < 2; ++i) { g_f32[i] = (uint8_t*)std::calloc(pix, 4); if (!g_f32[i]) return false; }
+    for (int i = 0; i < kSlots; ++i) {
+        g_tex32_pix[i] = (uint8_t*)g_tex32_mem.p + i * pix * 4;
+        // A8R8G8B8 = the u32 0xAARRGGBB, bytes B,G,R,A: a Windows 32-bit DIB.
+        // The shader forces alpha to 1, so the DIB's unused byte is harmless.
+        sceGxmTextureInitLinear(&g_tex32[i], g_tex32_pix[i], SCE_GXM_TEXTURE_FORMAT_A8R8G8B8, kSrcW, kSrcH, 0);
+        sceGxmTextureSetMinFilter(&g_tex32[i], SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMagFilter(&g_tex32[i], SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetUAddrMode(&g_tex32[i], SCE_GXM_TEXTURE_ADDR_CLAMP);
+        sceGxmTextureSetVAddrMode(&g_tex32[i], SCE_GXM_TEXTURE_ADDR_CLAMP);
+    }
     uint8_t* vp = (uint8_t*)g_vtx_mem.p;
     g_quad_vtx = (float*)vp; g_quad_idx = (uint16_t*)(vp + 64); g_ovl_idx = (uint16_t*)(vp + 128);
     const float x1 = (float)kOutW / kScrW;                                // pillarbox in clip space
@@ -490,6 +538,22 @@ void window_report(uint64_t now) {
             busy[0], busy[1], busy[2], g_samples[0] * 100 / tot, g_samples[1] * 100 / tot, g_samples[2] * 100 / tot,
             g_samples[3] * 100 / tot, g_samples[4] * 100 / tot, g_samples[5] * 100 / tot);
         std::memset(g_samples, 0, sizeof g_samples);
+        {   // guest time by module (while the guest thread was running)
+            uint32_t v[kMaxMods + 3], t = 0; for (int i = 0; i < kMaxMods + 3; ++i) { v[i] = g_msamp[i].exchange(0); t += v[i]; }
+            if (!t) t = 1;
+            int k = std::snprintf(line, sizeof line, "guest time by module (%u samples):", t);
+            const int n = g_nmods.load();
+            for (int pass = 0; pass < 6; ++pass) {   // the six biggest, largest first
+                int best = -1;
+                for (int i = 0; i < kMaxMods + 2; ++i) if (v[i] && (best < 0 || v[i] > v[best])) best = i;
+                if (best < 0) break;
+                const char* nm = best < n ? g_mods[best].name : best == kMaxMods ? "shims/GL" : "other (VirtualAlloc, heap)";
+                k += std::snprintf(line + k, sizeof line - k, " %s %u%%", nm, v[best] * 100 / t);
+                v[best] = 0;
+                if (k >= (int)sizeof line - 40) break;
+            }
+            log("[not-bound] %s", line);
+        }
         if (g_br && g_br->prof_window(line, sizeof line, 8) > 0) log("[not-bound] shim time (10 s):%s", line);
     }
     {
@@ -528,7 +592,7 @@ void window_report(uint64_t now) {
 void ime_step() {
     int st = g_ime_state.load();
     if (st == 1) {
-        static const char16_t title16[] = u"StarCraft";
+        static const char16_t title16[] = u"WarCraft III";
         const SceWChar16* title = (const SceWChar16*)title16;
         SceImeDialogParam p; sceImeDialogParamInit(&p);
         p.supportedLanguages = SCE_IME_LANGUAGE_ENGLISH; p.languagesForced = SCE_FALSE;
@@ -558,7 +622,7 @@ int display_main(SceSize, void*) {
     int slot = 0;
     while (!g_quit.load()) {
         ime_step();
-        const uint32_t va = g_src_va.load(), pitch = g_src_pitch.load();
+        const uint32_t va = g_src_va.load(), pitch = g_src_pitch.load(), bpp = g_src_bpp.load();
         const uint8_t* src = va ? (const uint8_t*)g_cpu->hostptr(va, pitch * kSrcH) : nullptr;
         if (!src) { sceKernelDelayThread(4000); continue; }
         // The keyboard dialog draws over the whole screen, and we only ever
@@ -571,10 +635,14 @@ int display_main(SceSize, void*) {
 
         // Reuse a texture set only once the GPU has finished the scene that read it.
         sceGxmNotificationWait(&g_notif[slot]);
-        if (pitch == kSrcW) std::memcpy(g_tex_pix[slot], src, kSrcW * kSrcH);
-        else for (int y = 0; y < kSrcH; ++y) std::memcpy(g_tex_pix[slot] + y * kSrcW, src + y * pitch, kSrcW);
-        const uint32_t* pal = g_pal[g_pal_seq.load() & 1];
-        for (int i = 0; i < 256; ++i) g_tex_pal[slot][i] = pal[i] | 0xFF000000u;   // 0x00BBGGRR -> ABGR, opaque
+        if (bpp == 32) {
+            std::memcpy(g_tex32_pix[slot], g_f32[g_f32_seq.load() & 1], kSrcW * kSrcH * 4);
+        } else {
+            if (pitch == kSrcW) std::memcpy(g_tex_pix[slot], src, kSrcW * kSrcH);
+            else for (int y = 0; y < kSrcH; ++y) std::memcpy(g_tex_pix[slot] + y * kSrcW, src + y * pitch, kSrcW);
+            const uint32_t* pal = g_pal[g_pal_seq.load() & 1];
+            for (int i = 0; i < 256; ++i) g_tex_pal[slot][i] = pal[i] | 0xFF000000u;   // 0x00BBGGRR -> ABGR, opaque
+        }
         const bool grid = g_grid_on.load();
         if (grid) build_overlay(g_ovl[slot], g_grid_cell.load());
 
@@ -583,7 +651,7 @@ int display_main(SceSize, void*) {
         sceGxmSetFrontDepthFunc(g_ctx, SCE_GXM_DEPTH_FUNC_ALWAYS);
         sceGxmSetFrontDepthWriteEnable(g_ctx, SCE_GXM_DEPTH_WRITE_DISABLED);
         sceGxmSetVertexProgram(g_ctx, g_vp_tex); sceGxmSetFragmentProgram(g_ctx, g_fp_tex);
-        sceGxmSetFragmentTexture(g_ctx, 0, &g_tex[slot]);
+        sceGxmSetFragmentTexture(g_ctx, 0, bpp == 32 ? &g_tex32[slot] : &g_tex[slot]);
         sceGxmSetVertexStream(g_ctx, 0, g_quad_vtx);
         sceGxmDraw(g_ctx, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16, g_quad_idx, 4);
         if (grid) {
@@ -632,16 +700,29 @@ int display_main(SceSize, void*) {
 // Called once from boot before the guest starts.
 bool present_init() {
     const char* f = std::getenv("SC_FPS");
-    g_interval = (f && std::atoi(f) == 30) ? 2 : 1;
+    g_interval = (f && std::atoi(f) == 60) ? 1 : 2;   // WarCraft III: locked 30 by default (K), SC_FPS=60 for 60
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
     SceAppUtilInitParam ai; SceAppUtilBootParam bi;
     std::memset(&ai, 0, sizeof ai); std::memset(&bi, 0, sizeof bi);
     sceAppUtilInit(&ai, &bi);
     SceCommonDialogConfigParam cfg; sceCommonDialogConfigParamInit(&cfg); sceCommonDialogSetConfigParam(&cfg);
+    g_main_thread = sceKernelGetThreadId();
+    g_gl = present_gl_mode();
+    if (g_gl) {
+        // The OpenGL renderer: vitaGL sets up the GPU and the display when the
+        // game creates its GL context, and every frame is drawn and shown on
+        // the guest thread. No display thread of our own.
+        g_ok = true;
+        { SceUID t = sceKernelCreateThread("sc_sampler", sampler_main, 0x60, 0x2000, 0, SCE_KERNEL_CPU_MASK_USER_2, nullptr);
+          if (t >= 0) sceKernelStartThread(t, 0, nullptr); }
+        { int gw = 0, gh = 0; input_screen(&gw, &gh);
+          log("[not-bound] presenter: OpenGL renderer through vitaGL, game drawn at %dx%d (display scaler to 960x544), %s fps lock",
+              gw, gh, g_interval == 1 ? "60" : "30"); }
+        return true;
+    }
     g_ok = gpu_init();
     if (!g_ok) return false;
-    g_main_thread = sceKernelGetThreadId();
     g_display_thread = sceKernelCreateThread("sc_display", display_main, 0x40, 0x10000, 0, SCE_KERNEL_CPU_MASK_USER_1, nullptr);
     if (g_display_thread < 0) { log("[not-bound] [cause: display thread rc=0x%08x]", (unsigned)g_display_thread); return false; }
     wx86_vita_core_register("display", g_display_thread, SCE_KERNEL_CPU_MASK_USER_1, 0);
@@ -668,22 +749,49 @@ bool present_init() {
 void present_shutdown() {
     g_quit.store(1);
     if (g_display_thread >= 0) { SceUInt to = 500000; sceKernelWaitThreadEnd(g_display_thread, nullptr, &to); }
-    sceGxmDisplayQueueFinish();
-    sceGxmFinish(g_ctx);
+    if (g_ctx) { sceGxmDisplayQueueFinish(); sceGxmFinish(g_ctx); }
     d2rt::dsound::shutdown();
     log_flush();
 }
+
+bool present_ime_open() { return g_ime_state.load() == 2; }
 
 // Guest thread, once per DirectDraw present.
 void present(d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t h, const uint32_t* pal) {
     static uint64_t last_us = 0;
     const uint64_t now = wx86_now_us();
     g_guest_presents.fetch_add(1);
+    if (g_gl) {   // one GL frame was just shown (vglSwapBuffers)
+        ime_step();   // no display thread in GL mode: vglSwapBuffers(GL_TRUE) draws the dialog
+        static uint64_t last_swap = 0;
+        if (last_swap) {
+            const uint64_t dt = now - last_swap, budget = 16667u * g_interval + 1500u;
+            ++g_win.frames; if (dt > budget) ++g_win.misses; if (dt > g_win.worst_us) g_win.worst_us = dt;
+        }
+        last_swap = now;
+        window_report(now);
+    }
     if (!g_ip) {
         g_ip = c.ip_ptr();
+        build_module_ranges();
         if (d2rt::PeImage* st = g_br ? g_br->module("storm.dll") : nullptr) { g_storm_lo = st->load_base(); g_storm_hi = g_storm_lo + st->image_size(); }
     }
-    if (w == (uint32_t)kSrcW && h == (uint32_t)kSrcH) {
+    if (w == (uint32_t)kSrcW && h == (uint32_t)kSrcH && !pal) {   // 32-bit frame (no palette)
+        // SoftDrv starts the next frame in the same DIB right after the blit,
+        // so copy the finished frame out here (two staging buffers, by
+        // sequence number) instead of letting the display thread read a
+        // half-drawn one.
+        const uint32_t next = g_f32_seq.load() + 1;
+        uint8_t* dst = g_f32[next & 1];
+        const uint8_t* srcp = (const uint8_t*)c.hostptr(pixels, pitch * kSrcH);
+        if (dst && srcp) {
+            if (pitch == kSrcW * 4) std::memcpy(dst, srcp, kSrcW * kSrcH * 4);
+            else for (int y = 0; y < kSrcH; ++y) std::memcpy(dst + y * kSrcW * 4, srcp + y * pitch, kSrcW * 4);
+            g_f32_seq.store(next);
+            g_src_bpp.store(32); g_src_pitch.store(kSrcW * 4); g_src_va.store(pixels);
+        }
+    } else if (w == (uint32_t)kSrcW && h == (uint32_t)kSrcH) {
+        g_src_bpp.store(8);
         const uint32_t next = g_pal_seq.load() + 1;
         std::memcpy(g_pal[next & 1], pal, sizeof g_pal[0]);
         g_pal_seq.store(next);
@@ -697,7 +805,15 @@ void present(d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t
     {   // Front panel reports 1920x1088 for the 960x544 screen; the game
         // area is the centred 725x544 quad, i.e. 640x480 scaled.
         SceTouchData td; std::memset(&td, 0, sizeof td);
-        if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1) > 0 && td.reportNum > 0) {
+        if (g_gl) {   // the game fills the screen: 1920x1088 panel -> game resolution
+            if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1) > 0 && td.reportNum > 0) {
+                int gw = 960, gh = 544; input_screen(&gw, &gh);
+                p.touch = true;
+                p.tx = (int)(td.report[0].x * gw / 1920.0); p.ty = (int)(td.report[0].y * gh / 1088.0);
+                if (p.tx > gw - 1) p.tx = gw - 1; if (p.ty > gh - 1) p.ty = gh - 1;
+                if (p.tx < 0) p.tx = 0; if (p.ty < 0) p.ty = 0;
+            }
+        } else if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1) > 0 && td.reportNum > 0) {
             const double sx = td.report[0].x / 2.0 - (960 - kOutW) / 2.0;
             const double sy = td.report[0].y / 2.0;
             if (sx >= 0 && sx < kOutW) {

@@ -14,6 +14,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <map>
+#include <set>
 
 using d2rt::Cpu;
 using d2rt::Shim;
@@ -74,7 +75,10 @@ std::vector<uint8_t> pe_version_resource(const std::vector<uint8_t>& f) {
     return std::vector<uint8_t>(f.begin() + off, f.begin() + off + sz);
 }
 
-// ---- in-memory registry (persisted later; empty on each boot for now) ----
+// ---- registry: in memory, saved to <game>/w3vita_registry.txt -------------
+// WarCraft III keeps its player profiles, campaign progress and options in
+// the registry, so the values are written back to a text file whenever the
+// game closes or flushes a key it changed, and read again at the next start.
 std::map<uint32_t, std::string> g_keys;                       // HKEY -> full path (lower)
 std::map<std::string, std::map<std::string, std::vector<uint8_t>>> g_vals;   // path -> name -> data
 std::map<std::string, std::map<std::string, uint32_t>> g_types;
@@ -82,6 +86,53 @@ uint32_t g_next_key = 0x00A00000u;
 std::map<uint32_t, uint32_t> g_timer_kill;   // timeSetEvent id -> guest kill flag
 
 std::string lower(std::string s) { for (auto& ch : s) ch = (char)tolower((unsigned char)ch); return s; }
+bool g_reg_dirty = false;
+std::string reg_file() { return g_root + "/w3vita_registry.txt"; }
+// One value per line: key <TAB> name <TAB> type <TAB> hex bytes. Keys and
+// names are stored lower-case (lookups are case-insensitive anyway).
+void reg_save() {
+    if (!g_reg_dirty) return;
+    g_reg_dirty = false;
+    std::string out;
+    for (auto& k : g_vals) {
+        if (k.second.empty()) { out += k.first + "\t\t0\t\n"; continue; }   // an empty key still exists
+        for (auto& v : k.second) {
+            char t[16]; std::snprintf(t, sizeof t, "%u", g_types[k.first][v.first]);
+            out += k.first + "\t" + v.first + "\t" + t + "\t";
+            static const char* hx = "0123456789abcdef";
+            for (uint8_t b : v.second) { out += hx[b >> 4]; out += hx[b & 15]; }
+            out += "\n";
+        }
+    }
+    const std::string tmp = reg_file() + ".new";
+    if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+        const bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
+        std::fclose(f);
+        if (ok) { std::remove(reg_file().c_str()); std::rename(tmp.c_str(), reg_file().c_str()); }
+    }
+}
+void reg_load() {
+    FILE* f = std::fopen(reg_file().c_str(), "rb"); if (!f) return;
+    std::string text; char buf[4096]; size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+    std::fclose(f);
+    size_t i = 0, count = 0;
+    while (i < text.size()) {
+        size_t e = text.find('\n', i); if (e == std::string::npos) e = text.size();
+        std::string line = text.substr(i, e - i); i = e + 1;
+        size_t a = line.find('\t'), b = a == std::string::npos ? a : line.find('\t', a + 1),
+               c3 = b == std::string::npos ? b : line.find('\t', b + 1);
+        if (c3 == std::string::npos) continue;
+        const std::string key = line.substr(0, a), name = line.substr(a + 1, b - a - 1);
+        auto& vals = g_vals[key];
+        if (name.empty()) continue;
+        std::vector<uint8_t> d;
+        for (size_t k = c3 + 1; k + 1 < line.size(); k += 2) d.push_back((uint8_t)std::strtoul(line.substr(k, 2).c_str(), nullptr, 16));
+        vals[name] = d; g_types[key][name] = (uint32_t)std::strtoul(line.substr(b + 1, c3 - b - 1).c_str(), nullptr, 10);
+        ++count;
+    }
+    log("[not-bound] registry: %u values from %s", (unsigned)count, reg_file().c_str());
+}
 std::string key_path(uint32_t parent, const std::string& sub) {
     std::string base;
     switch (parent) {
@@ -129,6 +180,15 @@ void reg_seed_dword(const std::string& key, const std::string& name, uint32_t v)
     std::vector<uint8_t> d(4); std::memcpy(d.data(), &v, 4);
     g_vals[p][n] = d; g_types[p][n] = 4;
 }
+// A first-launch default: set only when the value is not there yet, so a
+// change the player makes in the game's options (saved to the registry file)
+// wins on the next launch.
+void reg_default_dword(const std::string& key, const std::string& name, uint32_t v) {
+    std::string p = lower(key), n = lower(name);
+    auto k = g_vals.find(p);
+    if (k != g_vals.end() && k->second.count(n)) return;
+    reg_seed_dword(key, name, v);
+}
 void reg_seed_sz(const std::string& key, const std::string& name, const std::string& v) {
     std::string p = lower(key), n = lower(name);
     std::vector<uint8_t> d(v.begin(), v.end()); d.push_back(0);
@@ -136,6 +196,7 @@ void reg_seed_sz(const std::string& key, const std::string& name, const std::str
 }
 
 void install_misc(d2rt::Bridge& br) {
+    reg_load();
     {   // cdecl, variadic: the caller cleans the stack.
         Shim s; s.argc = 0; s.stdcall_cleanup = false; s.tag = "USER32.dll!wsprintfA";
         s.fn = [](Cpu& c) -> uint32_t {
@@ -244,6 +305,7 @@ void install_misc(d2rt::Bridge& br) {
         static const bool tr = std::getenv("SC_TRACE_REG") != nullptr;
         if (tr) log("[reg] %s %s%s", create ? "create" : "open", p.c_str(), (!create && !g_vals.count(p)) ? " (missing)" : "");
         if (!create && !g_vals.count(p)) return 2u;   // ERROR_FILE_NOT_FOUND
+        if (!g_vals.count(p)) g_reg_dirty = true;
         g_vals[p];
         uint32_t h = g_next_key++; g_keys[h] = p;
         if (out) c.write_u32(out, h);
@@ -255,8 +317,8 @@ void install_misc(d2rt::Bridge& br) {
         if (c.arg(8)) c.write_u32(c.arg(8), 1);   // REG_CREATED_NEW_KEY
         return r;
     });
-    R(br, "ADVAPI32.dll", "RegCloseKey", 1, [](Cpu& c) { g_keys.erase(c.arg(0)); return 0u; });
-    R(br, "ADVAPI32.dll", "RegFlushKey", 1, [](Cpu&) { return 0u; });
+    R(br, "ADVAPI32.dll", "RegCloseKey", 1, [](Cpu& c) { g_keys.erase(c.arg(0)); reg_save(); return 0u; });
+    R(br, "ADVAPI32.dll", "RegFlushKey", 1, [](Cpu&) { reg_save(); return 0u; });
     R(br, "ADVAPI32.dll", "RegQueryValueExA", 6, [](Cpu& c) -> uint32_t {
         std::string p = key_path(c.arg(0), ""), n = lower(gstr(c, c.arg(1)));
         auto k = g_vals.find(p);
@@ -274,16 +336,37 @@ void install_misc(d2rt::Bridge& br) {
     R(br, "ADVAPI32.dll", "RegSetValueExA", 6, [](Cpu& c) -> uint32_t {
         std::string p = key_path(c.arg(0), ""), n = lower(gstr(c, c.arg(1)));
         std::vector<uint8_t> d(c.arg(5)); if (!d.empty()) c.read(c.arg(4), d.data(), (uint32_t)d.size());
-        g_vals[p][n] = d; g_types[p][n] = c.arg(3);
+        g_vals[p][n] = d; g_types[p][n] = c.arg(3); g_reg_dirty = true;
         static const bool tr = std::getenv("SC_TRACE_REG") != nullptr;
         if (tr) log("[reg] set %s\\%s (%u bytes, type %u)", p.c_str(), n.c_str(), (unsigned)d.size(), c.arg(3));
         return 0u;
     });
     R(br, "ADVAPI32.dll", "RegDeleteValueA", 2, [](Cpu& c) -> uint32_t {
         std::string p = key_path(c.arg(0), ""), n = lower(gstr(c, c.arg(1)));
-        return g_vals[p].erase(n) ? 0u : 2u;
+        if (!g_vals[p].erase(n)) return 2u;
+        g_reg_dirty = true; return 0u;
     });
-    R(br, "ADVAPI32.dll", "RegEnumKeyExA", 8, [](Cpu&) { return 259u; });   // ERROR_NO_MORE_ITEMS
+    // Subkeys of a key, in name order (dwIndex counts from 0).
+    R(br, "ADVAPI32.dll", "RegEnumKeyExA", 8, [](Cpu& c) -> uint32_t {
+        const std::string p = key_path(c.arg(0), "") + "\\";
+        std::set<std::string> subs;
+        for (auto& k : g_vals)
+            if (k.first.size() > p.size() && k.first.compare(0, p.size(), p) == 0)
+                subs.insert(k.first.substr(p.size(), k.first.find('\\', p.size()) - p.size()));
+        uint32_t idx = c.arg(1);
+        if (idx >= subs.size()) return 259u;                                     // ERROR_NO_MORE_ITEMS
+        auto it = subs.begin(); std::advance(it, idx);
+        const uint32_t cap = c.arg(3) ? c.read_u32(c.arg(3)) : 0;
+        if (cap <= it->size()) return 234u;                                      // ERROR_MORE_DATA
+        c.write(c.arg(2), it->c_str(), (uint32_t)it->size() + 1);
+        c.write_u32(c.arg(3), (uint32_t)it->size());
+        return 0u;
+    });
+    R(br, "ADVAPI32.dll", "RegDeleteKeyA", 2, [](Cpu& c) -> uint32_t {
+        const std::string p = key_path(c.arg(0), gstr(c, c.arg(1)));
+        if (!g_vals.erase(p)) return 2u;
+        g_types.erase(p); g_reg_dirty = true; reg_save(); return 0u;
+    });
     R(br, "ADVAPI32.dll", "RegQueryInfoKeyA", 12, [](Cpu& c) {
         for (int i : { 4, 5, 6, 7, 8, 9 }) if (c.arg(i)) c.write_u32(c.arg(i), 0);
         return 0u;

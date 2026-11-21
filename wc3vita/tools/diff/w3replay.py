@@ -7,11 +7,11 @@ import sys, os, collections
 from unicorn import *
 from unicorn.x86_const import *
 snap = sys.argv[1]; limit = int(sys.argv[2]) if len(sys.argv) > 2 else 50_000_000
-TRAP_LO, TRAP_HI = 0x12500000, 0x12600000   # boot.cpp kTrapBase .. kArenaEnd
+TRAP_LO, TRAP_HI = 0x0E700000, 0x0EE00000   # boot.cpp kTrapBase .. kArenaEnd
 STOP = int(os.environ["STOP"], 16) if "STOP" in os.environ else None   # stop when EIP reaches this (e.g. the return address)
 r = [int(l, 16) for l in open(snap + '/regs.txt')]
 mu = Uc(UC_ARCH_X86, UC_MODE_32)
-mu.mem_map(0, 0x13000000)
+mu.mem_map(0, 0x0F000000)
 for f in sorted(os.listdir(snap)):
     if f.startswith('mem_'):
         mu.mem_write(int(f[4:12], 16), open(snap + '/' + f, 'rb').read())

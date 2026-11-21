@@ -44,7 +44,6 @@ void R(d2rt::Bridge& br, const char* dll, const char* name, uint32_t argc, std::
 // stdcall arguments and returns a fixed value; the first call is logged.
 struct Stub { const char* dll; const char* name; uint8_t argc; uint32_t ret; };
 const Stub kStubs[] = {
-    {"ADVAPI32.dll","RegDeleteKeyA",2,2},
     {"COMCTL32.dll","ImageList_Add",3,0xFFFFFFFFu},{"COMCTL32.dll","ImageList_BeginDrag",4,0},
     {"COMCTL32.dll","ImageList_Create",5,0},{"COMCTL32.dll","ImageList_Destroy",1,1},
     {"COMCTL32.dll","ImageList_DragEnter",3,0},{"COMCTL32.dll","ImageList_DragLeave",1,0},
@@ -226,8 +225,9 @@ void seed_registry() {
     // builds it again around the movie; there is no movie playback yet, so
     // mark it as seen.
     reg_seed_dword(k + "\\misc", "seenintromovie", 1);
-    uint32_t w = 800, h = 600;
-    if (const char* r = std::getenv("W3_RES")) std::sscanf(r, "%ux%u", &w, &h);
+    // The game's video mode = the size we render at (W3_RES, checked against
+    // the Vita's display modes), so its options and layout agree with WM_SIZE.
+    uint32_t w = 800, h = 600; gl_render_size(&w, &h);
     reg_seed_dword(k + "\\video", "reswidth", w);
     reg_seed_dword(k + "\\video", "resheight", h);
     reg_seed_dword(k + "\\video", "colordepth", 32);

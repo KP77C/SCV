@@ -53,7 +53,7 @@
 #define SC_VITA_DIR "ux0:data/WarCraft3"
 extern "C" {
 // Host newlib heap (box86 metadata has its own pool; guest memory is the arena).
-int _newlib_heap_size_user = 64 * 1024 * 1024;
+int _newlib_heap_size_user = 48 * 1024 * 1024;
 unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
 const char* const wx86_vita_progress_path = SC_VITA_DIR "/w3vita_progress.txt";
 }
@@ -192,26 +192,30 @@ using namespace sc;
 // va + membase), the same layout on the qemu host and the Vita. Every
 // WarCraft III module carries relocations, so all of them (War3.exe
 // included) are placed in the module window instead of their preferred bases.
-// First-boot sizes, generous on purpose; trimmed after measurement.
+// Sizes from the qemu host runs (Booty Bay 1v1: VirtualAlloc peak 143 MiB,
+// HeapAlloc under 1 MiB, modules 17.5 MiB, 12 guest threads), with headroom,
+// and small enough for the Vita: the arena is one committed block there,
+// next to a 48 MiB host heap, the 16 MiB JIT pool and vitaGL's pools.
 //   0x00000000  page 0 (main TIB)
-//   0x00400000  HeapAlloc            64 MiB (Storm and the CRT allocate here)
-//   0x04400000  module window        36 MiB (War3.exe, Game.dll 13 MiB, Storm, CRT ...)
-//   0x06800000  scratch              8 MiB
-//   0x07000000  VirtualAlloc         160 MiB
-//   0x11000000  worker stacks        16 x 1 MiB
-//   0x12000000  worker TIBs          1 MiB
-//   0x12100000  main stack           4 MiB
-//   0x12500000  native-thunk window  1 MiB
-//   0x12600000  end of arena (294 MiB)
-static constexpr uint32_t kHeapBase    = 0x00400000, kHeapSize    = 0x04000000;
-static constexpr uint32_t kModBase     = 0x04400000, kModEnd      = 0x06800000;
-static constexpr uint32_t kScratchBase = 0x06800000, kScratchSize = 0x00800000;
-static constexpr uint32_t kVaBase      = 0x07000000, kVaSize      = 0x0A000000;
-static constexpr uint32_t kStacks      = 0x11000000;
-static constexpr uint32_t kTibs        = 0x12000000;
-static constexpr uint32_t kMainStack   = 0x12100000, kMainStackSize = 0x00400000;
-static constexpr uint32_t kTrapBase    = 0x12500000;
-static constexpr uint32_t kArenaEnd    = 0x12600000;
+//   0x00400000  HeapAlloc            8 MiB (Storm allocates with VirtualAlloc instead)
+//   0x00C00000  module window        22 MiB (War3.exe, Game.dll 13 MiB, Storm, CRT, Miles ...)
+//   0x02200000  scratch              8 MiB
+//   0x02A00000  VirtualAlloc         168 MiB
+//   0x0D200000  worker stacks        16 x 1 MiB
+//   0x0E200000  worker TIBs          1 MiB
+//   0x0E300000  main stack           4 MiB
+//   0x0E700000  native-thunk window
+//   0x0EE00000  end of arena (238 MiB)
+static constexpr uint32_t kHeapBase    = 0x00400000, kHeapSize    = 0x00800000;
+static constexpr uint32_t kModBase     = 0x00C00000, kModEnd      = 0x02200000;
+static constexpr uint32_t kScratchBase = 0x02200000, kScratchSize = 0x00800000;
+static constexpr uint32_t kVaBase      = 0x02A00000, kVaSize      = 0x0A800000;
+static constexpr uint32_t kStacks      = 0x0D200000;
+static constexpr uint32_t kTibs        = 0x0E200000;
+static constexpr uint32_t kMainStack   = 0x0E300000, kMainStackSize = 0x00400000;
+static constexpr uint32_t kTrapBase    = 0x0E700000;
+static constexpr uint32_t kArenaEnd    = 0x0EE00000;
+static_assert(kVaBase + kVaSize <= kStacks && kMainStack + kMainStackSize <= kTrapBase, "layout overlap");
 
 static wx86::GuestRegion g_heap, g_va;
 void sc::guest_mem(uint32_t* hc, uint32_t* hp, uint32_t* vc, uint32_t* vp) {
