@@ -77,6 +77,9 @@ public:
     // or arm a single intrinsic without shifting the numbering of
     // subsequent slots.
     uint32_t shim_trap_existing(const std::string& dll, const std::string& name) const;
+    // The registered shim for dll!name (null if none), so one shim can call
+    // another natively instead of running guest code at a trap address.
+    const Shim* find_shim(const std::string& dll, const std::string& name) const;
 
     // A single catch-all shim used for any unresolved import (logs + returns 0).
     void set_default_shim(std::function<uint32_t(Cpu&, const std::string& tag)> fn);

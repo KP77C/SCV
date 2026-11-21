@@ -52,7 +52,9 @@ extern "C" { extern unsigned long long d2_e_calls; }
 // read false. Setting them explicitly in commit(), after the environment is
 // read and before the first trap can fire, avoids both problems.
 static uint32_t g_watch_va = 0;      // D2_WATCH=<hex address>
-static bool     g_traptag  = false;  // TRAPTAG=1
+static bool     g_traptag  = false;  // TRAPTAG=1 (or TRAPTAG=<n>: skip the first n calls)
+static uint64_t g_traptag_from = 0;
+static const char* g_traptag_match = nullptr;   // TRAPTAG_MATCH=<substring>: only tags containing it
 
 // A SINGLE __thread variable instead of three. Same semantics (per-thread
 // scope, zero-initialized); what changes is the number of emutls objects.
@@ -272,6 +274,11 @@ uint32_t Bridge::shim_trap(const std::string& dll, const std::string& name) {
     return alloc_trap(it->second);
 }
 
+const Shim* Bridge::find_shim(const std::string& dll, const std::string& name) const {
+    auto it = shims_.find(lc(dll) + "!" + name);
+    return it == shims_.end() ? nullptr : &it->second;
+}
+
 uint32_t Bridge::shim_trap_existing(const std::string& dll, const std::string& name) const {
     auto it = shims_.find(lc(dll) + "!" + name);
     if (it == shims_.end()) return 0;
@@ -299,7 +306,10 @@ bool Bridge::commit(std::string& err) {
     // in this same function).
     { const char* w = getenv("WX86_WATCH"); if (!w) w = getenv("D2_WATCH");
       g_watch_va = w ? (uint32_t)strtoul(w, nullptr, 16) : 0u;
-      g_traptag  = getenv("TRAPTAG") != nullptr; }
+      g_traptag  = getenv("TRAPTAG") != nullptr;
+      g_traptag_from = g_traptag ? strtoull(getenv("TRAPTAG"), nullptr, 10) : 0;
+      if (g_traptag_from == 1) g_traptag_from = 0;
+      g_traptag_match = getenv("TRAPTAG_MATCH"); }
     // Map every module image.
     for (auto& m : mods_) {
         auto& im = *m.img;
@@ -490,7 +500,8 @@ bool Bridge::trap_handler(Cpu& cpu, uint32_t trap_va) {
                            // LoadLibrary DISK) and grown slots_ — the old pointer would dangle
     // TRAPTAG=1: log shim tags (debug; env checked once — hot path stays clean)
     { static uint64_t tn = 0;   // CONSTANT initialization: zero guard, zero dmb
-      if (g_traptag && ++tn <= 4000)
+      if (g_traptag && (!g_traptag_match || std::strstr(slot->shim.tag.c_str(), g_traptag_match))
+          && ++tn > g_traptag_from && tn <= g_traptag_from + 4000)
         std::fprintf(stderr,"[tag %llu] %s -> eax=0x%08x\n",
             (unsigned long long)tn, slot->shim.tag.c_str(), eax); }
 #ifdef PROF_COUNTERS

@@ -1,0 +1,50 @@
+diff --git a/tools/winvita/third_party/box86-dynarec/custommem.c b/tools/winvita/third_party/box86-dynarec/custommem.c
+index f4e2893..a731890 100644
+--- a/tools/winvita/third_party/box86-dynarec/custommem.c
++++ b/tools/winvita/third_party/box86-dynarec/custommem.c
+@@ -1246,6 +1246,13 @@ int checkInHotPage(uintptr_t addr)
+ // With no SIGSEGV-based SMC detection, such pages get PROT_NEVERCLEAN: blocks
+ // translated there are always_test (re-hashed on every lookup, never
+ // direct-linked), so a rewrite is picked up on the next entry.
++int dyn86_smc_single(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("WX86_SMC_SINGLE"); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
+ void dyn86_mark_volatile_code(uintptr_t addr, uintptr_t size)
+ {
+     uintptr_t cur = addr & ~(box86_pagesize-1);
+diff --git a/tools/winvita/third_party/box86-dynarec/dynarec/dynarec_arm_pass.c b/tools/winvita/third_party/box86-dynarec/dynarec/dynarec_arm_pass.c
+index 25b335c..2e9e3e3 100755
+--- a/tools/winvita/third_party/box86-dynarec/dynarec/dynarec_arm_pass.c
++++ b/tools/winvita/third_party/box86-dynarec/dynarec/dynarec_arm_pass.c
+@@ -548,7 +548,8 @@ uintptr_t arm_pass(dynarec_arm_t* dyn, uintptr_t addr)
+         #if STEP == 0
+         memset(&dyn->insts[ninst], 0, sizeof(instruction_arm_t));
+         if((ok>0) && (((box86_dynarec_bigblock<stopblock) && !isJumpTableDefault((void*)addr)) 
+-            || (addr>=box86_nodynarec_start && addr<box86_nodynarec_end)))
++            || (addr>=box86_nodynarec_start && addr<box86_nodynarec_end)
++            || (dyn86_smc_single() && (getProtection(addr)&PROT_NEVERCLEAN))))
+         #else
+         if((ok>0) && (ninst==dyn->size))
+         #endif
+diff --git a/tools/winvita/third_party/box86-dynarec/include/custommem.h b/tools/winvita/third_party/box86-dynarec/include/custommem.h
+index 60f8eef..9d989ae 100644
+--- a/tools/winvita/third_party/box86-dynarec/include/custommem.h
++++ b/tools/winvita/third_party/box86-dynarec/include/custommem.h
+@@ -67,7 +67,12 @@ void loadProtectionFromMap();
+ #ifdef DYNAREC
+ void protectDB(uintptr_t addr, size_t size);
+ void unprotectDB(uintptr_t addr, size_t size, int mark);    // if mark==0, the blocks are not marked as potentially dirty
+-void dyn86_mark_volatile_code(uintptr_t addr, uintptr_t size);   // port addition: always re-validate code here
++void dyn86_mark_volatile_code(uintptr_t addr, uintptr_t size);
++// Port addition (Deus Ex): WX86_SMC_SINGLE=1 makes every block translated in
++// volatile (PROT_NEVERCLEAN) memory one instruction long, so code that
++// rewrites an instruction further down its own block (Fire.dll's water and
++// fire painters) sees the new bytes, as a real x86 does.
++int dyn86_smc_single(void);   // port addition: always re-validate code here
+ int isprotectedDB(uintptr_t addr, size_t size);
+ #endif
+ void* find32bitBlock(size_t size);

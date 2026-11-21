@@ -53,13 +53,18 @@ void win32_shims_memory_install(Bridge& br, const Wx86MemoryPlan& plan){
     K("GetProcessHeap",0,[](Cpu&){ return 0x00AA0000u; });
     K("HeapAlloc",3,[](Cpu&c){ uint32_t n=c.arg(2),a=g_plan.heap->alloc(n);
         if(a && (c.arg(1)&0x8u)) gzero(c,a,n);  // HEAP_ZERO_MEMORY
+        if(!a){ static int said=0; if(said++<8) std::fprintf(stdout,"[heap] HeapAlloc(%u) FAILED: heap exhausted\n",n); }
         return a; });
     K("HeapReAlloc",4,[](Cpu&c){ uint32_t old=c.arg(2),n=c.arg(3),a=g_plan.heap->alloc(n);
         if(old&&a){ uint32_t osz=g_plan.heap->size_of(old); uint32_t cp=osz&&osz<n?osz:n;
             void* dhp=c.hostptr(a,cp); void* shp=c.hostptr(old,cp);
             if(dhp&&shp){ c.invalidate_code(a,cp); std::memcpy(dhp,shp,cp); }   // barrier == c.write()
             else { std::vector<uint8_t> tmp(cp,0); c.read(old,tmp.data(),cp); c.write(a,tmp.data(),cp); }
-            g_plan.heap->free(old);} return a; });
+            g_plan.heap->free(old);
+            if((c.arg(1)&0x8u) && n>cp) gzero(c,a+cp,n-cp);}            // HEAP_ZERO_MEMORY: the grown tail
+        else if(a && (c.arg(1)&0x8u)) gzero(c,a,n);
+        if(!a) std::fprintf(stdout,"[heap] HeapReAlloc(%u) FAILED: heap exhausted\n",n);
+        return a; });
     K("HeapFree",3,[](Cpu&c){ g_plan.heap->free(c.arg(2)); return 1u; });
     K("HeapSize",3,[](Cpu&c){ uint32_t s=g_plan.heap->size_of(c.arg(2)); return s?s:0u; });
 
