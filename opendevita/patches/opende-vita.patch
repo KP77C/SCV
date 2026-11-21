@@ -1,0 +1,2082 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 55dc5ea..5068f68 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -48,7 +48,13 @@ if(EMSCRIPTEN)
+ endif()
+ 
+ # glad
+-if(EMSCRIPTEN)
++if(VITA)
++    # Debug symbols in the ELF for reading Vita crash dumps (the VPK's eboot has none).
++    add_compile_options(-g)
++    # PS Vita: GL comes from vitaGL; vita/include/glad/gl.h maps the GL 3.3 names onto it.
++    add_library(glad INTERFACE)
++    target_include_directories(glad SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/vita/include ${VITAGL_PREFIX}/include)
++elseif(EMSCRIPTEN)
+     add_library(glad INTERFACE)
+     target_include_directories(glad SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/cmake/emscripten)
+ else()
+@@ -60,9 +66,18 @@ endif()
+ add_library(miniaudio STATIC ${CMAKE_SOURCE_DIR}/vendor/miniaudio/miniaudio.c)
+ target_include_directories(miniaudio SYSTEM PUBLIC ${CMAKE_SOURCE_DIR}/vendor/miniaudio)
+ target_compile_definitions(miniaudio PUBLIC MA_NO_ENCODING MA_NO_GENERATION)
++if(VITA)
++    # PS Vita: only miniaudio's decoders are used; sound goes out through sceAudioOut (src/audio/audio.cc).
++    target_compile_definitions(miniaudio PUBLIC MA_NO_DEVICE_IO MA_NO_RUNTIME_LINKING)
++endif()
+ find_package(Threads REQUIRED)
+-target_link_libraries(miniaudio PUBLIC Threads::Threads ${CMAKE_DL_LIBS} m)
++if(VITA)
++    target_link_libraries(miniaudio PUBLIC Threads::Threads m)
++else()
++    target_link_libraries(miniaudio PUBLIC Threads::Threads ${CMAKE_DL_LIBS} m)
++endif()
+ 
++if(NOT VITA)
+ # Dear ImGui
+ add_library(imgui STATIC
+     ${CMAKE_SOURCE_DIR}/vendor/imgui/imgui.cpp
+@@ -85,6 +100,7 @@ endif()
+ add_library(imguizmo STATIC ${CMAKE_SOURCE_DIR}/vendor/imguizmo/ImGuizmo.cpp)
+ target_include_directories(imguizmo SYSTEM PUBLIC ${CMAKE_SOURCE_DIR}/vendor/imguizmo)
+ target_link_libraries(imguizmo PUBLIC imgui)
++endif()
+ 
+ # stb_image
+ add_library(stb_image STATIC ${CMAKE_SOURCE_DIR}/vendor/stb/stb_image.c)
+@@ -92,7 +108,7 @@ target_include_directories(stb_image SYSTEM PUBLIC ${CMAKE_SOURCE_DIR}/vendor/st
+ 
+ # GameNetworkingSockets
+ set(DX_NETWORKING OFF)
+-if(NOT EMSCRIPTEN)
++if(NOT EMSCRIPTEN AND NOT VITA)
+     set(DX_NETWORKING ON)
+ 
+     if(WIN32)
+@@ -113,13 +129,15 @@ if(NOT EMSCRIPTEN)
+ endif()
+ 
+ # Catch
++if(NOT VITA)
+ add_library(Catch2 STATIC ${CMAKE_SOURCE_DIR}/vendor/catch-3.16.0/catch_amalgamated.cpp)
+ target_include_directories(Catch2 SYSTEM PUBLIC ${CMAKE_SOURCE_DIR}/vendor/catch-3.16.0)
++endif()
+ 
+ # Add targets
+ add_subdirectory(src)
+ 
+-if(NOT SKIP_UT)
++if(NOT SKIP_UT AND NOT VITA)
+     enable_testing()
+     add_subdirectory(tests/unit)
+ endif()
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 827f6f3..ed0896d 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -7,6 +7,11 @@ set(DEUSEX_WARNINGS
+   -Wswitch-enum -Wundef -Wuninitialized -Wunused
+ )
+ 
++if(VITA)
++  # 32-bit ARM: the PC warning set (with -Werror) trips on alignment casts that are fine here.
++  set(DEUSEX_WARNINGS -Wall -Wno-cast-align -Wno-psabi)
++endif()
++
+ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
+   list(APPEND DEUSEX_WARNINGS -Wno-restrict)
+ endif()
+@@ -80,7 +85,7 @@ if(EMSCRIPTEN)
+     "SHELL:--preload-file ${DEUSEX_GAME_DATA}/Sounds@/game/Sounds"
+     "SHELL:--preload-file ${DEUSEX_GAME_DATA}/Textures@/game/Textures"
+   )
+-else()
++elseif(NOT VITA)
+   target_compile_definitions(deusex PRIVATE DEUSEX_GAME_DATA="${DEUSEX_GAME_DATA}")
+ endif()
+ 
+@@ -89,6 +94,7 @@ if(DX_NETWORKING)
+   list(APPEND DX_TARGETS dx-net)
+ endif()
+ 
++if(NOT VITA)
+ file(GLOB DX_COMPILER_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/compiler/*.cc)
+ add_library(dx-compiler STATIC ${DX_COMPILER_SOURCES})
+ target_include_directories(dx-compiler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+@@ -114,6 +120,8 @@ if(DX_EDITOR_SOURCES)
+   list(APPEND DX_TARGETS deused)
+ endif()
+ 
++endif()
++
+ foreach(tgt ${DX_TARGETS})
+   target_compile_options(${tgt} PRIVATE ${DEUSEX_WARNINGS})
+ 
+@@ -127,6 +135,12 @@ foreach(tgt ${DX_TARGETS})
+   )
+ endforeach()
+ 
+-if(NOT EMSCRIPTEN)
++if(VITA)
++  include("${VITASDK}/share/vita.cmake" REQUIRED)
++  target_link_libraries(deusex PRIVATE ${VITAGL_PREFIX}/lib/libvitaGL.a ${VITAGL_PREFIX}/lib/libvitashark.a ${VITAGL_PREFIX}/lib/libmathneon.a
++    SceShaccCg_stub_weak SceKernelDmacMgr_stub SceGxm_stub SceDisplay_stub SceCtrl_stub SceAppMgr_stub SceAppUtil_stub
++    SceAudio_stub SceAudioIn_stub SceSysmodule_stub SceCommonDialog_stub SceTouch_stub SceHid_stub SceMotion_stub SceIme_stub ScePower_stub SceRazorCapture_stub SceRtc_stub pthread m)
++  target_compile_definitions(deusex PRIVATE DEUSEX_GAME_DATA="ux0:data/DeusEx")
++elseif(NOT EMSCRIPTEN)
+   target_link_options(deusex PRIVATE -static-libstdc++ -static-libgcc)
+ endif()
+diff --git a/src/audio/audio.cc b/src/audio/audio.cc
+index 4e79963..b3c7c91 100644
+--- a/src/audio/audio.cc
++++ b/src/audio/audio.cc
+@@ -10,6 +10,13 @@
+ 
+ #include <miniaudio.h>
+ 
++#ifdef __vita__
++#include <atomic>
++#include <cstdio>
++#include <psp2/audioout.h>
++#include <psp2/kernel/threadmgr.h>
++#endif
++
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
+@@ -131,9 +138,16 @@ namespace dx::audio {
+             bool active = false;
+             bool offline = false;
+             bool hasContext = false;
++#ifdef __vita__
++            int port = -1;
++            int thread = -1;
++            std::atomic<bool> quit { false };
++#else
+             ma_context context {};
+             ma_device device {};
++#endif
+             uint32_t rate = 44100;
++            size_t decodedBytes = 0;
+             size_t channels = 16;
+             float ambientFactor = 0.7f;
+             float dopplerSpeed = 6500;
+@@ -493,12 +507,39 @@ namespace dx::audio {
+             }
+         }
+ 
++#ifdef __vita__
++        // PS Vita: a high priority thread mixes VitaAudioFrames at a time and
++        // hands them to the BGM audio port, which blocks until it needs more.
++        constexpr uint32_t VitaAudioFrames = 1024;
++
++        int vitaAudioThread(SceSize, void* argument)
++        {
++            State& s = **static_cast<State**>(argument);
++            std::vector<float> mix(VitaAudioFrames * 2);
++            int16_t out[2][VitaAudioFrames * 2];
++            int which = 0;
++            while (!s.quit.load()) {
++                {
++                    std::lock_guard<std::mutex> lock(s.mutex);
++                    mixAll(s, mix.data(), VitaAudioFrames);
++                }
++                int16_t* buffer = out[which];
++                for (size_t i = 0; i < VitaAudioFrames * 2; i++) {
++                    buffer[i] = static_cast<int16_t>(std::lrintf(mix[i] * 32767.0f));
++                }
++                sceAudioOutOutput(s.port, buffer);
++                which ^= 1;
++            }
++            return sceKernelExitDeleteThread(0);
++        }
++#else
+         void dataCallback(ma_device* device, void* output, const void*, ma_uint32 frameCount)
+         {
+             State& s = *static_cast<State*>(device->pUserData);
+             std::lock_guard<std::mutex> lock(s.mutex);
+             mixAll(s, static_cast<float*>(output), frameCount);
+         }
++#endif
+ 
+         Voice makeVoice(State& s, std::shared_ptr<const DecodedSound> pcm, USound* sound, UObject* actor, int32_t slot, const Vector& location, float volume, float radius, float pitch, bool attenuate)
+         {
+@@ -687,12 +728,20 @@ namespace dx::audio {
+             if (latency) {
+                 s.latency = static_cast<float>(std::atof(latency->c_str()));
+             }
++#ifdef __vita__
++            // PS Vita: mix at 22050 Hz (the rate of most of the game's sounds)
++            // with no reverb, to keep the sound thread light. DX_AUDIO_HZ and
++            // DX_REVERB=1 change that.
++            const char* rate = std::getenv("DX_AUDIO_HZ");
++            s.rate = rate ? static_cast<uint32_t>(std::atoi(rate)) : 22050u;
++            s.useReverb = std::getenv("DX_REVERB") != nullptr;
++#endif
+         }
+     }
+ 
+     size_t DecodedSound::frames() const
+     {
+-        return channels == 0 ? 0 : samples.size() / channels;
++        return channels == 0 ? 0 : fixed.size() / channels;
+     }
+ 
+     float DecodedSound::duration() const
+@@ -706,8 +755,7 @@ namespace dx::audio {
+         std::array<float, 1024> im {};
+         size_t frames = pcm.frames();
+         for (size_t i = 0; i < 1024; i++) {
+-            float sample = position + i < std::min(frames, end) ? pcm.samples[(position + i) * pcm.channels] : 0.0f;
+-            float clamped = std::clamp(std::nearbyint(sample * 32768.0f), -32768.0f, 32767.0f);
++            float clamped = position + i < std::min(frames, end) ? static_cast<float>(pcm.fixed[(position + i) * pcm.channels]) : 0.0f;
+             re[i] = clamped * (1.0f / 32768.0f) * (static_cast<float>(i) / 1024.0f);
+         }
+         fft(re, im);
+@@ -779,6 +827,9 @@ namespace dx::audio {
+         for (size_t i = 0; i < result->samples.size(); i++) {
+             result->fixed[i] = static_cast<int16_t>(std::clamp(std::nearbyint(result->samples[i] * 32768.0f), -32768.0f, 32767.0f));
+         }
++        // Only the 16-bit copy is used for mixing and lip sync; the float
++        // copy would triple the memory of every decoded sound.
++        std::vector<float>().swap(result->samples);
+         return result;
+     }
+ 
+@@ -793,6 +844,22 @@ namespace dx::audio {
+             return it->second;
+         }
+         std::shared_ptr<const DecodedSound> result = decodeBytes(sound->bytes);
++        // Decoded sounds are kept for reuse, but only up to a budget: past it,
++        // the ones not playing right now are dropped (decoded again if needed).
++        constexpr size_t budget = 32u << 20;
++        if (result) {
++            s.decodedBytes += result->fixed.size() * sizeof(int16_t);
++        }
++        if (s.decodedBytes > budget) {
++            for (auto entry = s.sounds.begin(); entry != s.sounds.end();) {
++                if (entry->second && entry->second.use_count() == 1) {
++                    s.decodedBytes -= std::min(s.decodedBytes, entry->second->fixed.size() * sizeof(int16_t));
++                    entry = s.sounds.erase(entry);
++                } else {
++                    ++entry;
++                }
++            }
++        }
+         s.sounds.emplace(sound, result);
+         if (result) {
+             sound->duration = result->duration();
+@@ -971,6 +1038,22 @@ namespace dx::audio {
+             return true;
+         }
+         readSettings(s);
++#ifdef __vita__
++        s.port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, VitaAudioFrames, static_cast<int>(s.rate), SCE_AUDIO_OUT_MODE_STEREO);
++        if (s.port < 0) {
++            std::fprintf(stderr, "sceAudioOutOpenPort(%u Hz) failed: 0x%08x\n", s.rate, static_cast<unsigned>(s.port));
++            return false;
++        }
++        int volume[2] = { SCE_AUDIO_VOLUME_0DB, SCE_AUDIO_VOLUME_0DB };
++        sceAudioOutSetVolume(s.port, static_cast<SceAudioOutChannelFlag>(SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH), volume);
++        s.quit = false;
++        s.thread = sceKernelCreateThread("dx_audio", vitaAudioThread, 0x10000100 - 16, 0x10000, 0, 0x20000, nullptr);
++        State* self = &s;
++        sceKernelStartThread(s.thread, sizeof(self), &self);
++        s.active = true;
++        s.offline = false;
++        return true;
++#else
+         ma_device_config config = ma_device_config_init(ma_device_type_playback);
+         config.playback.format = ma_format_f32;
+         config.playback.channels = 2;
+@@ -1001,6 +1084,7 @@ namespace dx::audio {
+         s.active = true;
+         s.offline = false;
+         return true;
++#endif
+     }
+ 
+     bool initializeOffline(uint32_t sampleRate)
+@@ -1011,6 +1095,7 @@ namespace dx::audio {
+         }
+         readSettings(s);
+         s.sounds.clear();
++        s.decodedBytes = 0;
+         s.modules.clear();
+         s.rate = sampleRate;
+         s.active = true;
+@@ -1025,11 +1110,18 @@ namespace dx::audio {
+             return;
+         }
+         if (!s.offline) {
++#ifdef __vita__
++            s.quit = true;
++            sceKernelWaitThreadEnd(s.thread, nullptr, nullptr);
++            sceAudioOutReleasePort(s.port);
++            s.port = -1;
++#else
+             ma_device_uninit(&s.device);
+             if (s.hasContext) {
+                 ma_context_uninit(&s.context);
+                 s.hasContext = false;
+             }
++#endif
+         }
+         s.active = false;
+         s.offline = false;
+@@ -1051,6 +1143,7 @@ namespace dx::audio {
+         s.viewer = {};
+         s.ear = {};
+         s.sounds.clear();
++        s.decodedBytes = 0;
+         s.modules.clear();
+     }
+ 
+diff --git a/src/core/objects.cc b/src/core/objects.cc
+index d5f4d4a..3f7a37a 100644
+--- a/src/core/objects.cc
++++ b/src/core/objects.cc
+@@ -639,7 +639,8 @@ namespace dx {
+                 registry().deferredData.push_back(object);
+             }
+             if (entry.size > 0) {
+-                Reader reader(linker.file().data(), static_cast<size_t>(entry.offset));
++                std::vector<uint8_t> scratch;
++                Reader reader = linker.file().exportReader(static_cast<size_t>(entry.offset), static_cast<size_t>(entry.size), scratch);
+                 int32_t stackNode = 0;
+                 int32_t stackState = 0;
+                 int32_t stackOffset = -1;
+diff --git a/src/engine/package.cc b/src/engine/package.cc
+index 2291142..dbc8b5c 100644
+--- a/src/engine/package.cc
++++ b/src/engine/package.cc
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include "engine/package.h"
+ 
+ #include <algorithm>
+@@ -119,14 +121,78 @@ namespace dx {
+         return Reader(owner.data(), nativeStart);
+     }
+ 
++    namespace {
++        // Packages read on demand keep their file open; a few at most, the
++        // most recently used first.
++        struct OpenFile {
++            std::string path;
++            std::FILE* file = nullptr;
++        };
++        std::vector<OpenFile>& openFiles()
++        {
++            static std::vector<OpenFile> files;
++            return files;
++        }
++
++        std::FILE* openPackageFile(const std::string& path)
++        {
++            std::vector<OpenFile>& files = openFiles();
++            for (size_t i = 0; i < files.size(); i++) {
++                if (files[i].path == path) {
++                    if (i != 0) {
++                        std::rotate(files.begin(), files.begin() + static_cast<std::ptrdiff_t>(i), files.begin() + static_cast<std::ptrdiff_t>(i) + 1);
++                    }
++                    return files[0].file;
++                }
++            }
++            std::FILE* file = std::fopen(path.c_str(), "rb");
++            if (!file) {
++                return nullptr;
++            }
++            if (files.size() >= 12) {
++                std::fclose(files.back().file);
++                files.pop_back();
++            }
++            files.insert(files.begin(), OpenFile { path, file });
++            return file;
++        }
++
++        bool keepPackagesInMemory()
++        {
++#ifdef __vita__
++            static const bool keep = std::getenv("DX_PACKAGE_RESIDENT") != nullptr;
++#else
++            static const bool keep = std::getenv("DX_PACKAGE_WINDOW") == nullptr;
++#endif
++            return keep;
++        }
++    }
++
++    Reader Package::exportReader(size_t offset, size_t size, std::vector<uint8_t>& scratch) const
++    {
++        if (resident) {
++            return Reader(bytes, offset);
++        }
++        scratch.resize(size);
++        std::FILE* file = openPackageFile(filePath.string());
++        if (!file || std::fseek(file, static_cast<long>(offset), SEEK_SET) != 0 || std::fread(scratch.data(), 1, size, file) != size) {
++            throw std::runtime_error("cannot read " + std::to_string(size) + " bytes at " + std::to_string(offset) + " from " + filePath.string());
++        }
++        return Reader(scratch, offset, offset);
++    }
++
+     Package::Package(const std::filesystem::path& path)
+         : packageName(path.stem().string())
++        , filePath(path)
+     {
+         std::ifstream file(path, std::ios::binary);
+         if (!file) {
+             throw std::runtime_error("cannot open package " + path.string());
+         }
+         bytes.resize(static_cast<size_t>(std::filesystem::file_size(path)));
++        if (std::getenv("DX_PACKAGE_LOG")) {
++            std::printf("package %s: %zu KiB\n", path.string().c_str(), bytes.size() / 1024);
++        }
+         file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+         if (!file) {
+             throw std::runtime_error("cannot read package " + path.string());
+@@ -190,6 +256,12 @@ namespace dx {
+             entry.name = reader.index();
+             importTable.push_back(entry);
+         }
++        if (!keepPackagesInMemory()) {
++            // The tables above are all that is needed up front; objects are
++            // read from the file when they load.
++            resident = false;
++            std::vector<uint8_t>().swap(bytes);
++        }
+     }
+ 
+     const std::string& Package::name() const
+diff --git a/src/engine/package.h b/src/engine/package.h
+index 653cdc6..8082944 100644
+--- a/src/engine/package.h
++++ b/src/engine/package.h
+@@ -101,6 +101,9 @@ namespace dx {
+         const std::vector<ImportEntry>& imports() const;
+         const std::vector<ExportEntry>& exports() const;
+         std::span<const uint8_t> data() const;
++        // A reader for one export's bytes. When the package is not kept in
++        // memory (PS Vita), they are read from the file into scratch.
++        Reader exportReader(size_t offset, size_t size, std::vector<uint8_t>& scratch) const;
+ 
+         const std::string& nameAt(int32_t index) const;
+         const ImportEntry& importAt(int32_t ref) const;
+@@ -113,7 +116,9 @@ namespace dx {
+ 
+     private:
+         std::string packageName;
++        std::filesystem::path filePath;
+         std::vector<uint8_t> bytes;
++        bool resident = true;
+         uint16_t fileVersion = 0;
+         uint16_t licenseeMode = 0;
+         std::vector<NameEntry> nameTable;
+diff --git a/src/engine/reader.cc b/src/engine/reader.cc
+index 3ff5cf2..b5420c4 100644
+--- a/src/engine/reader.cc
++++ b/src/engine/reader.cc
+@@ -12,9 +12,16 @@ namespace dx {
+     {
+     }
+ 
++    Reader::Reader(std::span<const uint8_t> data, size_t offset, size_t start)
++        : buffer(data)
++        , position(offset)
++        , base(start)
++    {
++    }
++
+     void Reader::require(size_t count) const
+     {
+-        if (position > buffer.size() || buffer.size() - position < count) {
++        if (position < base || position - base > buffer.size() || buffer.size() - (position - base) < count) {
+             throw std::runtime_error("read past end of package data");
+         }
+     }
+@@ -22,14 +29,14 @@ namespace dx {
+     void Reader::bytes(void* out, size_t count)
+     {
+         require(count);
+-        std::memcpy(out, buffer.data() + position, count);
++        std::memcpy(out, buffer.data() + (position - base), count);
+         position += count;
+     }
+ 
+     uint8_t Reader::u8()
+     {
+         require(1);
+-        return buffer[position++];
++        return buffer[position++ - base];
+     }
+ 
+     int16_t Reader::i16()
+@@ -135,7 +142,7 @@ namespace dx {
+ 
+     void Reader::seek(size_t offset)
+     {
+-        if (offset > buffer.size()) {
++        if (offset < base || offset - base > buffer.size()) {
+             throw std::runtime_error("seek past end of package data");
+         }
+         position = offset;
+diff --git a/src/engine/reader.h b/src/engine/reader.h
+index 41cb909..7ae8228 100644
+--- a/src/engine/reader.h
++++ b/src/engine/reader.h
+@@ -9,6 +9,9 @@ namespace dx {
+     class Reader {
+     public:
+         Reader(std::span<const uint8_t> data, size_t offset);
++        // data holds the package bytes from file position base onwards; offsets
++        // stay file positions (used when only one object is read from disk).
++        Reader(std::span<const uint8_t> data, size_t offset, size_t base);
+ 
+         uint8_t u8();
+         int16_t i16();
+@@ -28,5 +31,6 @@ namespace dx {
+ 
+         std::span<const uint8_t> buffer;
+         size_t position;
++        size_t base = 0;
+     };
+ }
+diff --git a/src/engine/world.cc b/src/engine/world.cc
+index 37f990c..8db1030 100644
+--- a/src/engine/world.cc
++++ b/src/engine/world.cc
+@@ -500,6 +500,8 @@ namespace dx {
+         if (const char* name = std::getenv("COMPUTERNAME")) {
+             std::snprintf(host, sizeof(host), "%s", name);
+         }
++#elif defined(__vita__)
++        std::snprintf(host, sizeof(host), "%s", "PSVITA");
+ #else
+         gethostname(host, sizeof(host) - 1);
+ #endif
+diff --git a/src/game/main.cc b/src/game/main.cc
+index f4ca511..d26d181 100644
+--- a/src/game/main.cc
++++ b/src/game/main.cc
+@@ -22,6 +22,27 @@
+ #include <SDL.h>
+ #include <glad/gl.h>
+ 
++#ifdef __vita__
++// PS Vita: no SDL window. The screen is vitaGL's, 960x544; SDL is only used
++// for timers. These stand in for the SDL window calls the game makes.
++#include "game/vita_platform.h"
++#include <psp2/ctrl.h>
++namespace {
++    inline void vitaDrawableSize(int* width, int* height)
++    {
++        if (width) {
++            *width = vita::ScreenWidth;
++        }
++        if (height) {
++            *height = vita::ScreenHeight;
++        }
++    }
++}
++#define SDL_GL_GetDrawableSize(window, width, height) vitaDrawableSize(width, height)
++#define SDL_GetWindowSize(window, width, height) vitaDrawableSize(width, height)
++#define SDL_GL_SwapWindow(window) vita::swap()
++#endif
++
+ #ifndef _WIN32
+ #include <sys/select.h>
+ #include <unistd.h>
+@@ -1174,8 +1195,123 @@ namespace {
+             dx::console::key(key, action, 0);
+         }
+ 
++#ifdef __vita__
++        // Controls (same layout as the earlier Deus Ex Vita port):
++        //   Left stick  move (W/A/S/D)        Right stick  look; in menus the pointer
++        //   R  fire / click (left mouse)       L  use, pick up, open (right mouse)
++        //   Cross  jump     Circle  crouch     Square  reload    Triangle  inventory
++        //   D-pad up  goals and notes          D-pad down  put weapon away
++        //   D-pad left/right  previous / next belt item
++        //   Select  augmentation 1             Start  main menu
++        //   Touch screen  pointer under the finger, tap = click (menus)
++        // DX_LOOK_SPEED (default 900) is look speed in pixels per second at full stick.
++        void processVitaInput()
++        {
++            vita::Pad pad;
++            vita::readPad(pad);
++            uint64_t ticks = SDL_GetPerformanceCounter();
++            float dt = vitaLastPad ? static_cast<float>(ticks - vitaLastPad) / static_cast<float>(SDL_GetPerformanceFrequency()) : 0.0f;
++            vitaLastPad = ticks;
++            dt = std::min(dt, 0.1f);
++            uint32_t pressed = pad.buttons & ~vitaButtons;
++            uint32_t released = vitaButtons & ~pad.buttons;
++            vitaButtons = pad.buttons;
++            bool gui = dx::extension::wantsMouse();
++
++            auto mouseButton = [&](uint8_t key, bool down) {
++                if (gui && dx::extension::mouseButton(key, down)) {
++                    return;
++                }
++                handleKey(key, down);
++            };
++            auto holdKey = [&](uint8_t key, bool down, bool& state) {
++                if (down != state) {
++                    state = down;
++                    handleKey(key, down);
++                }
++            };
++
++            static const float lookSpeed = std::getenv("DX_LOOK_SPEED") ? static_cast<float>(std::atof(std::getenv("DX_LOOK_SPEED"))) : 900.0f;
++            if (pad.touch && gui) {
++                vitaCursorX = pad.tx;
++                vitaCursorY = pad.ty;
++                dx::extension::mouseMove(vitaCursorX, vitaCursorY);
++                if (!vitaTouchDown) {
++                    vitaTouchDown = true;
++                    mouseButton(dx::IK_LeftMouse, true);
++                }
++            } else if (vitaTouchDown) {
++                vitaTouchDown = false;
++                mouseButton(dx::IK_LeftMouse, false);
++            }
++            if (pad.rx != 0 || pad.ry != 0) {
++                // Squared response: fine aim near the centre, fast turns at the edge.
++                float dx = pad.rx * std::fabs(pad.rx) * lookSpeed * dt;
++                float dy = pad.ry * std::fabs(pad.ry) * lookSpeed * dt;
++                if (gui) {
++                    vitaCursorX = std::clamp(vitaCursorX + dx, 0.0f, static_cast<float>(vita::ScreenWidth - 1));
++                    vitaCursorY = std::clamp(vitaCursorY + dy, 0.0f, static_cast<float>(vita::ScreenHeight - 1));
++                    dx::extension::mouseMove(vitaCursorX, vitaCursorY);
++                } else {
++                    dx::console::key(dx::IK_MouseX, dx::IST_Axis, dx);
++                    dx::console::key(dx::IK_MouseY, dx::IST_Axis, -dy);
++                }
++            }
++            holdKey(static_cast<uint8_t>('A'), pad.lx < -0.35f, vitaHeld[0]);
++            holdKey(static_cast<uint8_t>('D'), pad.lx > 0.35f, vitaHeld[1]);
++            holdKey(static_cast<uint8_t>('W'), pad.ly < -0.35f, vitaHeld[2]);
++            holdKey(static_cast<uint8_t>('S'), pad.ly > 0.35f, vitaHeld[3]);
++
++            if (pressed & SCE_CTRL_RTRIGGER) {
++                mouseButton(dx::IK_LeftMouse, true);
++            }
++            if (released & SCE_CTRL_RTRIGGER) {
++                mouseButton(dx::IK_LeftMouse, false);
++            }
++            if (pressed & SCE_CTRL_LTRIGGER) {
++                mouseButton(dx::IK_RightMouse, true);
++            }
++            if (released & SCE_CTRL_LTRIGGER) {
++                mouseButton(dx::IK_RightMouse, false);
++            }
++            static const struct {
++                uint32_t bit;
++                uint8_t key;
++            } buttons[] = {
++                { SCE_CTRL_CROSS, dx::IK_Space }, { SCE_CTRL_CIRCLE, static_cast<uint8_t>('X') }, { SCE_CTRL_SQUARE, dx::IK_Semicolon },
++                { SCE_CTRL_TRIANGLE, dx::IK_F1 }, { SCE_CTRL_UP, static_cast<uint8_t>(dx::IK_F1 + 1) }, { SCE_CTRL_DOWN, dx::IK_Backspace },
++                { SCE_CTRL_START, dx::IK_Escape }, { SCE_CTRL_SELECT, static_cast<uint8_t>(dx::IK_F1 + 2) },
++            };
++            for (const auto& button : buttons) {
++                if (pressed & button.bit) {
++                    handleKey(button.key, true);
++                }
++                if (released & button.bit) {
++                    handleKey(button.key, false);
++                }
++            }
++            if (pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT)) {
++                bool up = (pressed & SCE_CTRL_LEFT) != 0;
++                dx::console::key(dx::IK_MouseW, dx::IST_Axis, up ? 120.0f : -120.0f);
++                uint8_t key = up ? dx::IK_MouseWheelUp : dx::IK_MouseWheelDown;
++                handleKey(key, true);
++                handleKey(key, false);
++            }
++        }
++
++        uint32_t vitaButtons = 0;
++        uint64_t vitaLastPad = 0;
++        bool vitaHeld[4] = {};
++        bool vitaTouchDown = false;
++        float vitaCursorX = vita::ScreenWidth / 2.0f;
++        float vitaCursorY = vita::ScreenHeight / 2.0f;
++#endif
++
+         void processEvents()
+         {
++#ifdef __vita__
++            processVitaInput();
++#endif
+             SDL_Event event;
+             while (SDL_PollEvent(&event)) {
+                 switch (event.type) {
+@@ -1432,6 +1568,9 @@ namespace {
+ 
+         void step()
+         {
++#ifdef __vita__
++            vita::mark(vita::Mark::FrameStart);
++#endif
+             processEvents();
+             bool gui = dx::extension::wantsMouse();
+             if (gui != guiMode) {
+@@ -1439,7 +1578,15 @@ namespace {
+                 SDL_SetRelativeMouseMode(gui ? SDL_FALSE : SDL_TRUE);
+                 float cursorX = 0;
+                 float cursorY = 0;
++#ifdef __vita__
++                if (gui && dx::extension::cursorPosition(cursorX, cursorY)) {
++                    vitaCursorX = cursorX;
++                    vitaCursorY = cursorY;
++                }
++                if (false) {
++#else
+                 if (gui && dx::extension::cursorPosition(cursorX, cursorY)) {
++#endif
+                     int windowWidth = 0;
+                     int windowHeight = 0;
+                     SDL_GetWindowSize(window, &windowWidth, &windowHeight);
+@@ -1477,6 +1624,9 @@ namespace {
+             int width = 0;
+             int height = 0;
+             SDL_GL_GetDrawableSize(window, &width, &height);
++#ifdef __vita__
++            vita::mark(vita::Mark::TickDone);
++#endif
+             render(width, height);
+             renderer->applyBrightness(static_cast<float>(std::atof(dx::config::system().get(videoSection(), "Brightness").value_or("0.5").c_str())));
+             dx::audio::update(viewLocation, viewRotation, delta);
+@@ -1511,7 +1661,13 @@ namespace {
+                 }
+                 running = false;
+             }
++#ifdef __vita__
++            vita::mark(vita::Mark::RenderDone);
++#endif
+             SDL_GL_SwapWindow(window);
++#ifdef __vita__
++            vita::mark(vita::Mark::SwapDone);
++#endif
+             limitFrameRate();
+             if (options.fps > 0) {
+                 SDL_Delay(static_cast<uint32_t>(1000 / options.fps));
+@@ -1665,6 +1821,37 @@ int main(int argc, char** argv)
+     if (options.dedicated || options.headless) {
+         return runHeadless(options);
+     }
++#ifdef __vita__
++    vita::initialize();
++    if (SDL_Init(SDL_INIT_EVENTS | SDL_INIT_TIMER) != 0) {
++        std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
++        return 1;
++    }
++    options.width = vita::ScreenWidth;
++    options.height = vita::ScreenHeight;
++    SDL_Window* window = nullptr;
++    dx::vm::setCriticalHandler([](const std::string& message) {
++        std::fprintf(stderr, "Critical Error: %s\n", message.c_str());
++        std::fflush(stderr);
++        std::_Exit(1);
++    });
++    int result = 0;
++    try {
++        Game game(window, options);
++        if (!game.start()) {
++            std::fprintf(stderr, "failed to start game\n");
++            result = 1;
++        } else {
++            result = game.run();
++        }
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "error: %s\n", error.what());
++        result = 1;
++    }
++    dx::audio::shutdown();
++    SDL_Quit();
++    return result;
++#else
+     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+         return 1;
+@@ -1756,4 +1943,5 @@ int main(int argc, char** argv)
+     SDL_Quit();
+     return result;
+ #endif
++#endif
+ }
+diff --git a/src/game/vita_platform.cc b/src/game/vita_platform.cc
+new file mode 100644
+index 0000000..0f1848f
+--- /dev/null
++++ b/src/game/vita_platform.cc
+@@ -0,0 +1,197 @@
++#ifdef __vita__
++
++#include "game/vita_platform.h"
++
++#include <psp2/ctrl.h>
++#include <psp2/kernel/processmgr.h>
++#include <psp2/kernel/sysmem.h>
++#include <psp2/power.h>
++#include <psp2/touch.h>
++#include <vitaGL.h>
++
++#include <malloc.h>
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++// Memory: the C/C++ heap (where the engine keeps packages, maps and objects)
++// gets most of the extended user budget (param.sfo ATTRIBUTE2=12). vitaGL
++// takes what is left for the GPU, then borrows from this heap if it runs out.
++extern "C" {
++int setenv(const char* name, const char* value, int overwrite);
++unsigned int _newlib_heap_size_user = 240 * 1024 * 1024;
++// UnrealScript calls nest deeply; the default 256 KiB main stack is too small.
++unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
++}
++
++namespace vita {
++    namespace {
++        constexpr const char* DataRoot = "ux0:data/DeusEx";
++
++        // NAME=value lines from ux0:data/DeusEx/opende_env.txt become
++        // environment variables (DX_LOOK_SPEED, DX_TEXTURE_SKIP, ...).
++        void readEnvironmentFile()
++        {
++            std::string path = std::string(DataRoot) + "/opende_env.txt";
++            FILE* file = std::fopen(path.c_str(), "r");
++            if (!file) {
++                return;
++            }
++            char line[512];
++            while (std::fgets(line, sizeof(line), file)) {
++                char* end = line + std::strlen(line);
++                while (end > line && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ')) {
++                    *--end = 0;
++                }
++                char* equals = std::strchr(line, '=');
++                if (line[0] == '#' || !equals) {
++                    continue;
++                }
++                *equals = 0;
++                setenv(line, equals + 1, 1);
++                std::printf("env %s=%s\n", line, equals + 1);
++            }
++            std::fclose(file);
++        }
++
++        float stick(uint8_t raw)
++        {
++            float value = (static_cast<float>(raw) - 127.5f) / 127.5f;
++            constexpr float dead = 0.18f;
++            if (std::fabs(value) < dead) {
++                return 0;
++            }
++            float sign = value < 0 ? -1.0f : 1.0f;
++            return sign * std::fmin((std::fabs(value) - dead) / (1.0f - dead), 1.0f);
++        }
++
++        uint64_t now()
++        {
++            return sceKernelGetProcessTimeWide();
++        }
++
++        struct Timing {
++            uint64_t frameStart = 0;
++            uint64_t tickDone = 0;
++            uint64_t renderDone = 0;
++            uint64_t windowStart = 0;
++            double tick = 0;
++            double render = 0;
++            double swap = 0;
++            double worst = 0;
++            int frames = 0;
++        } timing;
++    }
++
++    void initialize()
++    {
++        // Full speed: 444 MHz CPU (an overclock plugin can raise it further).
++        scePowerSetArmClockFrequency(444);
++        scePowerSetBusClockFrequency(222);
++        scePowerSetGpuClockFrequency(222);
++        scePowerSetGpuXbarClockFrequency(166);
++
++        std::string log = std::string(DataRoot) + "/opende_log.txt";
++        std::string previous = std::string(DataRoot) + "/opende_log_prev.txt";
++        std::remove(previous.c_str());
++        std::rename(log.c_str(), previous.c_str());
++        std::freopen(log.c_str(), "w", stdout);
++        std::freopen(log.c_str(), "a", stderr);
++        setvbuf(stdout, nullptr, _IOLBF, 0);
++        setvbuf(stderr, nullptr, _IONBF, 0);
++        std::printf("OpenDE for PS Vita\n");
++
++        setenv("DEUSEX_GAME_DATA", DataRoot, 0);
++        // Settings and saves: ux0:data/DeusEx/deusex/ (DeusEx.ini, User.ini, Save/).
++        setenv("XDG_DATA_HOME", DataRoot, 0);
++        setenv("HOME", DataRoot, 0);
++        readEnvironmentFile();
++
++        sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
++        sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
++
++        // vglInitExtended returns GL_FALSE when it did not have to fall back
++        // to another resolution, so its result is not an error code.
++        vglInitExtended(0, ScreenWidth, ScreenHeight, 8 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
++        vglWaitVblankStart(std::getenv("DX_NO_VSYNC") ? GL_FALSE : GL_TRUE);
++        glViewport(0, 0, ScreenWidth, ScreenHeight);
++        glClearColor(0, 0, 0, 1);
++        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++        vglSwapBuffers(GL_FALSE);
++        std::printf("GPU ready: VRAM %zu KiB free, GPU RAM %zu KiB free\n", vglMemFree(VGL_MEM_VRAM) / 1024, vglMemFree(VGL_MEM_RAM) / 1024);
++    }
++
++    void readPad(Pad& pad)
++    {
++        SceCtrlData data {};
++        sceCtrlPeekBufferPositive(0, &data, 1);
++        pad.buttons = data.buttons;
++        pad.lx = stick(data.lx);
++        pad.ly = stick(data.ly);
++        pad.rx = stick(data.rx);
++        pad.ry = stick(data.ry);
++        SceTouchData touch {};
++        sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
++        pad.touch = touch.reportNum > 0;
++        if (pad.touch) {
++            // The front panel reports 1920x1088.
++            pad.tx = static_cast<float>(touch.report[0].x) * 0.5f;
++            pad.ty = static_cast<float>(touch.report[0].y) * 0.5f;
++        }
++    }
++
++    void swap()
++    {
++        vglSwapBuffers(GL_FALSE);
++    }
++
++    void mark(Mark point)
++    {
++        uint64_t t = now();
++        switch (point) {
++        case Mark::FrameStart:
++            timing.frameStart = t;
++            if (!timing.windowStart) {
++                timing.windowStart = t;
++            }
++            break;
++        case Mark::TickDone:
++            timing.tickDone = t;
++            break;
++        case Mark::RenderDone:
++            timing.renderDone = t;
++            break;
++        case Mark::SwapDone: {
++            double tick = static_cast<double>(timing.tickDone - timing.frameStart) / 1000.0;
++            double render = static_cast<double>(timing.renderDone - timing.tickDone) / 1000.0;
++            double swap = static_cast<double>(t - timing.renderDone) / 1000.0;
++            double frame = static_cast<double>(t - timing.frameStart) / 1000.0;
++            timing.tick += tick;
++            timing.render += render;
++            timing.swap += swap;
++            timing.worst = std::fmax(timing.worst, frame);
++            timing.frames++;
++            double window = static_cast<double>(t - timing.windowStart) / 1e6;
++            if (window >= 5.0) {
++                int n = timing.frames;
++                struct mallinfo heap = mallinfo();
++                SceKernelFreeMemorySizeInfo free {};
++                free.size = sizeof(free);
++                sceKernelGetFreeMemorySize(&free);
++                std::printf("speed: %.1f fps | per frame: game %.1f ms, drawing %.1f ms, GPU wait+swap %.1f ms, worst frame %.0f ms | heap used %d MiB | VRAM free %zu MiB, GPU RAM free %zu MiB, system free %d MiB\n",
++                    n / window, timing.tick / n, timing.render / n, timing.swap / n, timing.worst,
++                    heap.uordblks / (1024 * 1024), vglMemFree(VGL_MEM_VRAM) / (1024 * 1024), vglMemFree(VGL_MEM_RAM) / (1024 * 1024),
++                    free.size_user / (1024 * 1024));
++                timing = Timing {};
++                timing.windowStart = t;
++            }
++            break;
++        }
++        }
++    }
++}
++
++#endif
+diff --git a/src/game/vita_platform.h b/src/game/vita_platform.h
+new file mode 100644
+index 0000000..7aa2a1c
+--- /dev/null
++++ b/src/game/vita_platform.h
+@@ -0,0 +1,35 @@
++// PS Vita platform layer for the game executable: start-up (clocks, GPU,
++// files, log), screen size and buffer swap, controller state, and a
++// once-every-few-seconds speed and memory line in the log.
++#pragma once
++#ifdef __vita__
++
++#include <cstdint>
++
++namespace vita {
++    constexpr int ScreenWidth = 960;
++    constexpr int ScreenHeight = 544;
++
++    struct Pad {
++        uint32_t buttons = 0;  // SCE_CTRL_* bits
++        float lx = 0;          // sticks, -1..1 after the dead zone
++        float ly = 0;
++        float rx = 0;
++        float ry = 0;
++        bool touch = false;    // a finger on the front screen
++        float tx = 0;          // its position in screen pixels
++        float ty = 0;
++    };
++
++    // Before anything else: clocks, log file, environment knobs, GPU.
++    void initialize();
++    void readPad(Pad& pad);
++    void swap();
++
++    // Frame timing: call mark() at the given points of each frame; a summary
++    // goes to the log every 5 seconds.
++    enum class Mark { FrameStart, TickDone, RenderDone, SwapDone };
++    void mark(Mark point);
++}
++
++#endif
+diff --git a/src/render/gl_device.cc b/src/render/gl_device.cc
+index 38db00b..9de74d2 100644
+--- a/src/render/gl_device.cc
++++ b/src/render/gl_device.cc
+@@ -6,8 +6,12 @@ namespace dx {
+     GLRenderDevice::GLRenderDevice()
+     {
+         shader = std::make_unique<UberShader>();
++#ifndef __vita__
++        // PS Vita: no gamma, MSAA/FXAA or ambient occlusion passes; the scene
++        // is drawn straight to the screen.
+         gammaPass = std::make_unique<GammaPass>();
+         scenePass = std::make_unique<ScenePass>();
++#endif
+         textures = std::make_unique<TextureCache>();
+         canvasImpl = std::make_unique<GLCanvas>(*shader, *textures);
+     }
+@@ -16,6 +20,9 @@ namespace dx {
+ 
+     bool GLRenderDevice::drawingToWindow()
+     {
++#ifdef __vita__
++        return false;
++#endif
+         GLint boundFramebuffer = 0;
+         glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &boundFramebuffer);
+         return boundFramebuffer == 0;
+@@ -23,21 +30,35 @@ namespace dx {
+ 
+     void GLRenderDevice::bindGammaTarget(int width, int height)
+     {
++        if (!gammaPass) {
++            return;
++        }
+         gammaPass->bindTarget(width, height);
+     }
+ 
+     void GLRenderDevice::resolveGamma(int width, int height, float exponent)
+     {
++        if (!gammaPass) {
++            return;
++        }
+         gammaPass->resolve(width, height, exponent);
+     }
+ 
+     void GLRenderDevice::applyGamma(int width, int height, float exponent)
+     {
++        if (!gammaPass) {
++            return;
++        }
+         gammaPass->apply(width, height, exponent);
+     }
+ 
+     void GLRenderDevice::beginScene(int width, int height, int samples, OcclusionQuality ambientOcclusion)
+     {
++        if (!scenePass) {
++            sceneWidth = width;
++            sceneHeight = height;
++            return;
++        }
+         bool occluding = ambientOcclusion != OcclusionQuality::Off;
+         if (occluding && !occlusionPass) {
+             occlusionPass = std::make_unique<OcclusionPass>();
+@@ -53,11 +74,17 @@ namespace dx {
+ 
+     void GLRenderDevice::endScene(int width, int height, bool fxaa)
+     {
++        if (!scenePass) {
++            return;
++        }
+         scenePass->end(width, height, fxaa);
+     }
+ 
+     void GLRenderDevice::beginOcclusion()
+     {
++        if (!scenePass) {
++            return;
++        }
+         scenePass->clearMask();
+     }
+ 
+@@ -78,6 +105,9 @@ namespace dx {
+ 
+     void GLRenderDevice::applyOcclusion(float nearPlane, float farPlane, float tanHalfWidth, float tanHalfHeight)
+     {
++        if (!scenePass) {
++            return;
++        }
+         if (!scenePass->occluding()) {
+             return;
+         }
+@@ -181,7 +211,7 @@ namespace dx {
+ 
+     void GLRenderDevice::setWireframe(bool enabled)
+     {
+-#ifndef __EMSCRIPTEN__
++#if !defined(__EMSCRIPTEN__) && !defined(__vita__)
+         glPolygonMode(GL_FRONT_AND_BACK, enabled ? GL_LINE : GL_FILL);
+ #else
+         static_cast<void>(enabled);
+@@ -201,12 +231,13 @@ namespace dx {
+     void GLRenderDevice::setBlend(BlendMode mode)
+     {
+         shader->setBlend(mode);
+-        scenePass->setMaskWrites(mode == BlendMode::Opaque || mode == BlendMode::Masked);
++        if (scenePass)
++            scenePass->setMaskWrites(mode == BlendMode::Opaque || mode == BlendMode::Masked);
+     }
+ 
+     void GLRenderDevice::setClipPlanes(const float* planes, int32_t count)
+     {
+-#ifndef __EMSCRIPTEN__
++#if !defined(__EMSCRIPTEN__) && !defined(__vita__)
+         for (int32_t i = 0; i < 8; i++) {
+             if (i < count) {
+                 glEnable(static_cast<GLenum>(GL_CLIP_DISTANCE0 + i));
+@@ -302,7 +333,9 @@ namespace dx {
+         if (found == staticBuffers.end()) {
+             return;
+         }
++#ifndef __vita__
+         glDeleteVertexArrays(1, &found->first);
++#endif
+         glDeleteBuffers(1, &found->second);
+         staticBuffers.erase(found);
+     }
+@@ -322,6 +355,30 @@ namespace dx {
+         shader->drawStaticRanges(geometry, firsts, counts, ranges);
+     }
+ 
++#ifdef __vita__
++    uint32_t GLRenderDevice::createQuery()
++    {
++        return 1;
++    }
++
++    void GLRenderDevice::deleteQuery(uint32_t)
++    {
++    }
++
++    void GLRenderDevice::beginQuery(uint32_t)
++    {
++    }
++
++    void GLRenderDevice::endQuery()
++    {
++    }
++
++    bool GLRenderDevice::queryResult(uint32_t, bool& visible)
++    {
++        visible = true;
++        return true;
++    }
++#else
+     uint32_t GLRenderDevice::createQuery()
+     {
+         GLuint query = 0;
+@@ -356,6 +413,7 @@ namespace dx {
+         visible = result != 0;
+         return true;
+     }
++#endif
+ 
+     void GLRenderDevice::beginTextureFrame(double time)
+     {
+@@ -394,7 +452,9 @@ namespace dx {
+         glGenTextures(1, &id);
+         glBindTexture(GL_TEXTURE_2D, id);
+         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
++#ifndef __vita__
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
++#endif
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+diff --git a/src/render/gl_shader.cc b/src/render/gl_shader.cc
+index 5a458c2..9a24e4e 100644
+--- a/src/render/gl_shader.cc
++++ b/src/render/gl_shader.cc
+@@ -438,6 +438,7 @@ void main()
+         }
+     }
+ 
++#ifndef __vita__
+     UberShader::UberShader()
+     {
+         for (int32_t index = 0; index < 2; index++) {
+@@ -782,6 +783,8 @@ void main()
+         glMultiDrawArrays(GL_TRIANGLES, firsts, counts, ranges);
+     }
+ 
++#endif
++
+     GammaPass::GammaPass()
+     {
+         program = linkFullscreen(gammaFragmentSource);
+diff --git a/src/render/gl_shader.h b/src/render/gl_shader.h
+index 66508ac..eee4a26 100644
+--- a/src/render/gl_shader.h
++++ b/src/render/gl_shader.h
+@@ -36,6 +36,40 @@ namespace dx {
+         void drawStaticRanges(uint32_t vao, const int32_t* firsts, const int32_t* counts, int32_t ranges);
+         uint32_t createStatic(const std::vector<GLVertex>& vertices, uint32_t& buffer);
+ 
++#ifdef __vita__
++    private:
++        // PS Vita (render/vita_shader.cc): one small Cg program per material
++        // type, compiled the first time it is needed, instead of one shader
++        // that branches on uFlags for every pixel.
++        enum Field : uint8_t { F_ViewProj, F_Pan, F_Scale, F_Tint, F_Lights, F_Eye, F_Clip, F_Count };
++        struct Program {
++            uint32_t id = 0;
++            int32_t loc[F_Count + 4] = {};
++            uint32_t seen[F_Count] = {};
++            int32_t lightCount = -1;
++        };
++        Program& program(int32_t key);
++        void apply();
++        void pointers(const uint8_t* base);
++
++        std::vector<std::pair<int32_t, Program*>> cache;
++        Program* active = nullptr;
++        int32_t flags = 0;
++        float viewProj[16] = {};
++        float pan[2] = {};
++        float scale[2] = { 1, 1 };
++        float tint[4] = { 1, 1, 1, 1 };
++        int32_t lightCount = 0;
++        float lights[MaxDynamicLights * 12] = {};
++        float eye[4] = {};
++        float forward[4] = {};
++        float detailDistance = 380.0f;
++        float clipPlanes[32] = {};
++        int32_t clipCount = 0;
++        uint32_t gen[F_Count] = {};
++        uint32_t uploadBuffer = 0;
++        uint32_t boundBuffer = 0xffffffffu;
++#else
+     private:
+         struct Locations {
+             int32_t viewProj = -1;
+@@ -86,6 +120,7 @@ namespace dx {
+         size_t streamCapacity = 0;
+         size_t streamOffset = 0;
+         int32_t uploadBase = 0;
++#endif
+     };
+ 
+     class GammaPass {
+diff --git a/src/render/scene_renderer.cc b/src/render/scene_renderer.cc
+index 259a101..6b4162a 100644
+--- a/src/render/scene_renderer.cc
++++ b/src/render/scene_renderer.cc
+@@ -3326,6 +3326,12 @@ namespace dx {
+         occlusionBoxes.clear();
+         occlusionIssued.clear();
+         occlusionUnconfirmed.clear();
++#ifdef __vita__
++        // No occlusion queries on the Vita: drawing the test boxes costs more than it saves.
++        static_cast<void>(candidates);
++        static_cast<void>(view);
++        return;
++#endif
+         size_t kept = 0;
+         for (UObject* actor : candidates) {
+             bool keep = true;
+diff --git a/src/render/texture_cache.cc b/src/render/texture_cache.cc
+index 4640c7c..e7a626f 100644
+--- a/src/render/texture_cache.cc
++++ b/src/render/texture_cache.cc
+@@ -7,6 +7,8 @@
+ 
+ #include <algorithm>
+ #include <bit>
++#include <cstdlib>
++#include <cstring>
+ #include <exception>
+ #include <vector>
+ 
+@@ -14,7 +16,9 @@ namespace dx {
+     namespace {
+         void setParameters(bool smooth, int32_t levels, bool trilinear, float anisotropy)
+         {
++#ifndef __vita__
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, levels - 1);
++#endif
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+             if (smooth) {
+@@ -209,6 +213,11 @@ namespace dx {
+         }
+         glGenTextures(1, &info.id);
+         glBindTexture(GL_TEXTURE_2D, info.id);
++#ifdef __vita__
++        if (uploadVita(texture, info)) {
++            return true;
++        }
++#endif
+         int32_t levels = 0;
+         for (size_t mip = 0; mip < texture->mips.size(); mip++) {
+             const TextureMip& level = texture->mips[mip];
+@@ -252,6 +261,106 @@ namespace dx {
+         return true;
+     }
+ 
++#ifdef __vita__
++    // PS Vita: textures stay in the compact form they have in the packages.
++    // Paletted (P8) textures go to the GPU as 8-bit indices plus a 256 entry
++    // palette (a quarter of the memory of RGBA, and the GPU reads them
++    // natively); DXT1 textures stay DXT1. Palette entry 0 is transparent, as
++    // in the RGBA path. VitaTextureSkip (DX_TEXTURE_SKIP=1) drops the largest
++    // mip of big textures to save another three quarters.
++    bool TextureCache::uploadVita(UTexture* texture, GLTextureInfo& info)
++    {
++        uint8_t format = texture->format();
++        if (format != 0 && format != 3) {
++            return false;
++        }
++        static const uint32_t skipWanted = [] {
++            const char* value = std::getenv("DX_TEXTURE_SKIP");
++            return value ? static_cast<uint32_t>(std::atoi(value)) : 0u;
++        }();
++        size_t count = 0;
++        for (size_t mip = 0; mip < texture->mips.size(); mip++) {
++            const TextureMip& level = texture->mips[mip];
++            if (level.width == 0 || level.height == 0) {
++                break;
++            }
++            if (level.width != std::max(1u, info.width >> mip) || level.height != std::max(1u, info.height >> mip)) {
++                break;
++            }
++            count++;
++            if (level.width == 1 && level.height == 1) {
++                break;
++            }
++        }
++        if (count == 0) {
++            return false;
++        }
++        size_t first = 0;
++        while (first < skipWanted && first + 1 < count && texture->mips[first].width > 64 && texture->mips[first].height > 64) {
++            first++;
++        }
++        if (format == 0) {
++            UPalette* pal = texture->palette();
++            if (!pal || pal->colors.size() < 256) {
++                return false;
++            }
++            size_t bytes = 256 * 4;
++            for (size_t mip = first; mip < count; mip++) {
++                const TextureMip& level = texture->mips[mip];
++                if (level.data.size() < static_cast<size_t>(level.width) * level.height) {
++                    count = mip;
++                    break;
++                }
++                bytes += static_cast<size_t>(level.width) * level.height;
++            }
++            if (count <= first) {
++                return false;
++            }
++            std::vector<uint8_t> packed(bytes);
++            uint8_t* out = packed.data();
++            for (size_t i = 0; i < 256; i++) {
++                uint32_t color = pal->colors[i];
++                out[0] = static_cast<uint8_t>(color & 0xff);
++                out[1] = static_cast<uint8_t>((color >> 8) & 0xff);
++                out[2] = static_cast<uint8_t>((color >> 16) & 0xff);
++                out[3] = 255;
++                if (i == 0) {
++                    out[3] = 0;
++                    if (info.masked) {
++                        out[0] = out[1] = out[2] = 0;
++                    }
++                }
++                out += 4;
++            }
++            for (size_t mip = first; mip < count; mip++) {
++                const TextureMip& level = texture->mips[mip];
++                size_t size = static_cast<size_t>(level.width) * level.height;
++                std::memcpy(out, level.data.data(), size);
++                out += size;
++            }
++            const TextureMip& top = texture->mips[first];
++            glCompressedTexImage2D(GL_TEXTURE_2D, -static_cast<GLint>(count - first - 1), GL_PALETTE8_RGBA8_OES, static_cast<GLsizei>(top.width), static_cast<GLsizei>(top.height), 0, static_cast<GLsizei>(bytes), packed.data());
++        } else {
++            for (size_t mip = first; mip < count; mip++) {
++                const TextureMip& level = texture->mips[mip];
++                size_t size = static_cast<size_t>(std::max(1u, (level.width + 3) / 4)) * std::max(1u, (level.height + 3) / 4) * 8;
++                if (level.data.size() < size) {
++                    count = mip;
++                    break;
++                }
++                glCompressedTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(mip - first), GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, static_cast<GLsizei>(level.width), static_cast<GLsizei>(level.height), 0, static_cast<GLsizei>(size), level.data.data());
++            }
++            if (count <= first) {
++                return false;
++            }
++        }
++        info.smooth = !texture::bNoSmooth(texture);
++        info.levels = static_cast<int32_t>(count - first);
++        setParameters(info.smooth, info.levels, trilinear, anisotropy);
++        return true;
++    }
++#endif
++
+     bool TextureCache::uploadReplacement(UTexture* texture, GLTextureInfo& info)
+     {
+         ReplacementImage image;
+diff --git a/src/render/texture_cache.h b/src/render/texture_cache.h
+index e839bb5..9d65bc3 100644
+--- a/src/render/texture_cache.h
++++ b/src/render/texture_cache.h
+@@ -38,6 +38,9 @@ namespace dx {
+     private:
+         bool upload(UTexture* texture, GLTextureInfo& info, bool masked);
+         bool uploadReplacement(UTexture* texture, GLTextureInfo& info);
++#ifdef __vita__
++        bool uploadVita(UTexture* texture, GLTextureInfo& info);
++#endif
+ 
+         std::unordered_map<UTexture*, GLTextureInfo> textures;
+         std::unordered_map<UTexture*, GLTextureInfo> maskedTextures;
+diff --git a/src/render/vita_shader.cc b/src/render/vita_shader.cc
+new file mode 100644
+index 0000000..b57bd2f
+--- /dev/null
++++ b/src/render/vita_shader.cc
+@@ -0,0 +1,534 @@
++// PS Vita version of UberShader (render/gl_shader.h).
++//
++// The PC build draws everything with one GLSL program that tests uFlags for
++// every pixel. The Vita GPU (SGX543) pays for every one of those branches, so
++// here each combination of flags the renderer actually uses gets its own small
++// Cg program with only the code it needs, built the first time it is drawn.
++// The dynamic light count is part of the key too, so the light loop is
++// unrolled. Differences from the PC shader, on purpose:
++//   * lightmaps use plain bilinear filtering (no bicubic "smooth lightmaps"),
++//   * no ambient occlusion mask output (the Vita build has no AO pass),
++//   * colour maths in half precision,
++//   * clip planes (mirrors, portals) are hardware clip outputs, max 7.
++#ifdef __vita__
++
++#include "render/gl_shader.h"
++
++#include <glad/gl.h>
++
++#include <cstddef>
++#include <cstdio>
++#include <cstring>
++#include <string>
++
++namespace dx {
++    namespace {
++        constexpr int32_t KeyClip = 256;
++        constexpr int32_t KeyLightShift = 9;
++
++        const char* vertexCg = R"(
++void main(
++    float3 aPosition,
++    float2 aUV,
++    float2 aLightUV,
++    float4 aColor,
++    float3 aNormal,
++    float3 aFog,
++    uniform float4x4 uViewProj,
++    uniform float2 uPan,
++    uniform float2 uScale,
++    uniform float4 uEye,
++    uniform float4 uForward,
++#if CLIP
++    uniform float4 uClipPlanes[8],
++    float out vClip[7] : CLP0,
++#endif
++#if LIGHTS > 0
++    float3 out vWorld : TEXCOORD3,
++    float3 out vNormal : TEXCOORD4,
++#endif
++    float2 out vUV : TEXCOORD0,
++    float2 out vLightUV : TEXCOORD1,
++    half3 out vFog : TEXCOORD2,
++    half4 out vColor : COLOR,
++    float4 out gl_Position : POSITION)
++{
++    float4 position = float4(aPosition, 1.0);
++    vUV = aUV * uScale + uPan;
++    vLightUV = aLightUV;
++    vFog = aFog;
++#if DETAIL
++    float depth = dot(aPosition - uEye.xyz, uForward.xyz);
++    float distance = uForward.w;
++    float fade = floor((1.0 - clamp(depth, 0.0, distance) / distance) * 128.0 + 0.5) / 255.0;
++    vColor = half4(0.50196, 0.50196, 0.50196, fade);
++#else
++    vColor = aColor;
++#endif
++#if LIGHTS > 0
++    vWorld = aPosition;
++    vNormal = aNormal;
++#endif
++#if CLIP
++    for (int i = 0; i < 7; i++)
++    {
++        vClip[i] = dot(uClipPlanes[i], position);
++    }
++#endif
++    gl_Position = mul(position, uViewProj);
++}
++)";
++
++        const char* fragmentCg = R"(
++uniform float4 uTint;
++#if LIGHTS > 0
++uniform float4 uLights[24];
++
++half3 dynamicLight(float3 world, float3 normalIn)
++{
++    half3 total = half3(0.0, 0.0, 0.0);
++    float3 normal = normalize(normalIn);
++    for (int i = 0; i < LIGHTS; i++)
++    {
++        float4 place = uLights[i * 3];
++        float4 colour = uLights[i * 3 + 1];
++        float4 cone = uLights[i * 3 + 2];
++        float3 delta = place.xyz - world;
++        float index = floor(dot(delta, delta) * 4093.0 / (place.w * place.w) + 0.5);
++        float v = sqrt((min(index, 4095.0) + 1.0) / 4096.0);
++        float falloff = (index >= 4096.0) ? 0.0 : 1.0 + 2.0 * v * v * v - 3.0 * v * v;
++        float3 direction = normalize(delta);
++        float attenuation = falloff * abs(dot(direction, normal));
++        if (cone.w < 1.0)
++        {
++            float cosine = dot(direction, cone.xyz);
++            float spot = max(cosine - cone.w, 0.0) / (1.0 - cone.w);
++            attenuation *= spot * spot;
++        }
++        total += (half3)(colour.rgb * attenuation);
++    }
++    return total;
++}
++#endif
++
++float4 main(
++    float2 vUV : TEXCOORD0,
++    float2 vLightUV : TEXCOORD1,
++    half3 vFog : TEXCOORD2,
++    half4 vColor : COLOR,
++#if LIGHTS > 0
++    float3 vWorld : TEXCOORD3,
++    float3 vNormal : TEXCOORD4,
++#endif
++    uniform sampler2D uTexture : TEXUNIT0,
++    uniform sampler2D uLightmap : TEXUNIT1) : COLOR
++{
++#if DETAIL
++    return float4(lerp(vColor.rgb, (half3)tex2D(uTexture, vUV).rgb, vColor.a), 1.0);
++#elif FOGPASS
++    return tex2D(uLightmap, vLightUV);
++#else
++    half4 tint = (half4)uTint;
++#if FULLBRIGHT
++    half4 color = half4(tint.rgb, vColor.a * tint.a);
++#else
++    half4 color = vColor * tint;
++#endif
++    half4 texel = half4(1.0, 1.0, 1.0, 1.0);
++#if TEXTURED
++    texel = (half4)tex2D(uTexture, vUV);
++    color *= texel;
++#endif
++#if ALPHA_TEST
++    if (color.a < 0.5)
++    {
++        discard;
++    }
++#endif
++#if LIGHTS > 0
++    half3 dynamic = dynamicLight(vWorld, vNormal);
++#else
++    half3 dynamic = half3(0.0, 0.0, 0.0);
++#endif
++#if LIGHTMAP
++    color.rgb *= min((half3)tex2D(uLightmap, vLightUV).rgb + dynamic, half3(0.99608, 0.99608, 0.99608)) * 2.0;
++#elif LIGHTS > 0
++    color.rgb += texel.rgb * tint.rgb * dynamic * 2.0;
++#endif
++    return float4(saturate(color.rgb + vFog), color.a);
++#endif
++}
++)";
++
++        enum ExtraLocation { L_Lights = 0, L_Forward, L_Detail, L_Unused };
++
++        GLuint compileCg(GLenum type, const std::string& source, int32_t key)
++        {
++            GLuint shader = glCreateShader(type);
++            const char* text = source.c_str();
++            GLint length = static_cast<GLint>(source.size());
++            glShaderSource(shader, 1, &text, &length);
++            glCompileShader(shader);
++            GLint ok = 0;
++            glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++            if (!ok) {
++                char log[2048] = {};
++                glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
++                std::fprintf(stderr, "Vita shader %s for key 0x%x failed to compile:\n%s\n", type == GL_CG_VERTEX_SHADER_EXT ? "vertex" : "fragment", static_cast<unsigned>(key), log);
++            }
++            return shader;
++        }
++
++        std::string defines(int32_t key)
++        {
++            int32_t lights = (key >> KeyLightShift) & 15;
++            char text[256];
++            std::snprintf(text, sizeof(text),
++                "#define TEXTURED %d\n#define LIGHTMAP %d\n#define ALPHA_TEST %d\n#define DETAIL %d\n#define FOGPASS %d\n#define FULLBRIGHT %d\n#define CLIP %d\n#define LIGHTS %d\n",
++                (key & SHADER_Textured) ? 1 : 0, (key & SHADER_Lightmap) ? 1 : 0, (key & SHADER_AlphaTest) ? 1 : 0, (key & SHADER_Detail) ? 1 : 0,
++                (key & SHADER_Fog) ? 1 : 0, (key & SHADER_Fullbright) ? 1 : 0, (key & KeyClip) ? 1 : 0, lights);
++            return text;
++        }
++    }
++
++    UberShader::UberShader()
++    {
++        glGenBuffers(1, &uploadBuffer);
++        for (int i = 0; i < 6; i++) {
++            glEnableVertexAttribArray(static_cast<GLuint>(i));
++        }
++        std::memset(viewProj, 0, sizeof(viewProj));
++        viewProj[0] = viewProj[5] = viewProj[10] = viewProj[15] = 1;
++        program(0);
++    }
++
++    UberShader::~UberShader()
++    {
++        for (auto& [key, entry] : cache) {
++            glDeleteProgram(entry->id);
++            delete entry;
++        }
++        glDeleteBuffers(1, &uploadBuffer);
++    }
++
++    UberShader::Program& UberShader::program(int32_t key)
++    {
++        for (auto& [cached, entry] : cache) {
++            if (cached == key) {
++                return *entry;
++            }
++        }
++        std::string head = defines(key);
++        GLuint vertex = compileCg(GL_CG_VERTEX_SHADER_EXT, head + vertexCg, key);
++        GLuint fragment = compileCg(GL_CG_FRAGMENT_SHADER_EXT, head + fragmentCg, key);
++        GLuint id = glCreateProgram();
++        glAttachShader(id, vertex);
++        glAttachShader(id, fragment);
++        const char* names[6] = { "aPosition", "aUV", "aLightUV", "aColor", "aNormal", "aFog" };
++        for (GLuint i = 0; i < 6; i++) {
++            glBindAttribLocation(id, i, names[i]);
++        }
++        glLinkProgram(id);
++        glDeleteShader(vertex);
++        glDeleteShader(fragment);
++        GLint ok = 0;
++        glGetProgramiv(id, GL_LINK_STATUS, &ok);
++        if (!ok) {
++            std::fprintf(stderr, "Vita shader key 0x%x failed to link\n", static_cast<unsigned>(key));
++        }
++        Program* entry = new Program;
++        entry->id = id;
++        entry->loc[F_ViewProj] = glGetUniformLocation(id, "uViewProj");
++        entry->loc[F_Pan] = glGetUniformLocation(id, "uPan");
++        entry->loc[F_Scale] = glGetUniformLocation(id, "uScale");
++        entry->loc[F_Tint] = glGetUniformLocation(id, "uTint");
++        entry->loc[F_Lights] = glGetUniformLocation(id, "uLights");
++        entry->loc[F_Eye] = glGetUniformLocation(id, "uEye");
++        entry->loc[F_Clip] = glGetUniformLocation(id, "uClipPlanes");
++        entry->loc[F_Count + L_Forward] = glGetUniformLocation(id, "uForward");
++        entry->lightCount = (key >> KeyLightShift) & 15;
++        for (uint32_t& seen : entry->seen) {
++            seen = 0xffffffffu;
++        }
++        cache.emplace_back(key, entry);
++        std::printf("Vita shader 0x%03x ready (%zu built)\n", static_cast<unsigned>(key), cache.size());
++        return *entry;
++    }
++
++    void UberShader::apply()
++    {
++        int32_t key = flags & (SHADER_Textured | SHADER_Lightmap | SHADER_AlphaTest | SHADER_Detail | SHADER_Fog | SHADER_Fullbright);
++        if (clipCount > 0) {
++            key |= KeyClip;
++        }
++        if ((flags & SHADER_Dynamic) && lightCount > 0 && !(flags & (SHADER_Detail | SHADER_Fog))) {
++            key |= lightCount << KeyLightShift;
++        }
++        Program& p = program(key);
++        if (active != &p) {
++            active = &p;
++            glUseProgram(p.id);
++        }
++        if (p.seen[F_ViewProj] != gen[F_ViewProj]) {
++            glUniformMatrix4fv(p.loc[F_ViewProj], 1, GL_FALSE, viewProj);
++            p.seen[F_ViewProj] = gen[F_ViewProj];
++        }
++        if (p.seen[F_Pan] != gen[F_Pan]) {
++            glUniform2fv(p.loc[F_Pan], 1, pan);
++            p.seen[F_Pan] = gen[F_Pan];
++        }
++        if (p.seen[F_Scale] != gen[F_Scale]) {
++            glUniform2fv(p.loc[F_Scale], 1, scale);
++            p.seen[F_Scale] = gen[F_Scale];
++        }
++        if (p.seen[F_Tint] != gen[F_Tint]) {
++            glUniform4fv(p.loc[F_Tint], 1, tint);
++            p.seen[F_Tint] = gen[F_Tint];
++        }
++        if (p.lightCount > 0 && p.seen[F_Lights] != gen[F_Lights]) {
++            glUniform4fv(p.loc[F_Lights], p.lightCount * 3, lights);
++            p.seen[F_Lights] = gen[F_Lights];
++        }
++        if ((key & SHADER_Detail) && p.seen[F_Eye] != gen[F_Eye]) {
++            forward[3] = detailDistance;
++            glUniform4fv(p.loc[F_Eye], 1, eye);
++            glUniform4fv(p.loc[F_Count + L_Forward], 1, forward);
++            p.seen[F_Eye] = gen[F_Eye];
++        }
++        if ((key & KeyClip) && p.seen[F_Clip] != gen[F_Clip]) {
++            glUniform4fv(p.loc[F_Clip], 8, clipPlanes);
++            p.seen[F_Clip] = gen[F_Clip];
++        }
++    }
++
++    void UberShader::pointers(const uint8_t* base)
++    {
++        auto at = [base](size_t offset) { return static_cast<const void*>(base + offset); };
++        GLsizei stride = sizeof(GLVertex);
++        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, at(offsetof(GLVertex, x)));
++        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, at(offsetof(GLVertex, u)));
++        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, at(offsetof(GLVertex, lu)));
++        glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride, at(offsetof(GLVertex, r)));
++        glVertexAttribPointer(4, 3, GL_FLOAT, GL_FALSE, stride, at(offsetof(GLVertex, nx)));
++        glVertexAttribPointer(5, 3, GL_FLOAT, GL_FALSE, stride, at(offsetof(GLVertex, fogR)));
++    }
++
++    void UberShader::use()
++    {
++        active = nullptr;
++        apply();
++    }
++
++    void UberShader::setViewProj(const Mat4& matrix)
++    {
++        std::memcpy(viewProj, matrix.data(), sizeof(viewProj));
++        gen[F_ViewProj]++;
++    }
++
++    void UberShader::setQuality(bool, float distance)
++    {
++        detailDistance = distance;
++        gen[F_Eye]++;
++    }
++
++    void UberShader::setFlags(int32_t value)
++    {
++        flags = value;
++    }
++
++    void UberShader::setPan(float u, float v)
++    {
++        if (pan[0] != u || pan[1] != v) {
++            pan[0] = u;
++            pan[1] = v;
++            gen[F_Pan]++;
++        }
++    }
++
++    void UberShader::setScale(float u, float v)
++    {
++        if (scale[0] != u || scale[1] != v) {
++            scale[0] = u;
++            scale[1] = v;
++            gen[F_Scale]++;
++        }
++    }
++
++    void UberShader::setTint(float r, float g, float b, float a)
++    {
++        if (tint[0] != r || tint[1] != g || tint[2] != b || tint[3] != a) {
++            tint[0] = r;
++            tint[1] = g;
++            tint[2] = b;
++            tint[3] = a;
++            gen[F_Tint]++;
++        }
++    }
++
++    void UberShader::setEye(const Vector& eyeAt, const Vector& ahead)
++    {
++        eye[0] = eyeAt.x;
++        eye[1] = eyeAt.y;
++        eye[2] = eyeAt.z;
++        forward[0] = ahead.x;
++        forward[1] = ahead.y;
++        forward[2] = ahead.z;
++        gen[F_Eye]++;
++    }
++
++    void UberShader::setClipPlanes(const float* planes, int32_t count)
++    {
++        std::memset(clipPlanes, 0, sizeof(clipPlanes));
++        // Unused planes pass everything: dot((0,0,0,1), p) = 1.
++        for (int32_t i = 0; i < 8; i++) {
++            clipPlanes[i * 4 + 3] = 1;
++        }
++        std::memcpy(clipPlanes, planes, static_cast<size_t>(count) * 4 * sizeof(float));
++        clipCount = count;
++        gen[F_Clip]++;
++    }
++
++    void UberShader::setOcclusion(float)
++    {
++    }
++
++    void UberShader::setBlend(BlendMode mode)
++    {
++        switch (mode) {
++        case BlendMode::Opaque:
++        case BlendMode::Masked:
++            glDisable(GL_BLEND);
++            glDepthMask(GL_TRUE);
++            break;
++        case BlendMode::Translucent:
++            glEnable(GL_BLEND);
++            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR);
++            glDepthMask(GL_FALSE);
++            break;
++        case BlendMode::Modulated:
++            glEnable(GL_BLEND);
++            glBlendFunc(GL_DST_COLOR, GL_SRC_COLOR);
++            glDepthMask(GL_FALSE);
++            break;
++        case BlendMode::Alpha:
++            glEnable(GL_BLEND);
++            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++            glDepthMask(GL_FALSE);
++            break;
++        case BlendMode::Highlight:
++            glEnable(GL_BLEND);
++            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++            glDepthMask(GL_FALSE);
++            break;
++        }
++    }
++
++    void UberShader::setDynamicLights(const std::vector<DynamicLight>& list)
++    {
++        size_t count = std::min(list.size(), MaxDynamicLights);
++        for (size_t i = 0; i < count; i++) {
++            const DynamicLight& light = list[i];
++            float* at = lights + i * 12;
++            at[0] = light.location.x;
++            at[1] = light.location.y;
++            at[2] = light.location.z;
++            at[3] = light.radius;
++            at[4] = light.color.x;
++            at[5] = light.color.y;
++            at[6] = light.color.z;
++            at[7] = 0;
++            at[8] = light.direction.x;
++            at[9] = light.direction.y;
++            at[10] = light.direction.z;
++            at[11] = light.cone;
++        }
++        lightCount = static_cast<int32_t>(count);
++        gen[F_Lights]++;
++    }
++
++    void UberShader::bindTexture(uint32_t texture)
++    {
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, texture);
++    }
++
++    void UberShader::bindLightmap(uint32_t texture)
++    {
++        glActiveTexture(GL_TEXTURE1);
++        glBindTexture(GL_TEXTURE_2D, texture);
++        glActiveTexture(GL_TEXTURE0);
++    }
++
++    // Streamed vertices are drawn straight from memory: vitaGL copies what a
++    // draw reads into GPU memory of its own for that frame.
++    void UberShader::draw(const std::vector<GLVertex>& vertices, uint32_t primitive)
++    {
++        if (vertices.empty()) {
++            return;
++        }
++        apply();
++        if (boundBuffer != 0) {
++            glBindBuffer(GL_ARRAY_BUFFER, 0);
++            boundBuffer = 0;
++        }
++        pointers(reinterpret_cast<const uint8_t*>(vertices.data()));
++        glDrawArrays(primitive, 0, static_cast<GLsizei>(vertices.size()));
++    }
++
++    // upload() + drawRange(): several draws read one block, so it goes into a
++    // buffer once (vitaGL gives the buffer new storage when it is respecified
++    // while the GPU may still read the old contents).
++    void UberShader::upload(const std::vector<GLVertex>& vertices)
++    {
++        glBindBuffer(GL_ARRAY_BUFFER, uploadBuffer);
++        boundBuffer = uploadBuffer;
++        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(GLVertex)), vertices.data(), GL_DYNAMIC_DRAW);
++    }
++
++    void UberShader::drawRange(int32_t first, int32_t count)
++    {
++        apply();
++        glBindBuffer(GL_ARRAY_BUFFER, uploadBuffer);
++        boundBuffer = uploadBuffer;
++        pointers(nullptr);
++        glDrawArrays(GL_TRIANGLES, first, count);
++    }
++
++    uint32_t UberShader::createStatic(const std::vector<GLVertex>& vertices, uint32_t& buffer)
++    {
++        glGenBuffers(1, &buffer);
++        glBindBuffer(GL_ARRAY_BUFFER, buffer);
++        boundBuffer = buffer;
++        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(GLVertex)), vertices.data(), GL_STATIC_DRAW);
++        return buffer;
++    }
++
++    void UberShader::bindStatic(uint32_t geometry)
++    {
++        glBindBuffer(GL_ARRAY_BUFFER, geometry);
++        boundBuffer = geometry;
++        pointers(nullptr);
++    }
++
++    void UberShader::drawStatic(uint32_t geometry, int32_t first, int32_t count)
++    {
++        apply();
++        if (boundBuffer != geometry) {
++            bindStatic(geometry);
++        } else {
++            pointers(nullptr);
++        }
++        glDrawArrays(GL_TRIANGLES, first, count);
++    }
++
++    void UberShader::drawStaticRanges(uint32_t geometry, const int32_t* firsts, const int32_t* counts, int32_t ranges)
++    {
++        apply();
++        bindStatic(geometry);
++        for (int32_t i = 0; i < ranges; i++) {
++            glDrawArrays(GL_TRIANGLES, firsts[i], counts[i]);
++        }
++    }
++}
++
++#endif
+diff --git a/vita/include/glad/gl.h b/vita/include/glad/gl.h
+new file mode 100644
+index 0000000..0dd9067
+--- /dev/null
++++ b/vita/include/glad/gl.h
+@@ -0,0 +1,63 @@
++// PS Vita: stands in for glad's GL 3.3 loader. GL comes from vitaGL (linked
++// statically), so there is nothing to load. The few GL 3.3 names vitaGL lacks
++// are only used by the PC post-processing passes (MSAA, FXAA, ambient
++// occlusion, gamma framebuffer), which the Vita build never switches on.
++#pragma once
++#include <vitaGL.h>
++
++typedef void (*GLADapiproc)(void);
++typedef GLADapiproc (*GLADloadfunc)(const char* name);
++static inline int gladLoadGL(GLADloadfunc) { return 1; }
++
++#define GLAD_GL_ARB_texture_filter_anisotropic 0
++#define GLAD_GL_EXT_texture_filter_anisotropic 0
++
++#ifndef GL_CLIP_DISTANCE0
++#define GL_CLIP_DISTANCE0 0x3000
++#endif
++#ifndef GL_COLOR
++#define GL_COLOR 0x1800
++#endif
++#ifndef GL_COLOR_ATTACHMENT1
++#define GL_COLOR_ATTACHMENT1 0x8CE1
++#endif
++#ifndef GL_DEPTH_STENCIL
++#define GL_DEPTH_STENCIL 0x84F9
++#endif
++#ifndef GL_DRAW_BUFFER0
++#define GL_DRAW_BUFFER0 0x8825
++#endif
++#ifndef GL_DRAW_BUFFER1
++#define GL_DRAW_BUFFER1 0x8826
++#endif
++#ifndef GL_MAX_SAMPLES
++#define GL_MAX_SAMPLES 0x8D57
++#endif
++#ifndef GL_MAX_TEXTURE_MAX_ANISOTROPY
++#define GL_MAX_TEXTURE_MAX_ANISOTROPY 0x84FF
++#endif
++#ifndef GL_TEXTURE_MAX_ANISOTROPY
++#define GL_TEXTURE_MAX_ANISOTROPY 0x84FE
++#endif
++#ifndef GL_R32UI
++#define GL_R32UI 0x8236
++#endif
++#ifndef GL_RED_INTEGER
++#define GL_RED_INTEGER 0x8D94
++#endif
++#ifndef GL_TEXTURE_MAX_LEVEL
++#define GL_TEXTURE_MAX_LEVEL 0x813D
++#endif
++#ifndef GL_UNSIGNED_INT_24_8
++#define GL_UNSIGNED_INT_24_8 0x84FA
++#endif
++#ifndef GL_VERTEX_ARRAY_BINDING
++#define GL_VERTEX_ARRAY_BINDING 0x85B5
++#endif
++#ifndef GL_DRAW_FRAMEBUFFER_BINDING
++#define GL_DRAW_FRAMEBUFFER_BINDING 0x8CA6
++#endif
++
++static inline void glClearBufferfv(GLenum, GLint, const GLfloat*) {}
++static inline void glDrawBuffers(GLsizei, const GLenum*) {}
++static inline void glRenderbufferStorageMultisample(GLenum, GLsizei, GLenum, GLsizei, GLsizei) {}
