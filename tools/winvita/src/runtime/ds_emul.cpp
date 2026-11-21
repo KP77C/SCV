@@ -76,6 +76,14 @@ struct Voice {
     // apart "no audio out" from "audio never written". Published as flux=.
     uint64_t lockKio = 0;
     bool     volSaid = false;    // first SetVolume logged (verbose log)
+    // Streaming rings: a looping buffer the game keeps re-filling. If the
+    // game stops filling it (a long load on the guest thread, where Windows
+    // would still have run the game's sound timer on another thread), the
+    // ring would replay its last ~second over and over. Such a voice is
+    // muted until the next Lock. A looping buffer filled once (a static
+    // ambient loop) has few locks and is never muted.
+    uint32_t locks = 0;
+    uint64_t lastLockUs = 0;
 };
 
 // Engine setting, with fallback to the port's older env var name (see install()).
@@ -132,6 +140,7 @@ uint32_t g_devObj = 0;
 // Counters — all published by stat_line() (Vita watchdog, 10 s window) and
 // the final report line. No counter is exposed unless it's both fed and read:
 // a lying counter costs more than a missing one.
+std::atomic<unsigned long long> c_stale{0};
 std::atomic<unsigned long long> c_created{0}, c_grains{0}, c_famine{0}, c_play{0},
     c_stop{0}, c_frames{0}, c_lockKio{0}, c_nohost{0}, c_mixus{0}, c_outus{0},
     c_mixed{0}, c_restmin{0xffffffffull},
@@ -246,6 +255,9 @@ void mix_grain(Cpu* c, int frames) {
             if (!v.host && c) v.host = (const uint8_t*)c->hostptr(v.buf, v.len);
             const uint64_t acc0 = v.posAcc;
             if (!v.host) c_nohost.fetch_add(1, std::memory_order_relaxed);
+            else if (v.looping && v.locks >= 8 && wx86_now_us() - v.lastLockUs > 300000u) {
+                c_stale.fetch_add(1, std::memory_order_relaxed);   // stale stream: silence
+            }
             else if (!g_voiceCap || (int)g_snap.size() < g_voiceCap) {
                 g_snap.push_back(Snap{v.host, v.len, v.cursor, v.blockAlign, v.rate, acc0,
                                       v.ch, v.gL, v.gR, v.looping});
@@ -751,6 +763,7 @@ uint32_t m_buf_lock(Cpu& c) {
     if (pb2) c.write_u32(pb2, b2);
     c_lockKio.fetch_add((b1 + b2) >> 10, std::memory_order_relaxed);
     v->lockKio += (uint64_t)((b1 + b2) >> 10);
+    ++v->locks; v->lastLockUs = wx86_now_us();
     return DS_OK;
 }
 uint32_t m_buf_unlock(Cpu&) { return DS_OK; }   // direct write: nothing to copy back
@@ -1184,7 +1197,7 @@ int stat_line(char* out, unsigned n) {
         "audio(10s): voix=%llu/%llu creees=%llu grains=%llu famine=%llu us/grain=%llu sortie=%llu"
         " rest=%s crete=%llu rms=%.0f gain0=%llu errsortie=%llu flux=%u/%u"
         " verrou=%lluKio play=%llu stop=%llu s=%.1f sansvue=%llu"
-        " uncoup=%llu/%llu finrejoue=%llu setpos=%llu resamp=%llu puits=%s",
+        " uncoup=%llu/%llu finrejoue=%llu setpos=%llu resamp=%llu muet=%llu puits=%s",
         (unsigned long long)c_mixed.load(), (unsigned long long)g_voices.size(),
         (unsigned long long)c_created.load(), dgr, dfa,
         dgr ? dmu / dgr : 0ull, dgr ? dou / dgr : 0ull,
@@ -1196,7 +1209,7 @@ int stat_line(char* out, unsigned n) {
         (unsigned long long)c_nohost.load(),
         (unsigned long long)c_endnl.load(), (unsigned long long)c_playnl.load(),
         (unsigned long long)c_playend.load(), (unsigned long long)c_setpos.load(),
-        (unsigned long long)c_resamp.load(), sink_name());
+        (unsigned long long)c_resamp.load(), (unsigned long long)c_stale.load(), sink_name());
     // Host-provided tail (e.g. a codec decode cost running on the game
     // thread) — without it, that cost would be misattributed to the mixer.
     // The engine doesn't know what it is, it just makes room for it. snprintf

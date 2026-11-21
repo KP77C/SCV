@@ -136,7 +136,6 @@ void install_dx(d2rt::Bridge& br) {
     // The startup splash runs on its own thread with a modeless dialog: no
     // dialog here, the thread just waits for the quit message.
     R(br, "USER32.dll", "CreateDialogParamA", 5, [](Cpu&) { return g_next_gdi += 4; });
-    R(br, "USER32.dll", "PostThreadMessageA", 4, [](Cpu&) { return 1u; });
     // COM: only DirectSound is ever created, and Galaxy asks for it by
     // CLSID. Anything else is "class not registered".
     R(br, "ole32.dll", "CoInitialize", 1, [](Cpu&) { return 0u; });
