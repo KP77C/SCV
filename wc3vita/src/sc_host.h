@@ -73,6 +73,8 @@ void install_dx(d2rt::Bridge& br);       // Deus Ex extras (dx_shims.cpp)
 void install_w3(d2rt::Bridge& br);       // WarCraft III extras (w3_shims.cpp)
 void inline_hot_imports();               // TLS / last-error imports as guest x86 (w3_shims.cpp); after each module load
 void patch_module(const std::string& name, uint32_t base);   // data patches to a module just loaded (w3_shims.cpp)
+void mp3_install(d2rt::Cpu& c, uint32_t base);                 // w3_mp3.cpp: native MP3 for Mp3dec.asi
+void mp3_stats(uint64_t* opens, uint64_t* frames);
 void gl_install_filters(d2rt::Cpu& c);   // redundant-GL-call stubs in front of the shims (w3_gl.cpp)
 void install_dshow(d2rt::Bridge& br);    // stand-in DirectShow graph (w3_dshow.cpp)
 void set_default_window_size(int w, int h);   // CW_USEDEFAULT window size (sc_user32.cpp)

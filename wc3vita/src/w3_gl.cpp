@@ -60,6 +60,7 @@ uint32_t g_w = 800, g_h = 600;
 #endif
 bool     g_current = false;
 uint64_t g_calls = 0, g_draws = 0, g_tris = 0;
+uint64_t g_sub_kept = 0, g_sub_calls = 0, g_sub_skips = 0, g_sub_skip_bytes = 0;   // texture upload dedupe (below)
 #ifndef __vita__
 OSMesaContext g_ctx = nullptr;
 std::vector<uint8_t> g_fb;
@@ -254,9 +255,15 @@ void swap(Cpu& c) {
     ++frames;
     uint64_t now = wx86_now_us(); if (!t0) t0 = now;
     if (now - t0 >= 5000000) {
-        log("[not-bound] gl(5s): %llu frames, %llu calls, %llu draws, %llu triangles",
+        static uint64_t last_mp3 = 0; uint64_t mp3_opens = 0, mp3_frames = 0; mp3_stats(&mp3_opens, &mp3_frames);
+        log("[not-bound] gl(5s): %llu frames, %llu calls, %llu draws, %llu triangles; sub-images %llu, %llu skipped as repeats (%llu KiB), %llu KiB kept; mp3 %llu frames (%llu streams opened)",
             (unsigned long long)frames, (unsigned long long)(g_calls - last_calls),
-            (unsigned long long)(g_draws - last_draws), (unsigned long long)(g_tris - last_tris));
+            (unsigned long long)(g_draws - last_draws), (unsigned long long)(g_tris - last_tris),
+            (unsigned long long)g_sub_calls, (unsigned long long)g_sub_skips,
+            (unsigned long long)(g_sub_skip_bytes >> 10), (unsigned long long)(g_sub_kept >> 10),
+            (unsigned long long)(mp3_frames - last_mp3), (unsigned long long)mp3_opens);
+        last_mp3 = mp3_frames;
+        g_sub_calls = g_sub_skips = g_sub_skip_bytes = 0;
         frames = 0; t0 = now; last_calls = g_calls; last_draws = g_draws; last_tris = g_tris;
         glstat_line();
     }
@@ -493,6 +500,81 @@ void gl_check_filters(Cpu& c) {
 #endif
 }
 
+namespace {
+// ---- texture uploads: skip a glTexSubImage2D that sends what the texture
+// already holds. The game sends ~30 sub-images a frame and most repeat the
+// previous one (build 6 Vita log: up to 730 ms of 10 s in vitaGL's
+// glTexSubImage2D). Kept: a copy of the last upload per (texture, level,
+// rectangle), compared byte for byte; rectangles up to 256 KiB, 4 MiB in all.
+// W3_TEX_DEDUP=0 turns it off.
+constexpr uint32_t kSubMax = 256u * 1024u, kSubTotal = 4u * 1024u * 1024u;
+struct Unpack { int32_t row = 0, align = 4, skip_px = 0, skip_rows = 0; } g_unpack;
+uint32_t g_tex_bound[2] = { 0, 0 };   // texture bound to GL_TEXTURE_2D on units 0 and 1
+struct SubCopy { uint32_t level, x, y, w, h, fmt, type; std::vector<uint8_t> bytes; };
+std::map<uint32_t, std::vector<SubCopy>> g_sub_copies;   // by texture name
+const bool g_dedup_on = [] { const char* e = std::getenv("W3_TEX_DEDUP"); return !(e && *e == '0'); }();
+
+uint32_t texel_bytes(uint32_t fmt, uint32_t type) {
+    uint32_t comps = 0;
+    switch (fmt) {
+    case 0x1908: case 0x80E1: comps = 4; break;              // GL_RGBA, GL_BGRA
+    case 0x1907: case 0x80E0: comps = 3; break;              // GL_RGB, GL_BGR
+    case 0x190A: comps = 2; break;                           // GL_LUMINANCE_ALPHA
+    case 0x1906: case 0x1909: case 0x1903: comps = 1; break; // GL_ALPHA, GL_LUMINANCE, GL_RED
+    default: return 0;
+    }
+    switch (type) {
+    case 0x1401: return comps;                               // GL_UNSIGNED_BYTE
+    case 0x8033: case 0x8363: case 0x8034: return 2;         // 4_4_4_4, 5_6_5, 5_5_5_1
+    case 0x8035: case 0x8367: return 4;                      // 8_8_8_8, 8_8_8_8_REV
+    default: return 0;
+    }
+}
+void sub_forget(uint32_t tex) {
+    auto it = g_sub_copies.find(tex); if (it == g_sub_copies.end()) return;
+    for (const SubCopy& s : it->second) g_sub_kept -= s.bytes.size();
+    g_sub_copies.erase(it);
+}
+// True when this upload repeats the texels the bound texture got last time
+// for the same rectangle (then the call is skipped); otherwise remembers them.
+bool sub_repeats(Cpu& c, uint32_t target, uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                 uint32_t fmt, uint32_t type, uint32_t va) {
+    ++g_sub_calls;
+    if (!g_dedup_on || target != GL_TEXTURE_2D || !va || !w || !h) return false;
+    const uint32_t bpp = texel_bytes(fmt, type); if (!bpp) return false;
+    const uint32_t row = w * bpp, n = row * h;
+    if (n > kSubMax) return false;
+    const uint32_t a = g_unpack.align > 0 ? (uint32_t)g_unpack.align : 1u;
+    const uint32_t stride = ((g_unpack.row > 0 ? (uint32_t)g_unpack.row : w) * bpp + a - 1) / a * a;
+    const uint32_t start = (uint32_t)g_unpack.skip_rows * stride + (uint32_t)g_unpack.skip_px * bpp;
+    const uint8_t* src = (const uint8_t*)c.hostptr(va + start, stride * (h - 1) + row);
+    if (!src) return false;
+    const uint32_t tex = g_tex_bound[(g_gl_act - GL_TEXTURE0) & 1];
+    std::vector<SubCopy>& v = g_sub_copies[tex];
+    SubCopy* rec = nullptr;
+    for (size_t i = 0; i < v.size();) {
+        SubCopy& s = v[i];
+        if (s.level == level && s.x == x && s.y == y && s.w == w && s.h == h && s.fmt == fmt && s.type == type) { rec = &s; ++i; continue; }
+        // Another rectangle of the same level that overlaps this one is now stale.
+        if (s.level == level && x < s.x + s.w && s.x < x + w && y < s.y + s.h && s.y < y + h) {
+            g_sub_kept -= s.bytes.size(); v.erase(v.begin() + (long)i); continue;
+        }
+        ++i;
+    }
+    if (rec) {
+        bool same = true;
+        for (uint32_t r = 0; r < h && same; ++r) same = std::memcmp(rec->bytes.data() + r * row, src + r * stride, row) == 0;
+        if (same) { ++g_sub_skips; g_sub_skip_bytes += n; return true; }
+    } else {
+        if (g_sub_kept + n > kSubTotal) return false;
+        v.push_back(SubCopy{ level, x, y, w, h, fmt, type, std::vector<uint8_t>(n) });
+        rec = &v.back(); g_sub_kept += n;
+    }
+    for (uint32_t r = 0; r < h; ++r) std::memcpy(rec->bytes.data() + r * row, src + r * stride, row);
+    return false;
+}
+}  // namespace
+
 void install_gl(d2rt::Bridge& br) {
     { uint32_t w, h; gl_render_size(&w, &h); }   // W3_RES -> g_w, g_h
     // The game's window is the whole screen: GetSystemMetrics, the default
@@ -568,7 +650,13 @@ void install_gl(d2rt::Bridge& br) {
     G(br, "glDrawBuffer", 1, [](Cpu&) { return 0u; });   // always the back buffer
     G(br, "glReadBuffer", 1, [](Cpu&) { return 0u; });
     G(br, "glFinish", 0, [](Cpu&) { return 0u; });       // the swap waits instead
-    G(br, "glPixelStorei", 2, [](Cpu& c) { glPixelStorei(c.arg(0), (GLint)c.arg(1)); return 0u; });
+    G(br, "glPixelStorei", 2, [](Cpu& c) {
+        const int32_t v = (int32_t)c.arg(1);
+        switch (c.arg(0)) {   // the unpack layout, for the sub-image compare
+        case 0x0CF2: g_unpack.row = v; break; case 0x0CF3: g_unpack.skip_rows = v; break;
+        case 0x0CF4: g_unpack.skip_px = v; break; case 0x0CF5: g_unpack.align = v; break;
+        }
+        glPixelStorei(c.arg(0), (GLint)c.arg(1)); return 0u; });
     G(br, "glReadPixels", 7, [](Cpu& c) {
         glReadPixels((GLint)c.arg(0), (GLint)c.arg(1), (GLsizei)c.arg(2), (GLsizei)c.arg(3), c.arg(4), c.arg(5), P(c, c.arg(6)));
         return 0u;
@@ -589,8 +677,16 @@ void install_gl(d2rt::Bridge& br) {
 
     // ---- textures ------------------------------------------------------------------
     G(br, "glGenTextures", 2, [](Cpu& c) { glGenTextures((GLsizei)c.arg(0), P<GLuint>(c, c.arg(1))); return 0u; });
-    G(br, "glDeleteTextures", 2, [](Cpu& c) { glDeleteTextures((GLsizei)c.arg(0), P<const GLuint>(c, c.arg(1))); return 0u; });
-    G(br, "glBindTexture", 2, [](Cpu& c) { glBindTexture(c.arg(0), c.arg(1)); return 0u; });
+    G(br, "glDeleteTextures", 2, [](Cpu& c) {
+        const GLuint* names = P<const GLuint>(c, c.arg(1));
+        for (GLsizei i = 0; names && i < (GLsizei)c.arg(0); ++i) {
+            sub_forget(names[i]);
+            for (uint32_t& b : g_tex_bound) if (b == names[i]) b = 0;
+        }
+        glDeleteTextures((GLsizei)c.arg(0), names); return 0u; });
+    G(br, "glBindTexture", 2, [](Cpu& c) {
+        if (c.arg(0) == GL_TEXTURE_2D) g_tex_bound[(g_gl_act - GL_TEXTURE0) & 1] = c.arg(1);
+        glBindTexture(c.arg(0), c.arg(1)); return 0u; });
     G(br, "glTexParameteri", 3, [](Cpu& c) { glTexParameteri(c.arg(0), c.arg(1), (GLint)c.arg(2)); return 0u; });
     G(br, "glTexEnvi", 3, [](Cpu& c) { glTexEnvi(c.arg(0), c.arg(1), (GLint)c.arg(2)); return 0u; });
 #ifdef __vita__
@@ -604,11 +700,13 @@ void install_gl(d2rt::Bridge& br) {
     G(br, "glTexGeni", 3, [](Cpu& c) { glTexGeni(c.arg(0), c.arg(1), (GLint)c.arg(2)); return 0u; });
 #endif
     G(br, "glTexImage2D", 9, [](Cpu& c) {
+        if (c.arg(0) == GL_TEXTURE_2D) sub_forget(g_tex_bound[(g_gl_act - GL_TEXTURE0) & 1]);
         glTexImage2D(c.arg(0), (GLint)c.arg(1), (GLint)c.arg(2), (GLsizei)c.arg(3), (GLsizei)c.arg(4), (GLint)c.arg(5),
                      c.arg(6), c.arg(7), P(c, c.arg(8)));
         return 0u;
     });
     G(br, "glTexSubImage2D", 9, [](Cpu& c) {
+        if (sub_repeats(c, c.arg(0), c.arg(1), c.arg(2), c.arg(3), c.arg(4), c.arg(5), c.arg(6), c.arg(7), c.arg(8))) return 0u;
         glTexSubImage2D(c.arg(0), (GLint)c.arg(1), (GLint)c.arg(2), (GLint)c.arg(3), (GLsizei)c.arg(4), (GLsizei)c.arg(5),
                         c.arg(6), c.arg(7), P(c, c.arg(8)));
         return 0u;
@@ -629,7 +727,7 @@ void install_gl(d2rt::Bridge& br) {
     G(br, "glUnlockArraysEXT", 0, [](Cpu&) { return 0u; });
 
     // ---- GL_ARB_multitexture (through wglGetProcAddress) -------------------------------
-    G(br, "glActiveTextureARB", 1, [](Cpu& c) { glActiveTexture(c.arg(0)); return 0u; });
+    G(br, "glActiveTextureARB", 1, [](Cpu& c) { glActiveTexture(c.arg(0)); g_gl_act = c.arg(0); return 0u; });   // filters off
     G(br, "glClientActiveTextureARB", 1, [](Cpu& c) { glClientActiveTexture(c.arg(0)); return 0u; });
     G(br, "glMultiTexCoord2fARB", 3, [](Cpu& c) { glMultiTexCoord2f(c.arg(0), F(c, 1), F(c, 2)); return 0u; });
     G(br, "glMultiTexCoord2fvARB", 2, [](Cpu& c) { const GLfloat* v = P<const GLfloat>(c, c.arg(1)); glMultiTexCoord2f(c.arg(0), v[0], v[1]); return 0u; });
