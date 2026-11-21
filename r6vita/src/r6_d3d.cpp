@@ -484,7 +484,7 @@ void apply_state(Cpu& c) {
         combine(st, true, aop == 1 ? 3 : aop, g_tss[st][5], g_tss[st][6]);
         if (g_rs[60] != 0xFFFFFFFFu || st == 0) {
             const uint32_t f = g_rs[60];
-            const GLfloat col[4] = { ((f >> 16) & 255) / 255.f, ((f >> 8) & 255) / 255.f, (f & 255) / 255.f, (f >> 24) / 255.f };
+            GLfloat col[4] = { ((f >> 16) & 255) / 255.f, ((f >> 8) & 255) / 255.f, (f & 255) / 255.f, (f >> 24) / 255.f };
             glTexEnvfv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, col);
         }
         if (st == 0 && t->ck && g_rs[41]) ck_test = true;
