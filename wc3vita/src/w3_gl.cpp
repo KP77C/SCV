@@ -182,8 +182,7 @@ bool make_current() {
     // Deus Ex port's build 3 quit at boot by treating GL_FALSE as failure).
     if (vglInitExtended(0x400000, (int)g_w, (int)g_h, 24 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE))
         log("[not-bound] vitaGL lowered the render size %ux%u to the display maximum", g_w, g_h);
-    const char* f = std::getenv("SC_FPS");
-    const int interval = (f && std::atoi(f) == 60) ? 1 : 2;   // locked 30 fps by default (K)
+    const int interval = fps_lock_interval();   // steady 15 fps by default (K); SC_FPS=20/30/60
     eglSwapInterval(nullptr, interval);
     glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT); vglSwapBuffers(GL_FALSE);
     log("[not-bound] GL context: vitaGL %ux%u, vsync every %d vblank(s); free RAM %u KiB, VRAM %u KiB", g_w, g_h, interval,

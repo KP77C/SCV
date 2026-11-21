@@ -204,6 +204,7 @@ uint16_t* g_quad_idx; float* g_quad_vtx; uint16_t* g_ovl_idx;
 SceGxmNotification g_notif[kSlots];
 int g_back = 0, g_front = kBuffers - 1;
 int g_interval = 1;                    // vblanks per frame: 1 = 60 Hz, 2 = 30 Hz
+const char* const kLockName[4] = { "15", "60", "30", "20" };   // by g_interval & 3 (4 -> 0)
 bool g_ok = false;
 bool g_gl = false;                     // vitaGL owns the GPU (OpenGL renderer)
 
@@ -552,7 +553,7 @@ void window_report(uint64_t now) {
     }
     log("%s [cause: %s] display %.1f fps (%s lock), %.2f%% missed (worst %.1f ms), submit+wait %.2f ms/frame, guest %.1f presents/s; "
         "core0 guest %.0f%%, core1 display %.0f%%; RAM free %d KiB (low %d), VRAM free %d KiB (low %d)",
-        tag, cause, g_win.frames * 1e6 / span, g_interval == 1 ? "60" : "30", miss_pct, g_win.worst_us / 1000.0, gpu_ms, gps,
+        tag, cause, g_win.frames * 1e6 / span, kLockName[g_interval & 3], miss_pct, g_win.worst_us / 1000.0, gpu_ms, gps,
         load_main, load_disp, ukb, g_win.min_user_kb, ckb, g_win.min_cdram_kb);
     char line[600];
     {
@@ -799,8 +800,7 @@ int display_main(SceSize, void*) {
 
 // Called once from boot before the guest starts.
 bool present_init() {
-    const char* f = std::getenv("SC_FPS");
-    g_interval = (f && std::atoi(f) == 60) ? 1 : 2;   // WarCraft III: locked 30 by default (K), SC_FPS=60 for 60
+    g_interval = fps_lock_interval();   // WarCraft III: steady 15 fps by default (K), SC_FPS=20/30/60
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
     SceAppUtilInitParam ai; SceAppUtilBootParam bi;
@@ -816,9 +816,9 @@ bool present_init() {
         g_ok = true;
         { SceUID t = sceKernelCreateThread("sc_sampler", sampler_main, 0x60, 0x2000, 0, SCE_KERNEL_CPU_MASK_USER_2, nullptr);
           if (t >= 0) sceKernelStartThread(t, 0, nullptr); }
-        { int gw = 0, gh = 0; input_screen(&gw, &gh);
-          log("[not-bound] presenter: OpenGL renderer through vitaGL, game drawn at %dx%d (display scaler to 960x544), %s fps lock",
-              gw, gh, g_interval == 1 ? "60" : "30"); }
+        { uint32_t gw = 0, gh = 0; gl_render_size(&gw, &gh);
+          log("[not-bound] presenter: OpenGL renderer through vitaGL, game drawn at %ux%u (display scaler to 960x544), %s fps lock",
+              gw, gh, kLockName[g_interval & 3]); }
         return true;
     }
     g_ok = gpu_init();
@@ -839,7 +839,7 @@ bool present_init() {
     { SceUID t = sceKernelCreateThread("sc_sampler", sampler_main, 0x60, 0x2000, 0, SCE_KERNEL_CPU_MASK_USER_2, nullptr);
       if (t >= 0) sceKernelStartThread(t, 0, nullptr); }
     log("[not-bound] presenter: %dx%d -> %dx%d pillarboxed, %s Hz lock, %d display buffers in VRAM",
-        kSrcW, kSrcH, kOutW, kOutH, g_interval == 1 ? "60" : "30", kBuffers);
+        kSrcW, kSrcH, kOutW, kOutH, kLockName[g_interval & 3], kBuffers);
     return true;
 }
 

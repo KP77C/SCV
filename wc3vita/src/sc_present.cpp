@@ -59,6 +59,7 @@ std::vector<PadStep> load_script(const char* path) {
     std::fclose(f); return v;
 }
 uint64_t g_frames = 0, g_last_us = 0, g_win_start = 0, g_win_frames = 0;
+bool g_shot_now = false;   // SC_PAD_LIVE "shot": save the next frame
 
 void write_bmp(const char* path, d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t h, const uint32_t* pal) {
     FILE* f = std::fopen(path, "wb");
@@ -190,6 +191,30 @@ static void present_pump(d2rt::Cpu& c) {
     g_last_us = now;
     d2rt::dsound::frame_pump(c);
     static std::vector<PadStep> script = std::getenv("SC_PAD_SCRIPT") ? load_script(std::getenv("SC_PAD_SCRIPT")) : std::vector<PadStep>();
+    // SC_PAD_LIVE=<file>: drive a running host session. Every 10 frames the
+    // steps in that file are added to the script and the file is removed;
+    // "+N" in place of a frame number means N frames from now, and a line
+    // "shot" saves the next frame to SC_SHOTS.
+    static const char* live = std::getenv("SC_PAD_LIVE");
+    if (live && g_frames % 10 == 0) {
+        if (FILE* f = std::fopen(live, "r")) {
+            const std::string tmp = std::string(live) + ".abs";
+            if (FILE* o = std::fopen(tmp.c_str(), "w")) {
+                char line[256];
+                while (std::fgets(line, sizeof line, f)) {
+                    if (!std::strncmp(line, "shot", 4)) { g_shot_now = true; continue; }
+                    if (line[0] == '+') { char* end = nullptr; unsigned long long d = std::strtoull(line + 1, &end, 10);
+                                          std::fprintf(o, "%llu%s", (unsigned long long)g_frames + d, end); }
+                    else std::fputs(line, o);
+                }
+                std::fclose(o);
+                std::vector<PadStep> add = load_script(tmp.c_str());
+                script.insert(script.end(), add.begin(), add.end());
+                log("[not-bound] pad live: %u steps added at frame %llu", (unsigned)add.size(), (unsigned long long)g_frames);
+            }
+            std::fclose(f); std::remove(live);
+        }
+    }
     if (!script.empty()) {
         Pad cur; for (auto& st : script) {
             if (st.frame <= g_frames) cur = st.pad;
@@ -204,7 +229,8 @@ void present(d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t
     present_pump(c);
     static const char* dir = std::getenv("SC_SHOTS");
     static uint64_t every = std::getenv("SC_SHOT_EVERY") ? std::strtoull(std::getenv("SC_SHOT_EVERY"), nullptr, 10) : 30;
-    if (dir && (g_frames == 1 || g_frames % every == 0)) {
+    if (dir && (g_frames == 1 || g_frames % every == 0 || g_shot_now)) {
+        g_shot_now = false;
         mkdir(dir, 0777);
         char p[512]; std::snprintf(p, sizeof p, "%s/frame_%06llu.bmp", dir, (unsigned long long)g_frames);
         if (pal) write_bmp(p, c, pixels, pitch, w, h, pal);
@@ -219,7 +245,8 @@ void present_rgba(d2rt::Cpu& c, const uint8_t* rgba, uint32_t w, uint32_t h) {
     present_pump(c);
     static const char* dir = std::getenv("SC_SHOTS");
     static uint64_t every = std::getenv("SC_SHOT_EVERY") ? std::strtoull(std::getenv("SC_SHOT_EVERY"), nullptr, 10) : 30;
-    if (!dir || !(g_frames == 1 || g_frames % every == 0)) return;
+    if (!dir || !(g_frames == 1 || g_frames % every == 0 || g_shot_now)) return;
+    g_shot_now = false;
     mkdir(dir, 0777);
     char p[512]; std::snprintf(p, sizeof p, "%s/frame_%06llu.bmp", dir, (unsigned long long)g_frames);
     FILE* f = std::fopen(p, "wb"); if (!f) return;

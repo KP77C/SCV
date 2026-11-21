@@ -6,6 +6,7 @@
 //   [not-bound] [cause: missing shim] ...
 //   [CPU-bound] [cause: main-thread stall] ...
 #pragma once
+#include <cstdlib>
 #include "runtime/bridge.h"
 #include "runtime/cpu.h"
 
@@ -76,6 +77,14 @@ void patch_module(const std::string& name, uint32_t base);   // data patches to 
 void mp3_install(d2rt::Cpu& c, uint32_t base);                 // w3_mp3.cpp: native MP3 for Mp3dec.asi
 void mp3_stats(uint64_t* opens, uint64_t* frames);
 // Per-frame GL counters for the spike report (w3_gl.cpp): read and cleared.
+// The display lock: vblanks per frame from SC_FPS (60, 30, 20 or 15). WarCraft
+// III defaults to a steady 15 fps (K, 2026-11-21: an RTS is fine at 15 if it
+// is smooth). Returns 1, 2, 3 or 4.
+inline int fps_lock_interval() {
+    const char* f = std::getenv("SC_FPS");
+    const int fps = f && *f ? std::atoi(f) : 15;
+    return fps >= 60 ? 1 : fps >= 30 ? 2 : fps >= 20 ? 3 : 4;
+}
 struct GlFrameStats { uint32_t sub_n = 0, sub_bytes = 0, sub_us = 0, img_n = 0, img_bytes = 0, img_us = 0, draws = 0; };
 void gl_frame_stats(GlFrameStats* out);
 uint64_t trace_opens();                                // Storm file opens so far (w3_trace.cpp)
