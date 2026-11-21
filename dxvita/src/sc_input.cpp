@@ -1,21 +1,17 @@
-// sc_input.cpp — K's control scheme (2026-11-20), see sc_input.h.
+// sc_input.cpp — Deus Ex Vita controls (first default layout, 2026-11-21).
 //
-//   Right stick   cursor (L held: faster)
-//   Touch screen  cursor under the finger; tap = left click, touch and move = drag
-//   Left stick    map scroll (arrow keys)
-//   R             left click        L+R      right click (double R = double click)
-//   Cross         A
-//   Triangle      R                 L+Tri    G
-//   Square        S                 L+Sq     H
-//   Circle        P                 L+Circle R
-//   D-pad left    Ctrl (held)       D-pad right  Space
-//   D-pad left + face/L/R  Ctrl+1-6 (Cross 1, Square 2, Triangle 3, Circle 4, L 5, R 6)
-//   D-pad down + face/L/R  1-6
-//   L + cursor at a screen edge: scroll (without L the cursor stops 2 px short)
-//   D-pad up      hold: 3x3 command grid, right stick picks the cell,
-//                 R clicks it (grid stays up until D-pad up is released)
-//   Select        Enter             L+Select on-screen keyboard (no Enter)
-//   Start         F10               L+Start Escape
+//   Left stick    move (W / S, strafe A / D)
+//   Right stick   look (mouse); in menus it moves the pointer
+//   R             fire / click (left mouse)
+//   L             use, pick up, open (right mouse)
+//   Cross         jump (Space)            Circle    crouch (X)
+//   Square        reload (;)              Triangle  inventory (F1)
+//   D-pad left/right  previous / next belt item (mouse wheel)
+//   D-pad up      goals and notes (F2)    D-pad down  put weapon away (Backspace)
+//   Select        augmentation 1 (F3)     L+Select  on-screen keyboard
+//   Start         main menu (Escape)
+//   Touch screen  pointer under the finger, tap = click (menus)
+// DX_LOOK_SPEED (pixels per second at full stick, default 900) sets look speed.
 #include <cstdlib>
 #include "sc_input.h"
 #include "sc_host.h"
@@ -41,7 +37,6 @@ bool     g_ctrl_by_dpad = false;
 bool     g_grid = false; int g_cell = 4;
 bool     g_ime = false;
 // D-pad up/down swapped at K's request (build 16): grid on up, Ctrl on down.
-constexpr uint32_t kBtnGrid = PAD_UP, kBtnNum = PAD_DOWN;   // grid on up, numbers on down (K, build 20)
 constexpr double kEdgeGuard = 2;   // px kept from the screen edge unless L is held (no edge scroll)
 bool     g_r_grid = false;     // current R press was used by the grid
 bool     g_ctrl_by_left = false; // D-pad left is holding Ctrl
@@ -139,136 +134,65 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     const double dt = dt_us / 1e6;
     g_clock_us += dt_us;
 
-    // Command grid: hold D-pad up, pick with the right stick, press R to
-    // click the cell (K, 2026-11-20). The grid stays up while D-pad up is
-    // held, so several buttons can be pressed in a row; releasing closes it.
-    if (pressed & kBtnGrid) { g_grid = true; g_cell = 4; }
-    if (g_grid) g_cell = grid_cell(p);
-    if ((released & kBtnGrid) && g_grid) g_grid = false;
-    // Shoulders as digits (K, build 18): D-pad left + L/R = Ctrl+5/6 (Ctrl is
-    // already held by D-pad left), D-pad down + L/R = 5/6 (K, build 20). D-pad up
-    // is only the grid now, so R there always clicks the picked cell, centre included.
-    static uint32_t sh_key[2] = { 0, 0 };
-    const struct { uint32_t bit; uint32_t digit; } shoulders[2] = { { PAD_L, '5' }, { PAD_R, '6' } };
-    for (int i = 0; i < 2; ++i) {
-        if (pressed & shoulders[i].bit) {
-            const bool by_left = b & PAD_LEFT, by_num = b & kBtnNum;
-                        if (by_left || by_num) { key(shoulders[i].digit, true); sh_key[i] = shoulders[i].digit; }
-        }
-        if ((released & shoulders[i].bit) && sh_key[i]) { key(sh_key[i], false); sh_key[i] = 0; }
-        if (sh_key[i]) g_sh_owned |= shoulders[i].bit;
-    }
-    if ((pressed & PAD_R) && g_grid && !(g_sh_owned & PAD_R)) {
-        g_r_grid = true;                      // this R press belongs to the grid, not to the mouse
-        uint32_t ox, oy; wx86_get_cursor(&ox, &oy);
-        move_to(kCardX0 + kCardDX * (g_cell % 3), kCardY0 + kCardDY * (g_cell / 3));
-        lbutton(true); lbutton(false);
-        move_to((int)ox, (int)oy);
-        g_fx = ox; g_fy = oy;
-        g_stick_hold = true;
-    }
-
-    // Front touch screen: the cursor goes where the finger is and follows a
-    // drag (K, 2026-11-20). Same edge rule as the stick: without L it stops 2 px short.
-    if (!g_grid && p.touch) {
-        const double m = L ? 0 : kEdgeGuard;
-        double x = p.tx, y = p.ty;
-        x = x < m ? m : x > 639 - m ? 639 - m : x; y = y < m ? m : y > 479 - m ? 479 - m : y;
-        if ((int)x != (int)g_fx || (int)y != (int)g_fy) move_to((int)x, (int)y);
-        g_fx = x; g_fy = y;
-        // Touch clicks too (K, build 20): finger down = left button down where
-        // it landed, finger up = release. A tap is a click (two quick taps a
-        // double click), and moving while touching drags a selection box.
+    // Touch: pointer under the finger, finger down = left button (menus).
+    if (p.touch) {
+        if ((int)p.tx != (int)g_fx || (int)p.ty != (int)g_fy) move_to(p.tx, p.ty);
+        g_fx = p.tx; g_fy = p.ty;
         if (!g_touch_btn && !g_lbtn) { lbutton(true); g_touch_btn = true; }
     }
     if (!p.touch && g_touch_btn) { lbutton(false); g_touch_btn = false; }
 
-    // Cursor from the right stick (not while the grid owns it).
-    if (!g_grid && !p.touch) {
+    // Look / pointer from the right stick. In game Unreal puts the cursor back
+    // in the middle every frame (SetCursorPos) and reads how far it moved, so
+    // always continue from where the cursor really is.
+    if (!p.touch) {
         double x = axis(p.rx), y = axis(p.ry);
-        if (g_stick_hold) { if (x || y) x = y = 0; else g_stick_hold = false; }
+        static double rem_x = 0, rem_y = 0;
         if (x || y) {
-            // The game can move the cursor itself (SetCursorPos when a mission starts),
-            // so pick up from where it really is.
-            uint32_t cx, cy; wx86_get_cursor(&cx, &cy);
-            if ((int)cx != (int)g_fx || (int)cy != (int)g_fy) { g_fx = cx; g_fy = cy; }
-            const double speed = (L ? 1400.0 : 560.0) * dt;   // px per second at full deflection
-            g_fx += x * std::fabs(x) * speed; g_fy += y * std::fabs(y) * speed;
-            const double m = L ? 0 : kEdgeGuard;
-            g_fx = g_fx < m ? m : g_fx > 639 - m ? 639 - m : g_fx; g_fy = g_fy < m ? m : g_fy > 479 - m ? 479 - m : g_fy;
-            move_to((int)g_fx, (int)g_fy);
-        } else if (!L) {
-            // Edge scrolling only while L is held (K, 2026-11-20): when L is let
-            // go with the cursor on an edge, step it back inside.
-            uint32_t cx, cy; wx86_get_cursor(&cx, &cy);
-            const int m = (int)kEdgeGuard;
-            const int nx = (int)cx < m ? m : (int)cx > 639 - m ? 639 - m : (int)cx;
-            const int ny = (int)cy < m ? m : (int)cy > 479 - m ? 479 - m : (int)cy;
-            if (nx != (int)cx || ny != (int)cy) { move_to(nx, ny); g_fx = nx; g_fy = ny; }
-        }
+            static const double look = std::getenv("DX_LOOK_SPEED") ? std::atof(std::getenv("DX_LOOK_SPEED")) : 900.0;
+            // Squared response: fine aim near the centre, fast turns at the edge.
+            const double sx = x * std::fabs(x) * look * dt + rem_x, sy = y * std::fabs(y) * look * dt + rem_y;
+            const int ix = (int)sx, iy = (int)sy;
+            rem_x = sx - ix; rem_y = sy - iy;
+            if (ix || iy) {
+                uint32_t cx, cy; wx86_get_cursor(&cx, &cy);
+                move_to((int)cx + ix, (int)cy + iy);
+                uint32_t nx, ny; wx86_get_cursor(&nx, &ny); g_fx = nx; g_fy = ny;
+            }
+        } else { rem_x = rem_y = 0; }
     }
 
-    // Map scroll from the left stick, as held arrow keys. StarCraft scrolls at
-    // its own set speed, so L does not change it yet.
+    // Movement from the left stick, as held W/A/S/D.
     {
-        double x = axis(p.lx), y = axis(p.ly);
-        key(VK_LEFT, x < -0.35); key(VK_RIGHT, x > 0.35);
-        key(VK_UP, y < -0.35);   key(VK_DOWN, y > 0.35);
+        const double x = axis(p.lx), y = axis(p.ly);
+        key('A', x < -0.35); key('D', x > 0.35);
+        key('W', y < -0.35); key('S', y > 0.35);
     }
 
-    // Mouse buttons. R = left click, L+R = right click, Cross = right click.
-    if ((pressed & PAD_R) && !g_r_grid && !(g_sh_owned & PAD_R)) { if (L) { g_r_owner = PAD_R; rbutton(true); } else lbutton(true); }
-    if (released & PAD_R) {
-        if (g_sh_owned & PAD_R) {}            // that R press sent 6, not a click
-        else if (g_r_grid) g_r_grid = false;
-        else if (g_r_owner == PAD_R) { rbutton(false); g_r_owner = 0; } else lbutton(false);
-    }
+    // Mouse buttons.
+    if (pressed & PAD_R) lbutton(true);
+    if (released & PAD_R) lbutton(false);
+    if (pressed & PAD_L) rbutton(true);
+    if (released & PAD_L) rbutton(false);
 
-    g_sh_owned &= ~released;
-
-    // Face buttons.
-    struct Face { uint32_t bit; uint32_t plain, with_l, digit; };
-    static const Face faces[] = {
-        { PAD_CROSS, 'A', 'A', '1' }, { PAD_SQUARE, 'S', 'H', '2' },
-        { PAD_TRIANGLE, 'R', 'G', '3' }, { PAD_CIRCLE, 'P', 'R', '4' },
+    // Held keys.
+    const struct { uint32_t bit, vk; } held[] = {
+        { PAD_CROSS, VK_SPACE }, { PAD_CIRCLE, 'X' }, { PAD_SQUARE, 0xBA /* ; */ }, { PAD_TRIANGLE, 0x70 /* F1 */ },
+        { PAD_UP, 0x71 /* F2 */ }, { PAD_DOWN, 0x08 /* Backspace */ }, { PAD_START, VK_ESCAPE },
     };
-    for (int i = 0; i < 4; ++i) {
-        const Face& f = faces[i];
-        if (pressed & f.bit) {
-            if (b & PAD_LEFT) {                                                  // D-pad left (Ctrl held) + face: Ctrl+1-4
-                if (!g_down[VK_CONTROL]) key(VK_CONTROL, true);
-                key(f.digit, true); g_face_key[i] = f.digit;
-            } else if (b & kBtnNum) {                                            // D-pad down + face: 1-4 (K, build 20)
-                const bool ctrl = g_down[VK_CONTROL];
-                if (ctrl) key(VK_CONTROL, false);
-                key(f.digit, true); g_face_key[i] = f.digit | (ctrl ? 0x100 : 0);
-            } else {
-                uint32_t vk = L ? f.with_l : f.plain; key(vk, true); g_face_key[i] = vk;
-            }
-        }
-        if (released & f.bit) {
-            uint32_t k = g_face_key[i];
-            if (k) {
-                key(k & 0xFF, false);
-                if ((k & 0x100) && g_ctrl_by_dpad) key(VK_CONTROL, true);   // Ctrl back while D-pad up stays held
-            }
-            g_face_key[i] = 0;
-        }
+    for (const auto& h : held) {
+        if (pressed & h.bit) key(h.vk, true);
+        if (released & h.bit) key(h.vk, false);
     }
-
-    // Single keys.
-    // D-pad left: Ctrl held for as long as it is (K, build 17); G moved to L+Triangle.
-    if (pressed & PAD_LEFT) { g_ctrl_by_left = true; key(VK_CONTROL, true); }
-    if ((released & PAD_LEFT) && g_ctrl_by_left) { g_ctrl_by_left = false; if (!g_ctrl_by_dpad) key(VK_CONTROL, false); }
-    if (pressed & PAD_RIGHT) key(VK_SPACE, true); if (released & PAD_RIGHT) key(VK_SPACE, false);
-    // Start = F10 (game menu), L+Start = Escape (K, 2026-11-20). The key that
-    // went down is the one released, even if L changes in between.
-    static uint32_t start_vk = 0;
-    if (pressed & PAD_START) { start_vk = L ? VK_ESCAPE : VK_F10; key(start_vk, true); }
-    if ((released & PAD_START) && start_vk) { key(start_vk, false); start_vk = 0; }
-    if (pressed & PAD_SELECT) { if (L) g_ime = true; else key(VK_RETURN, true); }
-    if (released & PAD_SELECT) key(VK_RETURN, false);
-
+    // Select: F3 (first augmentation); L+Select opens the on-screen keyboard.
+    static bool sel_key = false;
+    if (pressed & PAD_SELECT) { if (L) g_ime = true; else { key(0x72, true); sel_key = true; } }
+    if ((released & PAD_SELECT) && sel_key) { key(0x72, false); sel_key = false; }
+    // D-pad left/right: mouse wheel (previous / next belt item).
+    if (pressed & (PAD_LEFT | PAD_RIGHT)) {
+        const int16_t delta = (pressed & PAD_LEFT) ? 120 : -120;
+        post_input(0x020A /* WM_MOUSEWHEEL */, ((uint32_t)(uint16_t)delta << 16) | (mk() & 0xFFFF), xy());
+    }
     g_prev = b;
 }
 

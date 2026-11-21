@@ -53,7 +53,7 @@
 #define SC_VITA_DIR "ux0:data/DeusEx"
 extern "C" {
 // Host newlib heap (box86 metadata has its own pool; guest memory is the arena).
-int _newlib_heap_size_user = 64 * 1024 * 1024;
+int _newlib_heap_size_user = 48 * 1024 * 1024;
 unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
 const char* const wx86_vita_progress_path = SC_VITA_DIR "/dxvita_progress.txt";
 }
@@ -192,26 +192,30 @@ using namespace sc;
 // va + membase), the same layout on the qemu host and the Vita. Deus Ex's
 // DLLs all carry relocations, so every module (DeusEx.exe included) is placed
 // in the module window instead of at its preferred 0x10xxxxxx base.
-// First-boot sizes, generous on purpose; trimmed after measurement.
+// Sizes from the first host runs (Liberty Island peaks: msvcrt heap 14.6 MiB,
+// VirtualAlloc 118 MiB, modules end near 0x01E00000 when loaded at 0x01400000),
+// with headroom, and small enough for the Vita: the arena is one committed
+// block there, next to a 48 MiB host heap and the 16 MiB JIT pool.
 //   0x00000000  page 0 (main TIB)
-//   0x00400000  HeapAlloc            16 MiB (msvcrt's own heap; Unreal allocates with VirtualAlloc)
-//   0x01400000  module window        24 MiB (exe, Core, Engine, renderers ...)
+//   0x00400000  HeapAlloc            24 MiB (msvcrt's own heap; Unreal allocates with VirtualAlloc)
+//   0x01C00000  module window        16 MiB (exe, Core, Engine, renderers ...)
 //   0x02C00000  scratch              8 MiB
-//   0x03400000  VirtualAlloc         176 MiB (Unreal's FMallocWindows pools, loaded packages)
-//   0x0E400000  worker stacks        16 x 1 MiB
-//   0x0F400000  worker TIBs          1 MiB
-//   0x0F500000  main stack           4 MiB
-//   0x0F900000  native-thunk window  1 MiB
-//   0x10000000  end of arena (256 MiB)
-static constexpr uint32_t kHeapBase    = 0x00400000, kHeapSize    = 0x01000000;
-static constexpr uint32_t kModBase     = 0x01400000, kModEnd      = 0x02C00000;
+//   0x03400000  VirtualAlloc         144 MiB (Unreal's FMallocWindows pools, loaded packages)
+//   0x0C400000  worker stacks        8 x 1 MiB
+//   0x0CC00000  worker TIBs          1 MiB
+//   0x0CD00000  main stack           4 MiB
+//   0x0D100000  native-thunk window
+//   0x0D800000  end of arena (216 MiB)
+static constexpr uint32_t kHeapBase    = 0x00400000, kHeapSize    = 0x01800000;
+static constexpr uint32_t kModBase     = 0x01C00000, kModEnd      = 0x02C00000;
 static constexpr uint32_t kScratchBase = 0x02C00000, kScratchSize = 0x00800000;
-static constexpr uint32_t kVaBase      = 0x03400000, kVaSize      = 0x0B000000;
-static constexpr uint32_t kStacks      = 0x0E400000;
-static constexpr uint32_t kTibs        = 0x0F400000;
-static constexpr uint32_t kMainStack   = 0x0F500000, kMainStackSize = 0x00400000;
-static constexpr uint32_t kTrapBase    = 0x0F900000;
-static constexpr uint32_t kArenaEnd    = 0x10000000;
+static constexpr uint32_t kVaBase      = 0x03400000, kVaSize      = 0x09000000;
+static constexpr uint32_t kStacks      = 0x0C400000;
+static constexpr uint32_t kTibs        = 0x0CC00000;
+static constexpr uint32_t kMainStack   = 0x0CD00000, kMainStackSize = 0x00400000;
+static constexpr uint32_t kTrapBase    = 0x0D100000;
+static constexpr uint32_t kArenaEnd    = 0x0D800000;
+static_assert(kVaBase + kVaSize <= kStacks && kMainStack + kMainStackSize <= kTrapBase, "layout overlap");
 
 static wx86::GuestRegion g_heap, g_va;
 void sc::guest_mem(uint32_t* hc, uint32_t* hp, uint32_t* vc, uint32_t* vp) {

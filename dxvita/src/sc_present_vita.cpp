@@ -186,7 +186,7 @@ struct DisplayData { void* addr; };
 SceGxmContext* g_ctx = nullptr;
 SceGxmRenderTarget* g_rt = nullptr;
 SceGxmShaderPatcher* g_patcher = nullptr;
-Block g_color_mem[kBuffers], g_depth_mem, g_tex_mem, g_vtx_mem, g_rings[3], g_usse_ring, g_pat_buf, g_pat_vusse, g_pat_fusse;
+Block g_color_mem[kBuffers], g_depth_mem, g_tex_mem, g_tex32_mem, g_vtx_mem, g_rings[3], g_usse_ring, g_pat_buf, g_pat_vusse, g_pat_fusse;
 SceGxmColorSurface g_color[kBuffers];
 SceGxmSyncObject* g_sync[kBuffers];
 SceGxmDepthStencilSurface g_depth;
@@ -194,6 +194,8 @@ SceGxmVertexProgram* g_vp_tex = nullptr; SceGxmFragmentProgram* g_fp_tex = nullp
 SceGxmVertexProgram* g_vp_col = nullptr; SceGxmFragmentProgram* g_fp_col = nullptr;
 SceGxmTexture g_tex[kSlots];
 uint8_t* g_tex_pix[kSlots]; uint32_t* g_tex_pal[kSlots];
+// Deus Ex draws 32-bit frames (SoftDrv into a DIB section): BGRX texels.
+SceGxmTexture g_tex32[kSlots]; uint8_t* g_tex32_pix[kSlots];
 struct ColVtx { float x, y; uint8_t r, g, b, a; };
 ColVtx* g_ovl[kSlots];
 uint16_t* g_quad_idx; float* g_quad_vtx; uint16_t* g_ovl_idx;
@@ -205,7 +207,8 @@ bool g_ok = false;
 // Guest -> display thread hand-off. The surface is read racily, exactly as a
 // real card scans out a DirectDraw primary; the palette is double-buffered by
 // sequence number.
-std::atomic<uint32_t> g_src_va{0}, g_src_pitch{0}, g_pal_seq{0};
+std::atomic<uint32_t> g_src_va{0}, g_src_pitch{0}, g_pal_seq{0}, g_src_bpp{8}, g_f32_seq{0};
+uint8_t* g_f32[2] = { nullptr, nullptr };   // 32-bit frames copied out on the guest thread
 uint32_t g_pal[2][256];
 std::atomic<uint64_t> g_guest_presents{0};
 std::atomic<bool> g_grid_on{false}; std::atomic<int> g_grid_cell{4};
@@ -387,6 +390,18 @@ bool gpu_init() {
         sceGxmTextureSetUAddrMode(&g_tex[i], SCE_GXM_TEXTURE_ADDR_CLAMP);
         sceGxmTextureSetVAddrMode(&g_tex[i], SCE_GXM_TEXTURE_ADDR_CLAMP);
     }
+    if (!alloc_gpu(g_tex32_mem, CD, kSlots * pix * 4, RO, "dx_frames32")) return false;
+    for (int i = 0; i < 2; ++i) { g_f32[i] = (uint8_t*)std::calloc(pix, 4); if (!g_f32[i]) return false; }
+    for (int i = 0; i < kSlots; ++i) {
+        g_tex32_pix[i] = (uint8_t*)g_tex32_mem.p + i * pix * 4;
+        // A8R8G8B8 = the u32 0xAARRGGBB, bytes B,G,R,A: a Windows 32-bit DIB.
+        // The shader forces alpha to 1, so the DIB's unused byte is harmless.
+        sceGxmTextureInitLinear(&g_tex32[i], g_tex32_pix[i], SCE_GXM_TEXTURE_FORMAT_A8R8G8B8, kSrcW, kSrcH, 0);
+        sceGxmTextureSetMinFilter(&g_tex32[i], SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMagFilter(&g_tex32[i], SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetUAddrMode(&g_tex32[i], SCE_GXM_TEXTURE_ADDR_CLAMP);
+        sceGxmTextureSetVAddrMode(&g_tex32[i], SCE_GXM_TEXTURE_ADDR_CLAMP);
+    }
     uint8_t* vp = (uint8_t*)g_vtx_mem.p;
     g_quad_vtx = (float*)vp; g_quad_idx = (uint16_t*)(vp + 64); g_ovl_idx = (uint16_t*)(vp + 128);
     const float x1 = (float)kOutW / kScrW;                                // pillarbox in clip space
@@ -528,7 +543,7 @@ void window_report(uint64_t now) {
 void ime_step() {
     int st = g_ime_state.load();
     if (st == 1) {
-        static const char16_t title16[] = u"StarCraft";
+        static const char16_t title16[] = u"Deus Ex";
         const SceWChar16* title = (const SceWChar16*)title16;
         SceImeDialogParam p; sceImeDialogParamInit(&p);
         p.supportedLanguages = SCE_IME_LANGUAGE_ENGLISH; p.languagesForced = SCE_FALSE;
@@ -558,7 +573,7 @@ int display_main(SceSize, void*) {
     int slot = 0;
     while (!g_quit.load()) {
         ime_step();
-        const uint32_t va = g_src_va.load(), pitch = g_src_pitch.load();
+        const uint32_t va = g_src_va.load(), pitch = g_src_pitch.load(), bpp = g_src_bpp.load();
         const uint8_t* src = va ? (const uint8_t*)g_cpu->hostptr(va, pitch * kSrcH) : nullptr;
         if (!src) { sceKernelDelayThread(4000); continue; }
         // The keyboard dialog draws over the whole screen, and we only ever
@@ -571,10 +586,14 @@ int display_main(SceSize, void*) {
 
         // Reuse a texture set only once the GPU has finished the scene that read it.
         sceGxmNotificationWait(&g_notif[slot]);
-        if (pitch == kSrcW) std::memcpy(g_tex_pix[slot], src, kSrcW * kSrcH);
-        else for (int y = 0; y < kSrcH; ++y) std::memcpy(g_tex_pix[slot] + y * kSrcW, src + y * pitch, kSrcW);
-        const uint32_t* pal = g_pal[g_pal_seq.load() & 1];
-        for (int i = 0; i < 256; ++i) g_tex_pal[slot][i] = pal[i] | 0xFF000000u;   // 0x00BBGGRR -> ABGR, opaque
+        if (bpp == 32) {
+            std::memcpy(g_tex32_pix[slot], g_f32[g_f32_seq.load() & 1], kSrcW * kSrcH * 4);
+        } else {
+            if (pitch == kSrcW) std::memcpy(g_tex_pix[slot], src, kSrcW * kSrcH);
+            else for (int y = 0; y < kSrcH; ++y) std::memcpy(g_tex_pix[slot] + y * kSrcW, src + y * pitch, kSrcW);
+            const uint32_t* pal = g_pal[g_pal_seq.load() & 1];
+            for (int i = 0; i < 256; ++i) g_tex_pal[slot][i] = pal[i] | 0xFF000000u;   // 0x00BBGGRR -> ABGR, opaque
+        }
         const bool grid = g_grid_on.load();
         if (grid) build_overlay(g_ovl[slot], g_grid_cell.load());
 
@@ -583,7 +602,7 @@ int display_main(SceSize, void*) {
         sceGxmSetFrontDepthFunc(g_ctx, SCE_GXM_DEPTH_FUNC_ALWAYS);
         sceGxmSetFrontDepthWriteEnable(g_ctx, SCE_GXM_DEPTH_WRITE_DISABLED);
         sceGxmSetVertexProgram(g_ctx, g_vp_tex); sceGxmSetFragmentProgram(g_ctx, g_fp_tex);
-        sceGxmSetFragmentTexture(g_ctx, 0, &g_tex[slot]);
+        sceGxmSetFragmentTexture(g_ctx, 0, bpp == 32 ? &g_tex32[slot] : &g_tex[slot]);
         sceGxmSetVertexStream(g_ctx, 0, g_quad_vtx);
         sceGxmDraw(g_ctx, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16, g_quad_idx, 4);
         if (grid) {
@@ -683,7 +702,22 @@ void present(d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t
         g_ip = c.ip_ptr();
         if (d2rt::PeImage* st = g_br ? g_br->module("storm.dll") : nullptr) { g_storm_lo = st->load_base(); g_storm_hi = g_storm_lo + st->image_size(); }
     }
-    if (w == (uint32_t)kSrcW && h == (uint32_t)kSrcH) {
+    if (w == (uint32_t)kSrcW && h == (uint32_t)kSrcH && !pal) {   // 32-bit frame (no palette)
+        // SoftDrv starts the next frame in the same DIB right after the blit,
+        // so copy the finished frame out here (two staging buffers, by
+        // sequence number) instead of letting the display thread read a
+        // half-drawn one.
+        const uint32_t next = g_f32_seq.load() + 1;
+        uint8_t* dst = g_f32[next & 1];
+        const uint8_t* srcp = (const uint8_t*)c.hostptr(pixels, pitch * kSrcH);
+        if (dst && srcp) {
+            if (pitch == kSrcW * 4) std::memcpy(dst, srcp, kSrcW * kSrcH * 4);
+            else for (int y = 0; y < kSrcH; ++y) std::memcpy(dst + y * kSrcW * 4, srcp + y * pitch, kSrcW * 4);
+            g_f32_seq.store(next);
+            g_src_bpp.store(32); g_src_pitch.store(kSrcW * 4); g_src_va.store(pixels);
+        }
+    } else if (w == (uint32_t)kSrcW && h == (uint32_t)kSrcH) {
+        g_src_bpp.store(8);
         const uint32_t next = g_pal_seq.load() + 1;
         std::memcpy(g_pal[next & 1], pal, sizeof g_pal[0]);
         g_pal_seq.store(next);
