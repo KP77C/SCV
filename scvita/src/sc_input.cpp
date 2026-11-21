@@ -1,6 +1,6 @@
 // sc_input.cpp — K's control scheme (2026-11-20), see sc_input.h.
 //
-//   Right stick   cursor (L held: faster)
+//   Right stick   cursor (D-pad right held: faster; L held: edge scrolling)
 //   Touch screen  cursor under the finger; tap = left click, touch and move = drag
 //   Left stick    map scroll (arrow keys)
 //   R             left click        L+R      right click (double R = double click)
@@ -8,7 +8,7 @@
 //   Triangle      R                 L+Tri    G
 //   Square        S                 L+Sq     H
 //   Circle        P                 L+Circle R
-//   D-pad left    Ctrl (held)       D-pad right  Space
+//   D-pad left    Ctrl (held)       L + D-pad up  Space (D-pad right unbound)
 //   D-pad left + face/L/R  Ctrl+1-6 (Cross 1, Square 2, Triangle 3, Circle 4, L 5, R 6)
 //   D-pad down + face/L/R  1-6
 //   L + cursor at a screen edge: scroll (without L the cursor stops 2 px short)
@@ -142,7 +142,11 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     // Command grid: hold D-pad up, pick with the right stick, press R to
     // click the cell (K, 2026-11-20). The grid stays up while D-pad up is
     // held, so several buttons can be pressed in a row; releasing closes it.
-    if (pressed & kBtnGrid) { g_grid = true; g_cell = 4; }
+    // L + D-pad up = Space (K, build 21); the grid opens only without L.
+    static bool space_by_up = false;
+    if ((pressed & kBtnGrid) && L) { key(VK_SPACE, true); space_by_up = true; }
+    else if (pressed & kBtnGrid) { g_grid = true; g_cell = 4; }
+    if ((released & kBtnGrid) && space_by_up) { key(VK_SPACE, false); space_by_up = false; }
     if (g_grid) g_cell = grid_cell(p);
     if ((released & kBtnGrid) && g_grid) g_grid = false;
     // Shoulders as digits (K, build 18): D-pad left + L/R = Ctrl+5/6 (Ctrl is
@@ -192,7 +196,7 @@ void input_tick(const Pad& p, uint64_t dt_us) {
             // so pick up from where it really is.
             uint32_t cx, cy; wx86_get_cursor(&cx, &cy);
             if ((int)cx != (int)g_fx || (int)cy != (int)g_fy) { g_fx = cx; g_fy = cy; }
-            const double speed = (L ? 1400.0 : 560.0) * dt;   // px per second at full deflection
+            const double speed = ((b & PAD_RIGHT) ? 1400.0 : 560.0) * dt;   // px per second at full deflection; D-pad right = fast (K, build 21)
             g_fx += x * std::fabs(x) * speed; g_fy += y * std::fabs(y) * speed;
             const double m = L ? 0 : kEdgeGuard;
             g_fx = g_fx < m ? m : g_fx > 639 - m ? 639 - m : g_fx; g_fy = g_fy < m ? m : g_fy > 479 - m ? 479 - m : g_fy;
@@ -260,7 +264,7 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     // D-pad left: Ctrl held for as long as it is (K, build 17); G moved to L+Triangle.
     if (pressed & PAD_LEFT) { g_ctrl_by_left = true; key(VK_CONTROL, true); }
     if ((released & PAD_LEFT) && g_ctrl_by_left) { g_ctrl_by_left = false; if (!g_ctrl_by_dpad) key(VK_CONTROL, false); }
-    if (pressed & PAD_RIGHT) key(VK_SPACE, true); if (released & PAD_RIGHT) key(VK_SPACE, false);
+    // D-pad right: unbound (Space moved to L + D-pad up, K build 21).
     // Start = F10 (game menu), L+Start = Escape (K, 2026-11-20). The key that
     // went down is the one released, even if L changes in between.
     static uint32_t start_vk = 0;
