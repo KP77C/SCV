@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 55dc5ea..5068f68 100644
+index 55dc5ea..fa1e80f 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -48,7 +48,13 @@ if(EMSCRIPTEN)
@@ -9,7 +9,7 @@ index 55dc5ea..5068f68 100644
 -if(EMSCRIPTEN)
 +if(VITA)
 +    # Debug symbols in the ELF for reading Vita crash dumps (the VPK's eboot has none).
-+    add_compile_options(-g)
++    add_compile_options(-g -fno-math-errno -funsafe-math-optimizations)
 +    # PS Vita: GL comes from vitaGL; vita/include/glad/gl.h maps the GL 3.3 names onto it.
 +    add_library(glad INTERFACE)
 +    target_include_directories(glad SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/vita/include ${VITAGL_PREFIX}/include)
@@ -128,10 +128,16 @@ index 827f6f3..ed0896d 100644
    target_link_options(deusex PRIVATE -static-libstdc++ -static-libgcc)
  endif()
 diff --git a/src/audio/audio.cc b/src/audio/audio.cc
-index 4e79963..ee98bc4 100644
+index 4e79963..3d006af 100644
 --- a/src/audio/audio.cc
 +++ b/src/audio/audio.cc
-@@ -10,6 +10,13 @@
+@@ -1,4 +1,5 @@
+ #include "audio/audio.h"
++#include "core/prof.h"
+ 
+ #include "audio/module.h"
+ #include "core/config.h"
+@@ -10,6 +11,13 @@
  
  #include <miniaudio.h>
  
@@ -145,7 +151,7 @@ index 4e79963..ee98bc4 100644
  #include <algorithm>
  #include <array>
  #include <cmath>
-@@ -131,9 +138,16 @@ namespace dx::audio {
+@@ -131,9 +139,16 @@ namespace dx::audio {
              bool active = false;
              bool offline = false;
              bool hasContext = false;
@@ -162,7 +168,7 @@ index 4e79963..ee98bc4 100644
              size_t channels = 16;
              float ambientFactor = 0.7f;
              float dopplerSpeed = 6500;
-@@ -493,12 +507,39 @@ namespace dx::audio {
+@@ -493,12 +508,39 @@ namespace dx::audio {
              }
          }
  
@@ -202,7 +208,7 @@ index 4e79963..ee98bc4 100644
  
          Voice makeVoice(State& s, std::shared_ptr<const DecodedSound> pcm, USound* sound, UObject* actor, int32_t slot, const Vector& location, float volume, float radius, float pitch, bool attenuate)
          {
-@@ -687,12 +728,20 @@ namespace dx::audio {
+@@ -687,12 +729,20 @@ namespace dx::audio {
              if (latency) {
                  s.latency = static_cast<float>(std::atof(latency->c_str()));
              }
@@ -224,7 +230,7 @@ index 4e79963..ee98bc4 100644
      }
  
      float DecodedSound::duration() const
-@@ -706,8 +755,7 @@ namespace dx::audio {
+@@ -706,8 +756,7 @@ namespace dx::audio {
          std::array<float, 1024> im {};
          size_t frames = pcm.frames();
          for (size_t i = 0; i < 1024; i++) {
@@ -234,7 +240,7 @@ index 4e79963..ee98bc4 100644
              re[i] = clamped * (1.0f / 32768.0f) * (static_cast<float>(i) / 1024.0f);
          }
          fft(re, im);
-@@ -779,6 +827,9 @@ namespace dx::audio {
+@@ -779,6 +828,9 @@ namespace dx::audio {
          for (size_t i = 0; i < result->samples.size(); i++) {
              result->fixed[i] = static_cast<int16_t>(std::clamp(std::nearbyint(result->samples[i] * 32768.0f), -32768.0f, 32767.0f));
          }
@@ -244,7 +250,7 @@ index 4e79963..ee98bc4 100644
          return result;
      }
  
-@@ -792,7 +843,34 @@ namespace dx::audio {
+@@ -792,7 +844,34 @@ namespace dx::audio {
          if (it != s.sounds.end()) {
              return it->second;
          }
@@ -279,7 +285,7 @@ index 4e79963..ee98bc4 100644
          s.sounds.emplace(sound, result);
          if (result) {
              sound->duration = result->duration();
-@@ -971,6 +1049,22 @@ namespace dx::audio {
+@@ -971,6 +1050,22 @@ namespace dx::audio {
              return true;
          }
          readSettings(s);
@@ -302,7 +308,7 @@ index 4e79963..ee98bc4 100644
          ma_device_config config = ma_device_config_init(ma_device_type_playback);
          config.playback.format = ma_format_f32;
          config.playback.channels = 2;
-@@ -1001,6 +1095,7 @@ namespace dx::audio {
+@@ -1001,6 +1096,7 @@ namespace dx::audio {
          s.active = true;
          s.offline = false;
          return true;
@@ -310,7 +316,7 @@ index 4e79963..ee98bc4 100644
      }
  
      bool initializeOffline(uint32_t sampleRate)
-@@ -1011,6 +1106,7 @@ namespace dx::audio {
+@@ -1011,6 +1107,7 @@ namespace dx::audio {
          }
          readSettings(s);
          s.sounds.clear();
@@ -318,7 +324,7 @@ index 4e79963..ee98bc4 100644
          s.modules.clear();
          s.rate = sampleRate;
          s.active = true;
-@@ -1025,11 +1121,18 @@ namespace dx::audio {
+@@ -1025,11 +1122,18 @@ namespace dx::audio {
              return;
          }
          if (!s.offline) {
@@ -337,7 +343,7 @@ index 4e79963..ee98bc4 100644
          }
          s.active = false;
          s.offline = false;
-@@ -1051,6 +1154,7 @@ namespace dx::audio {
+@@ -1051,6 +1155,7 @@ namespace dx::audio {
          s.viewer = {};
          s.ear = {};
          s.sounds.clear();
@@ -345,6 +351,14 @@ index 4e79963..ee98bc4 100644
          s.modules.clear();
      }
  
+@@ -1063,6 +1168,7 @@ namespace dx::audio {
+ 
+     void update(const Vector& listenerLocation, const Rotator& listenerRotation, float deltaSeconds)
+     {
++        prof::Scope profScope(prof::Audio);
+         State& s = state();
+         if (!s.active) {
+             return;
 diff --git a/src/core/objects.cc b/src/core/objects.cc
 index d5f4d4a..948f3a8 100644
 --- a/src/core/objects.cc
@@ -421,6 +435,198 @@ index 8c72219..705595c 100644
          void syncObjectProperties(UObject* object);
          UClass* classClass();
          UClass* objectClass();
+diff --git a/src/core/prof.cc b/src/core/prof.cc
+new file mode 100644
+index 0000000..7412e2c
+--- /dev/null
++++ b/src/core/prof.cc
+@@ -0,0 +1,80 @@
++#include "core/prof.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++
++#ifdef __vita__
++#include <psp2/kernel/processmgr.h>
++#else
++#include <chrono>
++#endif
++
++namespace dx::prof {
++    namespace {
++        const char* const names[Count] = {
++            "other", "game (rest)", "drawing (rest)", "actor ticks", "physics", "movement", "scripts", "AI", "audio", "menus/UI",
++            "visibility", "sky", "level", "meshes", "mesh lights", "sprites", "translucent", "HUD/canvas", "GL calls",
++        };
++    }
++
++    bool enabled()
++    {
++#ifdef __vita__
++        return true;
++#else
++        static const bool on = std::getenv("DX_PROF") != nullptr;
++        return on;
++#endif
++    }
++
++    uint64_t nowMicros()
++    {
++#ifdef __vita__
++        return sceKernelGetProcessTimeWide();
++#else
++        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++#endif
++    }
++
++    State& state()
++    {
++        static State s;
++        return s;
++    }
++
++    std::string report(uint32_t frames)
++    {
++        State& s = state();
++        uint64_t t = nowMicros();
++        s.total[s.current] += t - s.stamp;
++        s.stamp = t;
++        if (frames == 0) {
++            frames = 1;
++        }
++        int order[Count];
++        for (int i = 0; i < Count; i++) {
++            order[i] = i;
++        }
++        std::sort(order, order + Count, [&](int a, int b) { return s.total[a] > s.total[b]; });
++        std::string line = "time per frame:";
++        for (int i = 0; i < Count; i++) {
++            int section = order[i];
++            double ms = static_cast<double>(s.total[section]) / 1000.0 / frames;
++            if (ms < 0.5) {
++                break;
++            }
++            char item[96];
++            std::snprintf(item, sizeof(item), " %s %.1f ms (%u),", names[section], ms, static_cast<unsigned>(s.calls[section] / frames));
++            line += item;
++        }
++        if (line.back() == ',') {
++            line.pop_back();
++        }
++        for (int i = 0; i < Count; i++) {
++            s.total[i] = 0;
++            s.calls[i] = 0;
++        }
++        return line;
++    }
++}
+diff --git a/src/core/prof.h b/src/core/prof.h
+new file mode 100644
+index 0000000..f8f3c0b
+--- /dev/null
++++ b/src/core/prof.h
+@@ -0,0 +1,82 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++// Coarse frame-time breakdown for slow targets (PS Vita). Each Scope charges
++// the time spent inside it, minus nested scopes, to its section. On by
++// default on the Vita; DX_PROF=1 turns it on elsewhere.
++namespace dx::prof {
++    enum Section : uint8_t {
++        Other,
++        GameOther,
++        DrawOther,
++        TickActors,
++        Physics,
++        Movement,
++        Script,
++        AI,
++        Audio,
++        UI,
++        Visibility,
++        Sky,
++        Level,
++        Meshes,
++        MeshLights,
++        Sprites,
++        Translucent,
++        Canvas,
++        GLCalls,
++        Count
++    };
++
++    bool enabled();
++    uint64_t nowMicros();
++
++    struct State {
++        Section current = Other;
++        uint64_t stamp = 0;
++        uint64_t total[Count] {};
++        uint32_t calls[Count] {};
++    };
++    State& state();
++
++    class Scope {
++    public:
++        explicit Scope(Section section)
++        {
++            if (!enabled()) {
++                active = false;
++                return;
++            }
++            State& s = state();
++            uint64_t t = nowMicros();
++            s.total[s.current] += t - s.stamp;
++            s.stamp = t;
++            previous = s.current;
++            s.current = section;
++            s.calls[section]++;
++        }
++        ~Scope()
++        {
++            if (!active) {
++                return;
++            }
++            State& s = state();
++            uint64_t t = nowMicros();
++            s.total[s.current] += t - s.stamp;
++            s.stamp = t;
++            s.current = previous;
++        }
++        Scope(const Scope&) = delete;
++        Scope& operator=(const Scope&) = delete;
++
++    private:
++        bool active = true;
++        Section previous = Other;
++    };
++
++    // Per-frame averages of the busiest sections since the last report, as
++    // one line; resets the counters.
++    std::string report(uint32_t frames);
++}
+diff --git a/src/core/vm.cc b/src/core/vm.cc
+index e2ea8de..6c2fbb3 100644
+--- a/src/core/vm.cc
++++ b/src/core/vm.cc
+@@ -1,4 +1,5 @@
+ #include "core/vm.h"
++#include "core/prof.h"
+ 
+ #include "core/objects.h"
+ 
+@@ -977,6 +978,7 @@ namespace dx {
+                 callNative(stack, context, function, function->native, result);
+                 return;
+             }
++            prof::Scope profScope(prof::Script);
+             objects::ensureLoaded(function);
+             function->link();
+ 
 diff --git a/src/deusex/menus.cc b/src/deusex/menus.cc
 index adc3df3..6116255 100644
 --- a/src/deusex/menus.cc
@@ -433,6 +639,42 @@ index adc3df3..6116255 100644
              bool raw = tile->format() == 5;
              std::vector<uint8_t> rgba = raw ? std::vector<uint8_t>() : tile->rgba(0);
              int tileWidth = static_cast<int>(tile->width());
+diff --git a/src/engine/ai.cc b/src/engine/ai.cc
+index a032e86..7bcd899 100644
+--- a/src/engine/ai.cc
++++ b/src/engine/ai.cc
+@@ -1,4 +1,5 @@
+ #include "engine/ai.h"
++#include "core/prof.h"
+ 
+ #include "core/objects.h"
+ #include "core/package_writer.h"
+@@ -1307,6 +1308,7 @@ namespace dx {
+ 
+     void World::aiEvents()
+     {
++        prof::Scope profScope(prof::AI);
+         UEventManager* manager = levelInfo ? cast<UEventManager>(levelinfo::EventManager(levelInfo)) : nullptr;
+         if (manager) {
+             manager->tick();
+diff --git a/src/engine/collision.cc b/src/engine/collision.cc
+index 4a62583..610a690 100644
+--- a/src/engine/collision.cc
++++ b/src/engine/collision.cc
+@@ -1,4 +1,5 @@
+ #include "core/objects.h"
++#include "core/prof.h"
+ #include "core/vm.h"
+ #include "engine/actor.h"
+ #include "engine/resources.h"
+@@ -1073,6 +1074,7 @@ namespace dx {
+ 
+     bool World::moveActor(UObject* a, const Vector& delta, const Rotator& rotation, CheckResult& hit, bool test, bool ignorePawns, bool ignoreBases, bool noFail)
+     {
++        prof::Scope profScope(prof::Movement);
+         if (!a || a->destroyed || actor::bStatic(a) || !actor::bMovable(a)) {
+             return false;
+         }
 diff --git a/src/engine/package.cc b/src/engine/package.cc
 index 2291142..1a93682 100644
 --- a/src/engine/package.cc
@@ -559,6 +801,24 @@ index 653cdc6..8082944 100644
          uint16_t fileVersion = 0;
          uint16_t licenseeMode = 0;
          std::vector<NameEntry> nameTable;
+diff --git a/src/engine/physics.cc b/src/engine/physics.cc
+index d3b089c..211bf5a 100644
+--- a/src/engine/physics.cc
++++ b/src/engine/physics.cc
+@@ -1,4 +1,5 @@
+ #include "core/objects.h"
++#include "core/prof.h"
+ #include "core/vm.h"
+ #include "engine/actor.h"
+ #include "engine/world.h"
+@@ -1293,6 +1294,7 @@ namespace dx {
+ 
+     void performPhysics(UObject* a, float deltaSeconds)
+     {
++        prof::Scope profScope(prof::Physics);
+         uint8_t physics = actor::Physics(a);
+         if (isPawn(a)) {
+             switch (physics) {
 diff --git a/src/engine/reader.cc b/src/engine/reader.cc
 index 3ff5cf2..b5420c4 100644
 --- a/src/engine/reader.cc
@@ -925,10 +1185,16 @@ index 35522e3..b3e2e3e 100644
                  for (const TextureMip& mip : texture->mips) {
                      size_t skip = out.beginLazyArray(data);
 diff --git a/src/engine/world.cc b/src/engine/world.cc
-index 37f990c..8db1030 100644
+index 37f990c..64e2cec 100644
 --- a/src/engine/world.cc
 +++ b/src/engine/world.cc
-@@ -500,6 +500,8 @@ namespace dx {
+@@ -1,4 +1,5 @@
+ #include "engine/world.h"
++#include "core/prof.h"
+ 
+ #include "audio/audio.h"
+ #include "core/config.h"
+@@ -500,6 +501,8 @@ namespace dx {
          if (const char* name = std::getenv("COMPUTERNAME")) {
              std::snprintf(host, sizeof(host), "%s", name);
          }
@@ -937,6 +1203,14 @@ index 37f990c..8db1030 100644
  #else
          gethostname(host, sizeof(host) - 1);
  #endif
+@@ -1137,6 +1140,7 @@ namespace dx {
+ 
+     bool World::tickActor(UObject* a, float deltaSeconds)
+     {
++        prof::Scope profScope(prof::TickActors);
+         if (!a || a->destroyed) {
+             return true;
+         }
 diff --git a/src/extension/consys.cc b/src/extension/consys.cc
 index 2f57c6e..0ddc37a 100644
 --- a/src/extension/consys.cc
@@ -949,11 +1223,37 @@ index 2f57c6e..0ddc37a 100644
              const std::vector<uint8_t>& bytes = sound->bytes;
              uint32_t header = 0;
              if (!readU32(bytes, 0, header)) {
+diff --git a/src/extension/window.cc b/src/extension/window.cc
+index 590d1aa..bbaa55c 100644
+--- a/src/extension/window.cc
++++ b/src/extension/window.cc
+@@ -1,4 +1,5 @@
+ #include "extension/windows.h"
++#include "core/prof.h"
+ 
+ #include "audio/audio.h"
+ #include "core/config.h"
+@@ -3647,6 +3648,7 @@ namespace dx::extension {
+ 
+     void tick(float deltaSeconds)
+     {
++        prof::Scope profScope(prof::UI);
+         State& s = state();
+         s.time += static_cast<double>(deltaSeconds);
+         if (s.root && !s.root->destroyed) {
 diff --git a/src/game/main.cc b/src/game/main.cc
-index f4ca511..4636475 100644
+index f4ca511..848f904 100644
 --- a/src/game/main.cc
 +++ b/src/game/main.cc
-@@ -15,6 +15,7 @@
+@@ -1,6 +1,7 @@
+ #include "audio/audio.h"
+ #include "core/config.h"
+ #include "core/objects.h"
++#include "core/prof.h"
+ #include "core/url.h"
+ #include "core/vm.h"
+ #include "deusex/deusex.h"
+@@ -15,6 +16,7 @@
  #include "extension/extension.h"
  #include "render/lighting.h"
  #include "render/scene_renderer.h"
@@ -961,7 +1261,7 @@ index f4ca511..4636475 100644
  #ifdef DX_NETWORKING
  #include "net/gns_transport.h"
  #endif
-@@ -22,6 +23,27 @@
+@@ -22,6 +24,27 @@
  #include <SDL.h>
  #include <glad/gl.h>
  
@@ -989,7 +1289,7 @@ index f4ca511..4636475 100644
  #ifndef _WIN32
  #include <sys/select.h>
  #include <unistd.h>
-@@ -1066,13 +1088,16 @@ namespace {
+@@ -1066,13 +1089,16 @@ namespace {
              if (world && world->level) {
                  previousTravelInfo = world->level->travelInfo;
              }
@@ -1006,7 +1306,7 @@ index f4ca511..4636475 100644
              canvasObject = nullptr;
              world = std::make_unique<dx::World>();
              world->netMode = netMode;
-@@ -1174,8 +1199,123 @@ namespace {
+@@ -1174,8 +1200,123 @@ namespace {
              dx::console::key(key, action, 0);
          }
  
@@ -1130,7 +1430,15 @@ index f4ca511..4636475 100644
              SDL_Event event;
              while (SDL_PollEvent(&event)) {
                  switch (event.type) {
-@@ -1432,6 +1572,9 @@ namespace {
+@@ -1287,6 +1428,7 @@ namespace {
+                 }
+                 renderer->drawScene(world->level, world->actors, viewLocation, viewRotation, viewFov, viewActor);
+                 dx::UObject* canvasActor = canvas(width, height);
++                dx::prof::Scope profCanvas(dx::prof::Canvas);
+                 if (player && !player->destroyed) {
+                     dx::vm::Call(player, dx::Name("PreRender")).obj(canvasActor).run();
+                     if (viewActor) {
+@@ -1432,6 +1574,9 @@ namespace {
  
          void step()
          {
@@ -1140,7 +1448,7 @@ index f4ca511..4636475 100644
              processEvents();
              bool gui = dx::extension::wantsMouse();
              if (gui != guiMode) {
-@@ -1439,7 +1582,15 @@ namespace {
+@@ -1439,7 +1584,15 @@ namespace {
                  SDL_SetRelativeMouseMode(gui ? SDL_FALSE : SDL_TRUE);
                  float cursorX = 0;
                  float cursorY = 0;
@@ -1156,17 +1464,30 @@ index f4ca511..4636475 100644
                      int windowWidth = 0;
                      int windowHeight = 0;
                      SDL_GetWindowSize(window, &windowWidth, &windowHeight);
-@@ -1477,6 +1628,9 @@ namespace {
+@@ -1462,6 +1615,7 @@ namespace {
+             dx::deusex::applyVanillaFixes();
+             applyRenderOptions();
+             if (world) {
++                dx::prof::Scope profGame(dx::prof::GameOther);
+                 world->tick(delta);
+             }
+             pollNetwork(delta);
+@@ -1477,7 +1631,13 @@ namespace {
              int width = 0;
              int height = 0;
              SDL_GL_GetDrawableSize(window, &width, &height);
+-            render(width, height);
 +#ifdef __vita__
 +            vita::mark(vita::Mark::TickDone);
 +#endif
-             render(width, height);
++            {
++                dx::prof::Scope profDraw(dx::prof::DrawOther);
++                render(width, height);
++            }
              renderer->applyBrightness(static_cast<float>(std::atof(dx::config::system().get(videoSection(), "Brightness").value_or("0.5").c_str())));
              dx::audio::update(viewLocation, viewRotation, delta);
-@@ -1511,7 +1665,22 @@ namespace {
+             if (!pendingShot.empty()) {
+@@ -1511,7 +1671,25 @@ namespace {
                  }
                  running = false;
              }
@@ -1183,13 +1504,16 @@ index f4ca511..4636475 100644
 +            if (drawReport && ++reportFrames == 150) {
 +                std::printf("draw stats: %u draws, %u texture binds, %u flag changes per frame\n", dx::drawStats.draws / reportFrames, dx::drawStats.textures / reportFrames, dx::drawStats.flags / reportFrames);
 +                dx::drawStats = dx::DrawStats {};
++                if (dx::prof::enabled()) {
++                    std::printf("%s\n", dx::prof::report(reportFrames).c_str());
++                }
 +                reportFrames = 0;
 +            }
 +#endif
              limitFrameRate();
              if (options.fps > 0) {
                  SDL_Delay(static_cast<uint32_t>(1000 / options.fps));
-@@ -1665,6 +1834,37 @@ int main(int argc, char** argv)
+@@ -1665,6 +1843,37 @@ int main(int argc, char** argv)
      if (options.dedicated || options.headless) {
          return runHeadless(options);
      }
@@ -1227,7 +1551,7 @@ index f4ca511..4636475 100644
      if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
          std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
          return 1;
-@@ -1756,4 +1956,5 @@ int main(int argc, char** argv)
+@@ -1756,4 +1965,5 @@ int main(int argc, char** argv)
      SDL_Quit();
      return result;
  #endif
@@ -1235,14 +1559,15 @@ index f4ca511..4636475 100644
  }
 diff --git a/src/game/vita_platform.cc b/src/game/vita_platform.cc
 new file mode 100644
-index 0000000..5760c6a
+index 0000000..d9a7572
 --- /dev/null
 +++ b/src/game/vita_platform.cc
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,202 @@
 +#ifdef __vita__
 +
 +#include "game/vita_platform.h"
 +#include "render/gl_device.h"
++#include "core/prof.h"
 +
 +#include <psp2/ctrl.h>
 +#include <psp2/kernel/processmgr.h>
@@ -1428,6 +1753,7 @@ index 0000000..5760c6a
 +                    dx::drawStats.draws / static_cast<unsigned>(n), dx::drawStats.textures / static_cast<unsigned>(n),
 +                    heap.uordblks / (1024 * 1024), static_cast<unsigned>(vglMemFree(VGL_MEM_VRAM) / (1024 * 1024)), static_cast<unsigned>(vglMemFree(VGL_MEM_RAM) / (1024 * 1024)),
 +                    free.size_user / (1024 * 1024));
++                std::printf("%s\n", dx::prof::report(static_cast<uint32_t>(n)).c_str());
 +                timing = Timing {};
 +                timing.windowStart = t;
 +                dx::drawStats = dx::DrawStats {};
@@ -1811,10 +2137,16 @@ index 60247eb..6f234b1 100644
                  return nullptr;
              }
 diff --git a/src/render/scene_renderer.cc b/src/render/scene_renderer.cc
-index 259a101..47e9abf 100644
+index 259a101..c8d6e9e 100644
 --- a/src/render/scene_renderer.cc
 +++ b/src/render/scene_renderer.cc
-@@ -8,6 +8,7 @@
+@@ -1,4 +1,5 @@
+ #include "render/scene_renderer.h"
++#include "core/prof.h"
+ 
+ #include "core/objects.h"
+ #include "engine/mesh.h"
+@@ -8,6 +9,7 @@
  #include "render/lighting.h"
  
  #include <algorithm>
@@ -1822,7 +2154,7 @@ index 259a101..47e9abf 100644
  #include <bit>
  #include <chrono>
  #include <cmath>
-@@ -43,6 +44,19 @@ namespace dx {
+@@ -43,6 +45,19 @@ namespace dx {
          constexpr uint32_t PF_Unlit = 0x00400000;
          constexpr uint32_t PF_Portal = 0x04000000;
          constexpr uint32_t PF_Mirrored = 0x08000000;
@@ -1842,7 +2174,15 @@ index 259a101..47e9abf 100644
          constexpr int32_t MaxFrameRecursion = 4;
  
          constexpr uint8_t DT_Sprite = 1;
-@@ -586,7 +600,7 @@ namespace dx {
+@@ -508,6 +523,7 @@ namespace dx {
+ 
+     void SceneRenderer::occludeView(View& view, const std::vector<ScreenSpan>* open)
+     {
++        prof::Scope profScope(prof::Visibility);
+         std::shared_ptr<ViewVisibility> visibility = std::make_shared<ViewVisibility>();
+         view.visibility = visibility;
+         visibility->mirrorSpans.resize(levelData.mirrors.size());
+@@ -586,7 +602,7 @@ namespace dx {
              bottom = std::clamp(bottom, -1.0f, static_cast<float>(viewportHeight) + 1.0f);
              return spans.rectVisible(static_cast<int32_t>(std::floor(left)) - 1, static_cast<int32_t>(std::floor(top)) - 1, static_cast<int32_t>(std::ceil(right)) + 1, static_cast<int32_t>(std::ceil(bottom)) + 1);
          };
@@ -1851,7 +2191,15 @@ index 259a101..47e9abf 100644
          const std::vector<BspNode>& nodes = model->nodes;
          int32_t sequence = 0;
          Vector clipA[64];
-@@ -1259,7 +1273,7 @@ namespace dx {
+@@ -1241,6 +1257,7 @@ namespace dx {
+ 
+     void SceneRenderer::drawLevelGeometry(const View& view, bool translucentPass)
+     {
++        prof::Scope profScope(prof::Level);
+         if (!levelData.vao) {
+             return;
+         }
+@@ -1259,7 +1276,7 @@ namespace dx {
              });
          }
          bool skyActive = levelData.hasBackdrop;
@@ -1860,7 +2208,47 @@ index 259a101..47e9abf 100644
          if (translucentPass) {
              std::vector<TranslucentSurface>& surfaces = scratchTranslucentSurfaces;
              surfaces.clear();
-@@ -3326,6 +3340,12 @@ namespace dx {
+@@ -1440,6 +1457,7 @@ namespace dx {
+ 
+     void SceneRenderer::drawSky(const View& frame, const std::vector<UObject*>& actors, UObject* viewActor)
+     {
++        prof::Scope profScope(prof::Sky);
+         UObject* skyZone = frameSkyZone(zoneActor(pointZone(frame.location)));
+         if (!skyZone) {
+             levelData.hasBackdrop = false;
+@@ -1887,6 +1905,7 @@ namespace dx {
+ 
+     void SceneRenderer::selectActorLights(UObject* actor)
+     {
++        prof::Scope profScope(prof::MeshLights);
+         actorLights.clear();
+         actorLightPrepared.clear();
+         actorLightColors.clear();
+@@ -2297,6 +2316,7 @@ namespace dx {
+ 
+     void SceneRenderer::flushTranslucent(const View& view)
+     {
++        prof::Scope profScope(prof::Translucent);
+         applyView(view);
+         std::vector<size_t> order(translucentCount);
+         for (size_t i = 0; i < translucentCount; i++) {
+@@ -2510,6 +2530,7 @@ namespace dx {
+ 
+     void SceneRenderer::drawMeshWith(UObject* actor, UObject* lightActor, UMesh* mesh, UObject* animSource, const MeshTransform& transform, const View& view, std::vector<Vector>* worldOut)
+     {
++        prof::Scope profScope(prof::Meshes);
+         MeshAnimState animState;
+         animState.sequence = actor::AnimSequence(animSource);
+         animState.frame = actor::AnimFrame(animSource);
+@@ -2795,6 +2816,7 @@ namespace dx {
+ 
+     void SceneRenderer::drawSprite(UObject* actor, const View& view)
+     {
++        prof::Scope profScope(prof::Sprites);
+         UTexture* texture = asTexture(actor::Texture(actor));
+         if (!texture) {
+             return;
+@@ -3326,6 +3348,12 @@ namespace dx {
          occlusionBoxes.clear();
          occlusionIssued.clear();
          occlusionUnconfirmed.clear();
@@ -1873,7 +2261,7 @@ index 259a101..47e9abf 100644
          size_t kept = 0;
          for (UObject* actor : candidates) {
              bool keep = true;
-@@ -3541,7 +3561,7 @@ namespace dx {
+@@ -3541,7 +3569,7 @@ namespace dx {
              device->setDepthWrite(true);
              device->clear(false, true, 1.0f);
          }
@@ -2055,10 +2443,10 @@ index e839bb5..9d65bc3 100644
          std::unordered_map<UTexture*, GLTextureInfo> maskedTextures;
 diff --git a/src/render/vita_shader.cc b/src/render/vita_shader.cc
 new file mode 100644
-index 0000000..c705539
+index 0000000..541fa99
 --- /dev/null
 +++ b/src/render/vita_shader.cc
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,551 @@
 +// PS Vita version of UberShader (render/gl_shader.h).
 +//
 +// The PC build draws everything with one GLSL program that tests uFlags for
@@ -2074,6 +2462,7 @@ index 0000000..c705539
 +#ifdef __vita__
 +
 +#include "render/gl_shader.h"
++#include "core/prof.h"
 +
 +#include <glad/gl.h>
 +
@@ -2509,12 +2898,14 @@ index 0000000..c705539
 +
 +    void UberShader::bindTexture(uint32_t texture)
 +    {
++        prof::Scope profScope(prof::GLCalls);
 +        glActiveTexture(GL_TEXTURE0);
 +        glBindTexture(GL_TEXTURE_2D, texture);
 +    }
 +
 +    void UberShader::bindLightmap(uint32_t texture)
 +    {
++        prof::Scope profScope(prof::GLCalls);
 +        glActiveTexture(GL_TEXTURE1);
 +        glBindTexture(GL_TEXTURE_2D, texture);
 +        glActiveTexture(GL_TEXTURE0);
@@ -2524,6 +2915,7 @@ index 0000000..c705539
 +    // draw reads into GPU memory of its own for that frame.
 +    void UberShader::draw(const std::vector<GLVertex>& vertices, uint32_t primitive)
 +    {
++        prof::Scope profScope(prof::GLCalls);
 +        if (vertices.empty()) {
 +            return;
 +        }
@@ -2541,6 +2933,7 @@ index 0000000..c705539
 +    // while the GPU may still read the old contents).
 +    void UberShader::upload(const std::vector<GLVertex>& vertices)
 +    {
++        prof::Scope profScope(prof::GLCalls);
 +        glBindBuffer(GL_ARRAY_BUFFER, uploadBuffer);
 +        boundBuffer = uploadBuffer;
 +        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(GLVertex)), vertices.data(), GL_DYNAMIC_DRAW);
@@ -2548,6 +2941,7 @@ index 0000000..c705539
 +
 +    void UberShader::drawRange(int32_t first, int32_t count)
 +    {
++        prof::Scope profScope(prof::GLCalls);
 +        apply();
 +        glBindBuffer(GL_ARRAY_BUFFER, uploadBuffer);
 +        boundBuffer = uploadBuffer;
@@ -2573,6 +2967,7 @@ index 0000000..c705539
 +
 +    void UberShader::drawStatic(uint32_t geometry, int32_t first, int32_t count)
 +    {
++        prof::Scope profScope(prof::GLCalls);
 +        apply();
 +        if (boundBuffer != geometry) {
 +            bindStatic(geometry);
@@ -2584,6 +2979,7 @@ index 0000000..c705539
 +
 +    void UberShader::drawStaticRanges(uint32_t geometry, const int32_t* firsts, const int32_t* counts, int32_t ranges)
 +    {
++        prof::Scope profScope(prof::GLCalls);
 +        apply();
 +        bindStatic(geometry);
 +        // Ranges that follow each other in the buffer go out as one draw.
