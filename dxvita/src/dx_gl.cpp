@@ -16,7 +16,9 @@
 #include "runtime/guest_str.h"
 #include "runtime/host_clock.h"
 
+extern "C" unsigned long long dyn86_rdtsc_count;   // engine: RDTSC executed
 #include <algorithm>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -26,6 +28,7 @@
 
 #ifdef __vita__
 #include <vitaGL.h>
+#include <psp2/kernel/processmgr.h>
 #else
 #define GL_GLEXT_PROTOTYPES 1
 #include <GL/osmesa.h>
@@ -53,6 +56,17 @@ uint64_t* gl_counter(const char* name) {
 }
 #define GLCOUNT(n) do { if (g_stats) { static uint64_t* _c = gl_counter(n); ++*_c; } } while (0)
 
+// Wall time spent inside each GL shim (stats only): says whether the game's
+// own code or the GL layer under it eats the frame.
+std::map<std::string, uint64_t>* g_times = nullptr;
+uint64_t* gl_time_slot(const char* name) {
+    if (!g_times) g_times = new std::map<std::string, uint64_t>();
+    return &(*g_times)[name];
+}
+
+uint64_t g_rdtsc_last = 0;
+double g_rdtsc_cost_us = -1;   // measured once: one clock read, as RDTSC does it
+
 void gl_missing(const char* name) {
     static std::map<std::string, int> seen;
     if (seen[name]++ == 0) log("[not-bound] [cause: GL entry point not on this platform] %s", name);
@@ -73,11 +87,15 @@ void batch_flush();
 void reg(const char* name, uint32_t words, uint32_t (*fn)(Cpu&, const uint32_t*), bool flush) {
     Shim s; s.argc = words; s.stdcall_cleanup = true;
     s.tag = std::string("OPENGL32.dll!") + name;
-    s.fn = [fn, words, flush](Cpu& c) -> uint32_t {
+    uint64_t* tus = gl_time_slot(name);
+    s.fn = [fn, words, flush, tus](Cpu& c) -> uint32_t {
         static const uint32_t zero[16] = {};
+        const uint64_t t0 = g_stats ? wx86_now_us() : 0;
         if (flush && g_bn) batch_flush();
         const uint32_t* A = words ? (const uint32_t*)c.hostptr(c.reg(d2rt::R_ESP) + 4, 4 * words) : zero;
-        return fn(c, A ? A : zero);
+        const uint32_t r = fn(c, A ? A : zero);
+        if (g_stats) *tus += wx86_now_us() - t0;
+        return r;
     };
     g_glbr->register_shim("OPENGL32.dll", name, s);
 }
@@ -302,6 +320,31 @@ void stats_line() {
     if (g_swap_us || g_frame_us)
         log("[not-bound] GL frame: %.2f ms game+GL calls, %.2f ms in vglSwapBuffers (GPU wait + vblank)",
             g_frame_us / 300.0 / 1000.0, g_swap_us / 300.0 / 1000.0);
+    if (g_times) {
+        std::vector<std::pair<uint64_t, std::string>> tv; uint64_t tt = 0;
+        for (auto& kv : *g_times) if (kv.second) { tv.push_back({ kv.second, kv.first }); tt += kv.second; }
+        std::sort(tv.rbegin(), tv.rend());
+        std::string ts;
+        for (size_t i = 0; i < tv.size() && i < 10; ++i) { char b[80]; std::snprintf(b, sizeof b, " %s=%.2f", tv[i].second.c_str(), tv[i].first / 300.0 / 1000.0); ts += b; }
+        log("[not-bound] GL time per frame inside the GL layer: %.2f ms total,%s (ms)", tt / 300.0 / 1000.0, ts.c_str());
+        for (auto& kv : *g_times) kv.second = 0;
+    }
+    {
+        if (g_rdtsc_cost_us < 0) {
+            struct timespec ts; const uint64_t t0 = wx86_now_us();
+#ifdef __vita__
+            (void)ts; for (int i = 0; i < 1000; ++i) (void)sceKernelGetProcessTimeWide();   // what RDTSC now does
+#else
+            for (int i = 0; i < 1000; ++i) clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+            g_rdtsc_cost_us = (wx86_now_us() - t0) / 1000.0;
+        }
+        const uint64_t n = dyn86_rdtsc_count - g_rdtsc_last; g_rdtsc_last = dyn86_rdtsc_count;
+        uint32_t gts = 0xFFFFFFFFu;
+        if (g_bcpu && g_glbr) if (d2rt::PeImage* core = g_glbr->module("Core.dll")) if (uint32_t va = core->export_va("GTimestamp")) gts = g_bcpu->read_u32(va);
+        log("[not-bound] RDTSC: %llu per frame, clock read %.2f us each (%.2f ms per frame before dynarec overhead); GTimestamp=%d",
+            (unsigned long long)(n / 300), g_rdtsc_cost_us, n / 300.0 * g_rdtsc_cost_us / 1000.0, (int)gts);
+    }
     if (g_tex_texels)
         log("[not-bound] GL textures: %llu texels uploaded per frame, %.2f ms per frame inside the upload calls",
             (unsigned long long)(g_tex_texels / 300), g_tex_us / 300.0 / 1000.0);
@@ -314,7 +357,22 @@ void stats_line() {
     for (auto& kv : *g_counts) kv.second = 0;
 }
 
+// Unreal's stat clocks (clock()/unclock() around every polygon and most
+// engine work) read the TSC when GTimestamp is set: ~17,000 RDTSC a frame in
+// game, each one a call out of translated code. Nothing reads those stats
+// here, so GTimestamp is held at 0 (DX_TIMESTAMP=1 keeps the game's value).
+// The game clock (appSeconds) reads the TSC directly and is not affected.
+void hold_timestamp(Cpu& c) {
+    static const bool keep = std::getenv("DX_TIMESTAMP") && std::atoi(std::getenv("DX_TIMESTAMP")) != 0;
+    static uint32_t va = 0; static bool looked = false;
+    if (keep) return;
+    if (!looked) { looked = true; if (d2rt::PeImage* core = g_glbr->module("Core.dll")) va = core->export_va("GTimestamp"); }
+    if (va && c.read_u32(va)) c.write_u32(va, 0);
+}
+
 uint32_t swap(Cpu& c) {
+    g_bcpu = &c;
+    hold_timestamp(c);
     batch_flush();
     ++g_swaps;
 #ifdef __vita__

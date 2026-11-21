@@ -2,6 +2,9 @@
  * Box86 is (c) ptitSeb, MIT license — see third_party/box86-dynarec/LICENSE
  * Provides the minimal runtime surface the extracted dynarec links against.
  */
+#ifdef __vita__
+#include <psp2/kernel/processmgr.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -138,9 +141,17 @@ void my_cpuid(x86emu_t* emu, uint32_t tmp32u)
         emu->regs[_CX].dword[0], emu->regs[_DX].dword[0]);
 }
 
+unsigned long long dyn86_rdtsc_count = 0;   /* RDTSC executed (diagnostic) */
 uint64_t ReadTSC(x86emu_t* emu)
 {
     (void)emu;
+    ++dyn86_rdtsc_count;
+#ifdef __vita__
+    /* Unreal reads the TSC ~17,000 times a frame in game (stat clocks around
+     * every polygon). newlib's clock_gettime goes through the RTC service;
+     * the process timer is a single cheap kernel read. Units stay ns. */
+    return (uint64_t)sceKernelGetProcessTimeWide() * 1000ULL;
+#endif
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
