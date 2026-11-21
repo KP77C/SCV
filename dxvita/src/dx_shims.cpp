@@ -4,6 +4,7 @@
 
 #include "runtime/guest_scratch.h"
 #include "runtime/guest_str.h"
+#include "runtime/host_clock.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -131,6 +132,7 @@ void install_dx(d2rt::Bridge& br) {
     R(br, "ADVAPI32.dll", "RegOpenKeyExW", 5, [](Cpu&) { return 2u; });
     R(br, "ADVAPI32.dll", "RegSetValueExW", 6, [](Cpu&) { return 2u; });
     R(br, "ADVAPI32.dll", "RegQueryValueExW", 6, [](Cpu&) { return 2u; });
+    R(br, "USER32.dll", "GetMessageTime", 0, [](Cpu&) { return (uint32_t)wx86_now_ms(); });
     // The startup splash runs on its own thread with a modeless dialog: no
     // dialog here, the thread just waits for the quit message.
     R(br, "USER32.dll", "CreateDialogParamA", 5, [](Cpu&) { return g_next_gdi += 4; });

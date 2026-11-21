@@ -561,6 +561,16 @@ void install_kernel32(d2rt::Bridge& br) {
     K(br, "SetUnhandledExceptionFilter", 1, [](Cpu&) { return 0u; });
     K(br, "OutputDebugStringA", 1, [](Cpu& c) { log("[not-bound] guest debug: %s", gstr(c, c.arg(0)).c_str()); return 0u; });
     K(br, "RaiseException", 4, [](Cpu& c) -> uint32_t {
+        // Floating-point status exceptions (0xC000008D..0xC0000093) raised by
+        // msvcrt's math routines (pow in Render.dll's tables): treated as
+        // masked, which is what the game's FPU setup asks for on Windows.
+        // msvcrt then keeps its default result. Counted, not logged: the
+        // software renderer raises them thousands of times per frame.
+        if (c.arg(0) >= 0xC000008Du && c.arg(0) <= 0xC0000093u) {
+            static uint64_t n = 0;
+            if ((n++ & (n - 1)) == 0) log("[not-bound] FP exception 0x%08x treated as masked (%llu so far)", c.arg(0), (unsigned long long)n);
+            return 0;
+        }
         log("[not-bound] [cause: guest exception] RaiseException(0x%08x) at ra=0x%08x — not dispatched yet",
             c.arg(0), c.trap_retaddr());
         {   // where from: return addresses into loaded modules on the guest stack
