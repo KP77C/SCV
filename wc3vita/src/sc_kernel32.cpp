@@ -460,6 +460,24 @@ static uint32_t read_chunked(Cpu& c, uint32_t buf, uint32_t n, F&& rd) {
     return done;
 }
 
+// Return addresses into loaded modules found on the guest stack, as
+// " module+0xoffset ..." (for error logs: who called).
+std::string guest_stack(Cpu& c) {
+    const uint32_t E = c.reg(d2rt::R_ESP);
+    std::string chain;
+    for (uint32_t k = 0; k < 96 && chain.size() < 400; ++k) {
+        uint32_t v = c.read_u32(E + 4 * k);
+        auto it = g_modbase.upper_bound(v);
+        if (it == g_modbase.begin()) continue;
+        --it;
+        d2rt::PeImage* m = g_br->module(it->second);
+        if (m && v < it->first + m->image_size()) {
+            char b[64]; std::snprintf(b, sizeof b, " %s+0x%x", it->second.c_str(), v - it->first); chain += b;
+        }
+    }
+    return chain;
+}
+
 void install_kernel32(d2rt::Bridge& br) {
     // ---- process / module -------------------------------------------------
     // WarCraft III 1.27a (MSVCR120) needs Windows XP or later: report
@@ -602,21 +620,7 @@ void install_kernel32(d2rt::Bridge& br) {
         }
         log("[not-bound] [cause: guest exception] RaiseException(0x%08x) at ra=0x%08x — not dispatched yet",
             c.arg(0), c.trap_retaddr());
-        {   // where from: return addresses into loaded modules on the guest stack
-            const uint32_t E = c.reg(d2rt::R_ESP);
-            std::string chain;
-            for (uint32_t k = 0; k < 96 && chain.size() < 400; ++k) {
-                uint32_t v = c.read_u32(E + 4 * k);
-                auto it = g_modbase.upper_bound(v);
-                if (it == g_modbase.begin()) continue;
-                --it;
-                d2rt::PeImage* m = g_br->module(it->second);
-                if (m && v < it->first + m->image_size()) {
-                    char b[64]; std::snprintf(b, sizeof b, " %s+0x%x", it->second.c_str(), v - it->first); chain += b;
-                }
-            }
-            log("[not-bound]   stack:%s", chain.c_str());
-        }
+        log("[not-bound]   stack:%s", guest_stack(c).c_str());   // where from
         // Unreal's appErrorf keeps the message (and the guard call history)
         // in Core's GErrorHist (UTF-16) before it throws: log it.
         if (d2rt::PeImage* core = g_br->module("Core.dll"))
@@ -727,6 +731,7 @@ void install_kernel32(d2rt::Bridge& br) {
         uint32_t flags = c.arg(0), id = c.arg(2), buf = c.arg(4), cap = c.arg(5);
         std::string m = "Error " + std::to_string(id) + "\r\n";
         log("[not-bound] [cause: guest error report] FormatMessageA(flags=0x%x, id=0x%08x) ra=0x%08x", flags, id, c.trap_retaddr());
+        if (id != 2 && id != 3) log("[not-bound]   stack:%s", guest_stack(c).c_str());   // not "file/path not found": who reported it
         if (flags & 0x100) {   // FORMAT_MESSAGE_ALLOCATE_BUFFER
             uint32_t p = wx86_scratch_put_cstr(c, m.c_str());
             c.write_u32(buf, p); return (uint32_t)m.size();
@@ -778,6 +783,10 @@ void install_kernel32(d2rt::Bridge& br) {
         wx86_files()[h] = f; wx86_file_paths()[h] = host; wx86_file_pos()[h] = WxFPos{};
         wx86_set_lasterr(c, exists && (disp == 2 || disp == 4) ? ERROR_ALREADY_EXISTS : 0);
         if (std::getenv("SC_TRACE_FILES")) log("[not-bound] CreateFileA(%s) -> 0x%x", guest.c_str(), h);
+        else {   // the first opens, always: which loose files the game reads, and their sizes
+            static int opens = 0;
+            if (opens++ < 600) log("[not-bound] open %s (%ld bytes, %s)", guest.c_str(), exists ? (long)st.st_size : 0L, mode);
+        }
         return h;
     });
     K(br, "ReadFile", 5, [](Cpu& c) -> uint32_t {

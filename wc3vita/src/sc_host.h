@@ -73,6 +73,7 @@ void install_dx(d2rt::Bridge& br);       // Deus Ex extras (dx_shims.cpp)
 void install_w3(d2rt::Bridge& br);       // WarCraft III extras (w3_shims.cpp)
 void install_dshow(d2rt::Bridge& br);    // stand-in DirectShow graph (w3_dshow.cpp)
 void set_default_window_size(int w, int h);   // CW_USEDEFAULT window size (sc_user32.cpp)
+std::string guest_stack(d2rt::Cpu& c);       // " module+0xoff ..." return addresses on the guest stack
 void gl_render_size(uint32_t* w, uint32_t* h); // the size the game renders at (w3_gl.cpp, W3_RES)
 void install_net(d2rt::Bridge& br);      // offline Winsock (w3_net.cpp)
 void install_gl(d2rt::Bridge& br);       // OPENGL32 + pixel formats (w3_gl.cpp)

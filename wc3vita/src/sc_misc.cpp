@@ -382,6 +382,7 @@ void install_misc(d2rt::Bridge& br) {
     R(br, "USER32.dll", "MessageBoxA", 4, [](Cpu& c) {
         log("[not-bound] [cause: guest error dialog] MessageBoxA \"%s\": %s",
             gstr(c, c.arg(2)).c_str(), gstr(c, c.arg(1)).c_str());
+        log("[not-bound]   stack:%s", guest_stack(c).c_str());
         return 1u;   // IDOK
     });
     R(br, "USER32.dll", "DialogBoxParamA", 5, [](Cpu& c) {

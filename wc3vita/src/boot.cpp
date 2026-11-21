@@ -41,6 +41,8 @@
 #include <cstring>
 #include <dirent.h>
 #include <set>
+#include <algorithm>
+#include <vector>
 #include <functional>
 #include <cctype>
 #include <sys/stat.h>
@@ -333,6 +335,22 @@ int main(int argc, char** argv) {
     if (argc > 2) g_max_unshimmed = std::atoi(argv[2]);
 #endif
 
+    // The game's archives, with their sizes: a short or damaged copy (a
+    // transfer cut off part way) shows up here before it shows up as an error.
+    if (DIR* d = opendir(g_root.c_str())) {
+        static const struct { const char* name; long size; } kKnown[] = {   // 1.27a (1.27.0.52240)
+            { "war3.mpq", 562311708 }, { "war3x.mpq", 375558620 }, { "war3xlocal.mpq", 44795849 }, { "war3patch.mpq", 27514828 } };
+        while (dirent* e = readdir(d)) {
+            std::string n = e->d_name, l = n; for (auto& ch : l) ch = (char)std::tolower((unsigned char)ch);
+            if (l.size() < 4 || l.compare(l.size() - 4, 4, ".mpq") != 0) continue;
+            struct stat st{}; if (stat((g_root + "/" + n).c_str(), &st) != 0) continue;
+            const char* note = "";
+            for (auto& k : kKnown) if (l == k.name) note = (long)st.st_size == k.size ? " (matches 1.27a)" : " [cause: size differs from 1.27a]";
+            log("[not-bound] archive %s: %ld bytes%s", n.c_str(), (long)st.st_size, note);
+        }
+        closedir(d);
+    }
+
     // The engine reads its layout from the environment (lazily, before the
     // CPU and bridge exist). Set it here so no launcher has to.
     {
@@ -406,6 +424,45 @@ int main(int argc, char** argv) {
     win32_shims_psapi_install(br);
     Wx86MemoryPlan plan; plan.heap = &g_heap; plan.va = &g_va; plan.vquery = &vquery;
     win32_shims_memory_install(br, plan);
+    // Memory diagnostics, always on: refused or suspicious VirtualAlloc
+    // requests (with who asked), big ones, and each 16 MiB step of arena use.
+    // Vita build 1 quit with Storm "error 8" (out of memory) during startup.
+    wx86_mem_set_observer([](const WxMemEvent& e) {
+        static uint32_t big = 0, step = 0;
+        const uint32_t used = g_va.cur();
+        switch (e.kind) {
+        case WX86_MEM_VA_FAIL: case WX86_MEM_VA_GARBAGE:
+            log("[RAM-bound] [cause: %s] VirtualAlloc(0x%08x, %u KiB, type 0x%x) ra=0x%08x; VA used %u/%u KiB (peak %u)",
+                e.kind == WX86_MEM_VA_FAIL ? "VA arena refused" : "garbage size", e.addr, e.size >> 10, e.type, e.ra,
+                used >> 10, kVaSize >> 10, g_va.peak() >> 10);
+            if (e.cpu) log("[RAM-bound]   stack:%s", sc::guest_stack(*e.cpu).c_str());
+            if (e.kind == WX86_MEM_VA_FAIL) {   // full, or fragmented? and who holds it
+                static int dumps = 0;
+                if (dumps++ < 2) {
+                    std::vector<std::pair<uint32_t, uint32_t>> v;
+                    for (auto& b : g_va.used_map()) v.push_back({ b.second, b.first });
+                    std::sort(v.rbegin(), v.rend());
+                    std::string top;
+                    for (size_t i = 0; i < v.size() && i < 12; ++i) {
+                        char t[48]; std::snprintf(t, sizeof t, " %uK@%08x", v[i].first >> 10, v[i].second); top += t;
+                    }
+                    log("[RAM-bound]   largest free hole %u KiB; %u blocks; biggest:%s", g_va.largest_free() >> 10, (unsigned)v.size(), top.c_str());
+                }
+            }
+            break;
+        case WX86_MEM_VA_BIG:
+            if (e.size >= 0x00800000u || big < 24) {
+                ++big;
+                log("[not-bound] VirtualAlloc big: %u KiB type 0x%x ra=0x%08x (VA used %u KiB)", e.size >> 10, e.type, e.ra, used >> 10);
+            }
+            break;
+        case WX86_MEM_VA_RELEASE_MISS:
+            log("[RAM-bound] [cause: VirtualFree missed] 0x%08x ra=0x%08x", e.addr, e.ra);
+            break;
+        default: break;
+        }
+        if (used >> 24 > step) { step = used >> 24; log("[not-bound] VA arena use passed %u MiB (of %u)", step * 16, kVaSize >> 20); }
+    });
     win32_shims_advapi32_install(br);
     win32_shims_gdi32_install(br);
     win32_shims_user32_install(br);
