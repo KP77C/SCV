@@ -34,6 +34,10 @@ The ranges are rough (from referenced strings per 64 KB) and will be refined.
 
 For comparison, Republic Commando (deltasquad) counted 12,356 functions / 2.7 MB. The PC build `DX2Main.exe` (2004-02-09, D3D8, no exports) has 30,817 functions / 4.4 MB in Ghidra's first pass.
 
+## Missed functions
+
+`tools/ghidra/FindMissed.java` adds functions at code pointers found in the data sections (105) and at 16-byte aligned starts after `CC`/`90` padding between functions (9,661). Most new ones are small accessors and thunks reached only through vtables: 5,125 are under 16 bytes. After the sweep there are 33,036 functions and 4.76 MB of the 6.04 MB `.text` is inside functions (79%, from 72%). The rest is mostly jump tables, padding and data.
+
 ## Packages
 
 All `.d2u` packages are Unreal package version 95, licensee 69 (Republic Commando is 159). They hold almost no UnrealScript code:
