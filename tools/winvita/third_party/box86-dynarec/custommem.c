@@ -1249,8 +1249,18 @@ int checkInHotPage(uintptr_t addr)
 int dyn86_smc_single(void)
 {
     static int v = -1;
-    if (v < 0) { const char* e = getenv("WX86_SMC_SINGLE"); v = (e && e[0] == '1') ? 1 : 0; }
+    if (v < 0) { const char* e = getenv("WX86_SMC_SINGLE"); v = (e && (e[0] == '1' || e[0] == '2')) ? e[0] - '0' : 0; }
     return v;
+}
+
+int dyn86_smc_stop_after(uintptr_t ip, uintptr_t next)
+{
+    if (dyn86_smc_single() == 2) return 1;
+    for (uintptr_t p = ip; p + 4 <= next; ++p) {
+        uint32_t v; memcpy(&v, (const void*)DYN86_G2H(p), 4);
+        if (v >= 0x10000 && (getProtection(v) & PROT_NEVERCLEAN)) return 1;
+    }
+    return 0;
 }
 
 void dyn86_mark_volatile_code(uintptr_t addr, uintptr_t size)

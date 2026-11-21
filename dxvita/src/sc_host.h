@@ -64,6 +64,9 @@ void install_kernel32(d2rt::Bridge& br);
 void install_misc(d2rt::Bridge& br);
 void install_user32(d2rt::Bridge& br);
 void install_ddraw(d2rt::Bridge& br);
+void install_gl(d2rt::Bridge& br);
+// True when the game draws through OpenGL (DX_RENDER unset or "gl").
+bool present_gl_mode();
 void install_dx(d2rt::Bridge& br);       // Deus Ex extras (dx_shims.cpp)
 
 // Queue a key press (down+up) for the focused window (sc_user32.cpp).

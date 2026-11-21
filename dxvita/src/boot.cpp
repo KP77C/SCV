@@ -53,7 +53,7 @@
 #define SC_VITA_DIR "ux0:data/DeusEx"
 extern "C" {
 // Host newlib heap (box86 metadata has its own pool; guest memory is the arena).
-int _newlib_heap_size_user = 64 * 1024 * 1024;
+int _newlib_heap_size_user = 48 * 1024 * 1024;
 unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
 const char* const wx86_vita_progress_path = SC_VITA_DIR "/dxvita_progress.txt";
 }
@@ -192,26 +192,30 @@ using namespace sc;
 // va + membase), the same layout on the qemu host and the Vita. Deus Ex's
 // DLLs all carry relocations, so every module (DeusEx.exe included) is placed
 // in the module window instead of at its preferred 0x10xxxxxx base.
-// First-boot sizes, generous on purpose; trimmed after measurement.
+// Sizes from the first host runs (Liberty Island peaks: msvcrt heap 14.6 MiB,
+// VirtualAlloc 118 MiB, modules end near 0x01E00000 when loaded at 0x01400000),
+// with headroom, and small enough for the Vita: the arena is one committed
+// block there, next to a 48 MiB host heap and the 16 MiB JIT pool.
 //   0x00000000  page 0 (main TIB)
-//   0x00400000  HeapAlloc            16 MiB (msvcrt's own heap; Unreal allocates with VirtualAlloc)
-//   0x01400000  module window        24 MiB (exe, Core, Engine, renderers ...)
+//   0x00400000  HeapAlloc            24 MiB (msvcrt's own heap; Unreal allocates with VirtualAlloc)
+//   0x01C00000  module window        16 MiB (exe, Core, Engine, renderers ...)
 //   0x02C00000  scratch              8 MiB
-//   0x03400000  VirtualAlloc         176 MiB (Unreal's FMallocWindows pools, loaded packages)
-//   0x0E400000  worker stacks        16 x 1 MiB
-//   0x0F400000  worker TIBs          1 MiB
-//   0x0F500000  main stack           4 MiB
-//   0x0F900000  native-thunk window  1 MiB
-//   0x10000000  end of arena (256 MiB)
-static constexpr uint32_t kHeapBase    = 0x00400000, kHeapSize    = 0x01000000;
-static constexpr uint32_t kModBase     = 0x01400000, kModEnd      = 0x02C00000;
+//   0x03400000  VirtualAlloc         144 MiB (Unreal's FMallocWindows pools, loaded packages)
+//   0x0C400000  worker stacks        8 x 1 MiB
+//   0x0CC00000  worker TIBs          1 MiB
+//   0x0CD00000  main stack           4 MiB
+//   0x0D100000  native-thunk window
+//   0x0D800000  end of arena (216 MiB)
+static constexpr uint32_t kHeapBase    = 0x00400000, kHeapSize    = 0x01800000;
+static constexpr uint32_t kModBase     = 0x01C00000, kModEnd      = 0x02C00000;
 static constexpr uint32_t kScratchBase = 0x02C00000, kScratchSize = 0x00800000;
-static constexpr uint32_t kVaBase      = 0x03400000, kVaSize      = 0x0B000000;
-static constexpr uint32_t kStacks      = 0x0E400000;
-static constexpr uint32_t kTibs        = 0x0F400000;
-static constexpr uint32_t kMainStack   = 0x0F500000, kMainStackSize = 0x00400000;
-static constexpr uint32_t kTrapBase    = 0x0F900000;
-static constexpr uint32_t kArenaEnd    = 0x10000000;
+static constexpr uint32_t kVaBase      = 0x03400000, kVaSize      = 0x09000000;
+static constexpr uint32_t kStacks      = 0x0C400000;
+static constexpr uint32_t kTibs        = 0x0CC00000;
+static constexpr uint32_t kMainStack   = 0x0CD00000, kMainStackSize = 0x00400000;
+static constexpr uint32_t kTrapBase    = 0x0D100000;
+static constexpr uint32_t kArenaEnd    = 0x0D800000;
+static_assert(kVaBase + kVaSize <= kStacks && kMainStack + kMainStackSize <= kTrapBase, "layout overlap");
 
 static wx86::GuestRegion g_heap, g_va;
 void sc::guest_mem(uint32_t* hc, uint32_t* hp, uint32_t* vc, uint32_t* vp) {
@@ -234,19 +238,40 @@ void sc::dump_arena(d2rt::Cpu& c, const std::string& dir) {
 // The port's own settings file, System/DXVita.ini, made once from the game's
 // DeusEx.ini with the port's overrides; the game is started with
 // INI=DXVita.ini, so the PC settings in DeusEx.ini are never touched.
+bool sc::present_gl_mode() {
+#ifdef DX_NO_GL
+    return false;
+#else
+    const char* rs = std::getenv("DX_RENDER");
+    return !(rs && std::strcmp(rs, "soft") == 0);
+#endif
+}
+
 static void make_port_ini() {
+    // Made from DeusEx.ini the first time; after that the game's own saved
+    // settings in DXVita.ini are kept and only the port's overrides are
+    // applied again (so the renderer can be switched with DX_RENDER).
     const std::string out = resolve_path("DXVita.ini");
-    if (FILE* f = std::fopen(out.c_str(), "rb")) { std::fclose(f); return; }
-    std::vector<uint8_t> src = read_file(resolve_path("DeusEx.ini"));
+    std::vector<uint8_t> src = read_file(out);
+    if (src.empty()) src = read_file(resolve_path("DeusEx.ini"));
     if (src.empty()) { log("[not-bound] [cause: file not found] DeusEx.ini"); return; }
+    // DX_RENDER=soft: the software renderer (a 2D picture per frame);
+    // otherwise OpenGL (OSMesa on the host, the Vita GPU through vitaGL).
+    const bool soft = !sc::present_gl_mode();
+    const char* dev = soft ? "SoftDrv.SoftwareRenderDevice" : "OpenGLDrv.OpenGLRenderDevice";
     struct Ov { const char* section; const char* key; const char* value; };
-    static const Ov ov[] = {
-        { "Engine.Engine", "GameRenderDevice", "SoftDrv.SoftwareRenderDevice" },
-        { "Engine.Engine", "WindowedRenderDevice", "SoftDrv.SoftwareRenderDevice" },
-        { "Engine.Engine", "RenderDevice", "SoftDrv.SoftwareRenderDevice" },
+    const Ov ov[] = {
+        { "Engine.Engine", "GameRenderDevice", dev },
+        { "Engine.Engine", "WindowedRenderDevice", dev },
+        { "Engine.Engine", "RenderDevice", dev },
         { "WinDrv.WindowsClient", "StartupFullscreen", "False" },
         { "WinDrv.WindowsClient", "UseDirectDraw", "False" },
-        { "WinDrv.WindowsClient", "WindowedColorBits", "16" },
+        { "WinDrv.WindowsClient", "WindowedColorBits", soft ? "16" : "32" },
+        { "WinDrv.WindowsClient", "WindowedViewportX", "640" },
+        { "WinDrv.WindowsClient", "WindowedViewportY", "480" },
+        // Textures go up as plain RGBA, not as palettes with a lookup table.
+        { "OpenGLDrv.OpenGLRenderDevice", "UsePalette", "0" },
+        { "OpenGLDrv.OpenGLRenderDevice", "ShareLists", "0" },
     };
     std::string text(src.begin(), src.end()), res, section;
     size_t i = 0;
@@ -266,7 +291,7 @@ static void make_port_ini() {
         i = j + 1;
     }
     if (FILE* f = std::fopen(out.c_str(), "wb")) { std::fwrite(res.data(), 1, res.size(), f); std::fclose(f); }
-    log("[not-bound] wrote %s (software renderer, windowed)", out.c_str());
+    log("[not-bound] wrote %s (%s, windowed)", out.c_str(), dev);
 }
 
 static bool vquery(uint32_t a, uint32_t& base, uint32_t& size, uint32_t& state,
@@ -413,6 +438,9 @@ int main(int argc, char** argv) {
     sc::install_user32(br);
     sc::install_ddraw(br);
     sc::install_dx(br);
+#ifndef DX_NO_GL
+    sc::install_gl(br);
+#endif
     {   // DirectSound: the engine's COM emulation, mixed at 22.05 kHz for now.
         static d2rt::dsound::HostOps ops;
         ops.va_alloc = [](uint32_t n) { return g_va.alloc(n); };
