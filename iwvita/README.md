@@ -18,6 +18,7 @@ Milestone 1 (map the code) is in progress. See [docs/findings.md](docs/findings.
 | `tools/upkg.py <pkg>` | Minimal reader for the game's version 95 Unreal packages (`.d2u`) |
 | `tools/xboxkrnl_ordinals.txt` | xboxkrnl export ordinals and names |
 | `tools/ghidra/*.java` | Headless Ghidra scripts |
+| `tools/ghidra.sh <Script.java> [args]` | Runs one script against the saved project (edit the paths in it first) |
 
 ## Ghidra setup
 
