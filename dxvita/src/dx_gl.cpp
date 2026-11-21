@@ -14,6 +14,7 @@
 
 #include "runtime/guest_scratch.h"
 #include "runtime/guest_str.h"
+#include "runtime/host_clock.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -61,17 +62,186 @@ inline float GF(const uint32_t* A, int i) { float f; std::memcpy(&f, &A[i], 4); 
 inline double GD(const uint32_t* A, int i) { uint64_t v = A[i] | ((uint64_t)A[i + 1] << 32); double d; std::memcpy(&d, &v, 8); return d; }
 inline void* GP(Cpu& c, uint32_t va) { return va ? c.hostptr(va, 1) : nullptr; }
 
+uint32_t g_bn = 0;      // vertices waiting in the draw batch (see below)
+void batch_flush();
+
 // Register one OPENGL32 entry point. The shim reads its arguments straight
-// from the guest stack (one host pointer for all of them).
-void G(const char* name, uint32_t words, uint32_t (*fn)(Cpu&, const uint32_t*)) {
+// from the guest stack (one host pointer for all of them). Any GL call can
+// change state the batched draws depend on, so it first sends the batch;
+// only the client-array calls the batcher handles itself skip that (GB).
+void reg(const char* name, uint32_t words, uint32_t (*fn)(Cpu&, const uint32_t*), bool flush) {
     Shim s; s.argc = words; s.stdcall_cleanup = true;
     s.tag = std::string("OPENGL32.dll!") + name;
-    s.fn = [fn, words](Cpu& c) -> uint32_t {
+    s.fn = [fn, words, flush](Cpu& c) -> uint32_t {
         static const uint32_t zero[16] = {};
+        if (flush && g_bn) batch_flush();
         const uint32_t* A = words ? (const uint32_t*)c.hostptr(c.reg(d2rt::R_ESP) + 4, 4 * words) : zero;
         return fn(c, A ? A : zero);
     };
     g_glbr->register_shim("OPENGL32.dll", name, s);
+}
+void G(const char* name, uint32_t words, uint32_t (*fn)(Cpu&, const uint32_t*)) { reg(name, words, fn, true); }
+void GB(const char* name, uint32_t words, uint32_t (*fn)(Cpu&, const uint32_t*)) { reg(name, words, fn, false); }
+
+// ---- draw batching ----------------------------------------------------------
+// OpenGlDrv draws every polygon with its own glDrawArrays (about 800 per frame
+// on Liberty Island, plus a glEnable/DisableClientState pair each). Each GPU
+// draw has a fixed cost in vitaGL, so consecutive draws with nothing changed
+// in between are merged: their vertices are copied into one buffer as plain
+// triangles and sent as a single glDrawArrays when anything else happens.
+// The guest's client-array state is kept here; the real GL only ever sees
+// the batch buffer (or, for draws the batcher can't take, the guest arrays).
+struct Arr { bool on = false; int size = 4; uint32_t type = GL_FLOAT; int stride = 0; uint32_t va = 0; };
+struct GuestArrays { Arr v, c, n, sc, fog, t[2]; int unit = 0; } g_ga;
+struct BV { float x, y, z, u0, v0, u1, v1; uint8_t r, g, b, a; };
+constexpr uint32_t kBatchMax = 32768;
+BV* g_batch = nullptr;
+int g_bkey = -1;        // layout of the batch: bit0 colour, bit1 tex0, bit2 tex1
+int g_real_key = -2;    // layout the real GL arrays are set up for (-1 = guest arrays)
+Cpu* g_bcpu = nullptr;
+uint64_t g_st_draws = 0, g_st_batches = 0, g_st_direct = 0;
+#ifndef GL_SECONDARY_COLOR_ARRAY
+#define GL_SECONDARY_COLOR_ARRAY 0x845E
+#endif
+#ifndef GL_FOG_COORD_ARRAY
+#define GL_FOG_COORD_ARRAY 0x8457
+#endif
+
+void real_client(GLenum cap, bool on) { if (on) glEnableClientState(cap); else glDisableClientState(cap); }
+
+void batch_flush() {
+    if (!g_bn) return;
+    if (g_real_key != g_bkey) {
+        real_client(GL_VERTEX_ARRAY, true);
+        real_client(GL_COLOR_ARRAY, g_bkey & 1);
+        real_client(GL_NORMAL_ARRAY, false);
+        for (int u = 0; u < 2; ++u) {
+            glClientActiveTexture(GL_TEXTURE0 + u);
+            real_client(GL_TEXTURE_COORD_ARRAY, g_bkey & (2 << u));
+        }
+        glClientActiveTexture(GL_TEXTURE0);
+        g_real_key = g_bkey;
+    }
+    glVertexPointer(3, GL_FLOAT, sizeof(BV), &g_batch[0].x);
+    if (g_bkey & 1) glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(BV), &g_batch[0].r);
+    if (g_bkey & 2) { glClientActiveTexture(GL_TEXTURE0); glTexCoordPointer(2, GL_FLOAT, sizeof(BV), &g_batch[0].u0); }
+    if (g_bkey & 4) { glClientActiveTexture(GL_TEXTURE1); glTexCoordPointer(2, GL_FLOAT, sizeof(BV), &g_batch[0].u1); glClientActiveTexture(GL_TEXTURE0); }
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)g_bn);
+    g_bn = 0; ++g_st_batches;
+}
+
+// Draw with the guest's own arrays (formats the batcher doesn't take).
+void apply_guest_arrays(Cpu& c) {
+    auto P = [&](const Arr& a) -> const void* { return a.va ? c.hostptr(a.va, 1) : nullptr; };
+    real_client(GL_VERTEX_ARRAY, g_ga.v.on); if (g_ga.v.on) glVertexPointer(g_ga.v.size, g_ga.v.type, g_ga.v.stride, P(g_ga.v));
+    real_client(GL_COLOR_ARRAY, g_ga.c.on); if (g_ga.c.on) glColorPointer(g_ga.c.size, g_ga.c.type, g_ga.c.stride, P(g_ga.c));
+    real_client(GL_NORMAL_ARRAY, g_ga.n.on); if (g_ga.n.on) glNormalPointer(g_ga.n.type, g_ga.n.stride, P(g_ga.n));
+    for (int u = 0; u < 2; ++u) {
+        glClientActiveTexture(GL_TEXTURE0 + u);
+        real_client(GL_TEXTURE_COORD_ARRAY, g_ga.t[u].on);
+        if (g_ga.t[u].on) glTexCoordPointer(g_ga.t[u].size, g_ga.t[u].type, g_ga.t[u].stride, P(g_ga.t[u]));
+    }
+    glClientActiveTexture(GL_TEXTURE0);
+    g_real_key = -1;
+}
+
+inline int tsize(uint32_t type) { return type == GL_UNSIGNED_BYTE || type == GL_BYTE ? 1 : type == GL_SHORT || type == GL_UNSIGNED_SHORT ? 2 : type == GL_DOUBLE ? 8 : 4; }
+inline const uint8_t* arr_base(Cpu& c, const Arr& a) { return a.va ? (const uint8_t*)c.hostptr(a.va, 1) : nullptr; }
+inline int arr_stride(const Arr& a) { return a.stride ? a.stride : a.size * tsize(a.type); }
+
+// Can the batcher take a draw with the current guest arrays?
+bool batchable(uint32_t mode) {
+    if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_FAN && mode != GL_TRIANGLE_STRIP && mode != GL_QUADS && mode != GL_POLYGON) return false;
+    if (!g_ga.v.on || g_ga.v.type != GL_FLOAT || g_ga.v.size < 2 || g_ga.v.size > 3) return false;
+    if (g_ga.n.on || g_ga.sc.on || g_ga.fog.on) return false;
+    if (g_ga.c.on && !((g_ga.c.type == GL_UNSIGNED_BYTE && g_ga.c.size == 4) || (g_ga.c.type == GL_FLOAT && g_ga.c.size >= 3))) return false;
+    for (int u = 0; u < 2; ++u) if (g_ga.t[u].on && (g_ga.t[u].type != GL_FLOAT || g_ga.t[u].size != 2)) return false;
+    return true;
+}
+
+void put_vertex(BV& o, int i, const uint8_t* vb, int vs, const uint8_t* cb, int cs, const uint8_t* t0, int s0, const uint8_t* t1, int s1) {
+    const float* p = (const float*)(vb + i * vs);
+    o.x = p[0]; o.y = p[1]; o.z = g_ga.v.size > 2 ? p[2] : 0.0f;
+    if (t0) { const float* t = (const float*)(t0 + i * s0); o.u0 = t[0]; o.v0 = t[1]; }
+    if (t1) { const float* t = (const float*)(t1 + i * s1); o.u1 = t[0]; o.v1 = t[1]; }
+    if (cb) {
+        if (g_ga.c.type == GL_UNSIGNED_BYTE) std::memcpy(&o.r, cb + i * cs, 4);
+        else {
+            const float* f = (const float*)(cb + i * cs);
+            auto q = [](float v) -> uint8_t { return (uint8_t)(v <= 0 ? 0 : v >= 1 ? 255 : v * 255.0f + 0.5f); };
+            o.r = q(f[0]); o.g = q(f[1]); o.b = q(f[2]); o.a = g_ga.c.size > 3 ? q(f[3]) : 255;
+        }
+    }
+}
+
+uint32_t draw_arrays(Cpu& c, const uint32_t* A) {
+    GLCOUNT("glDrawArrays");
+    const uint32_t mode = A[0]; const int first = (int32_t)A[1], count = (int32_t)A[2];
+    ++g_st_draws;
+    if (count <= 0) return 0;
+    const int ntri = mode == GL_TRIANGLES ? count / 3 : mode == GL_QUADS ? (count / 4) * 2 : count - 2;
+    if (!batchable(mode) || ntri <= 0 || (uint32_t)ntri * 3 > kBatchMax) {
+        batch_flush(); apply_guest_arrays(c); ++g_st_direct;
+        glDrawArrays(mode, first, count);
+        return 0;
+    }
+    const int key = (g_ga.c.on ? 1 : 0) | (g_ga.t[0].on ? 2 : 0) | (g_ga.t[1].on ? 4 : 0);
+    if (g_bn && (key != g_bkey || g_bn + ntri * 3 > kBatchMax)) batch_flush();
+    if (!g_batch) g_batch = (BV*)std::calloc(kBatchMax, sizeof(BV));
+    g_bkey = key;
+    const uint8_t* vb = arr_base(c, g_ga.v); const int vs = arr_stride(g_ga.v);
+    const uint8_t* cb = g_ga.c.on ? arr_base(c, g_ga.c) : nullptr; const int cs = arr_stride(g_ga.c);
+    const uint8_t* t0 = g_ga.t[0].on ? arr_base(c, g_ga.t[0]) : nullptr; const int s0 = arr_stride(g_ga.t[0]);
+    const uint8_t* t1 = g_ga.t[1].on ? arr_base(c, g_ga.t[1]) : nullptr; const int s1 = arr_stride(g_ga.t[1]);
+    if (!vb) return 0;
+    BV* o = g_batch + g_bn;
+    auto V = [&](int i) { put_vertex(*o++, first + i, vb, vs, cb, cs, t0, s0, t1, s1); };
+    if (mode == GL_TRIANGLES) for (int i = 0; i < ntri * 3; ++i) V(i);
+    else if (mode == GL_QUADS) for (int q = 0; q < count / 4; ++q) { V(4*q); V(4*q+1); V(4*q+2); V(4*q); V(4*q+2); V(4*q+3); }
+    else if (mode == GL_TRIANGLE_STRIP) for (int i = 0; i < ntri; ++i) { if (i & 1) { V(i+1); V(i); V(i+2); } else { V(i); V(i+1); V(i+2); } }
+    else for (int i = 1; i <= ntri; ++i) { V(0); V(i); V(i+1); }   // fan / polygon
+    g_bn += ntri * 3;
+    return 0;
+}
+
+Arr* client_arr(uint32_t cap) {
+    switch (cap) {
+    case GL_VERTEX_ARRAY: return &g_ga.v;
+    case GL_COLOR_ARRAY: return &g_ga.c;
+    case GL_NORMAL_ARRAY: return &g_ga.n;
+    case GL_TEXTURE_COORD_ARRAY: return &g_ga.t[g_ga.unit];
+    case GL_SECONDARY_COLOR_ARRAY: return &g_ga.sc;
+    case GL_FOG_COORD_ARRAY: return &g_ga.fog;
+    default: return nullptr;
+    }
+}
+
+void install_batcher() {
+    GB("glEnableClientState", 1, [](Cpu&, const uint32_t* A) -> uint32_t { GLCOUNT("glEnableClientState"); if (Arr* a = client_arr(A[0])) a->on = true; return 0; });
+    GB("glDisableClientState", 1, [](Cpu&, const uint32_t* A) -> uint32_t { GLCOUNT("glDisableClientState"); if (Arr* a = client_arr(A[0])) a->on = false; return 0; });
+    GB("glClientActiveTextureARB", 1, [](Cpu&, const uint32_t* A) -> uint32_t { GLCOUNT("glClientActiveTextureARB"); g_ga.unit = (A[0] - GL_TEXTURE0) & 1; return 0; });
+    GB("glVertexPointer", 4, [](Cpu&, const uint32_t* A) -> uint32_t { g_ga.v.size = A[0]; g_ga.v.type = A[1]; g_ga.v.stride = A[2]; g_ga.v.va = A[3]; return 0; });
+    GB("glColorPointer", 4, [](Cpu&, const uint32_t* A) -> uint32_t { g_ga.c.size = A[0]; g_ga.c.type = A[1]; g_ga.c.stride = A[2]; g_ga.c.va = A[3]; return 0; });
+    GB("glTexCoordPointer", 4, [](Cpu&, const uint32_t* A) -> uint32_t { Arr& t = g_ga.t[g_ga.unit]; t.size = A[0]; t.type = A[1]; t.stride = A[2]; t.va = A[3]; return 0; });
+    GB("glNormalPointer", 3, [](Cpu&, const uint32_t* A) -> uint32_t { g_ga.n.size = 3; g_ga.n.type = A[0]; g_ga.n.stride = A[1]; g_ga.n.va = A[2]; return 0; });
+    GB("glSecondaryColorPointerEXT", 4, [](Cpu&, const uint32_t* A) -> uint32_t { g_ga.sc.size = A[0]; g_ga.sc.type = A[1]; g_ga.sc.stride = A[2]; g_ga.sc.va = A[3]; return 0; });
+    GB("glFogCoordPointerEXT", 3, [](Cpu&, const uint32_t* A) -> uint32_t { g_ga.fog.size = 1; g_ga.fog.type = A[0]; g_ga.fog.stride = A[1]; g_ga.fog.va = A[2]; return 0; });
+    GB("glLockArraysEXT", 2, [](Cpu&, const uint32_t*) -> uint32_t { return 0; });
+    GB("glUnlockArraysEXT", 0, [](Cpu&, const uint32_t*) -> uint32_t { return 0; });
+    GB("glDrawArrays", 3, draw_arrays);
+    // Indexed and single-element draws use the guest's arrays directly.
+    G("glArrayElement", 1, [](Cpu& c, const uint32_t* A) -> uint32_t {
+        GLCOUNT("glArrayElement"); apply_guest_arrays(c);
+#ifdef __vita__
+        (void)A; gl_missing("glArrayElement");
+#else
+        glArrayElement((GLint)A[0]);
+#endif
+        return 0; });
+    G("glInterleavedArrays", 3, [](Cpu&, const uint32_t*) -> uint32_t { gl_missing("glInterleavedArrays (batcher)"); return 0; });
+    G("glDrawElements", 4, [](Cpu& c, const uint32_t* A) -> uint32_t {
+        GLCOUNT("glDrawElements"); apply_guest_arrays(c); ++g_st_direct;
+        glDrawElements(A[0], (GLsizei)A[1], A[2], GP(c, A[3])); return 0; });
 }
 
 void R(d2rt::Bridge& br, const char* dll, const char* name, uint32_t argc, std::function<uint32_t(Cpu&)> fn) {
@@ -83,7 +253,7 @@ void R(d2rt::Bridge& br, const char* dll, const char* name, uint32_t argc, std::
 // ---- context ---------------------------------------------------------------
 bool g_ctx_made = false;
 uint32_t g_fb_va = 0;                    // host: the colour buffer (guest memory)
-uint64_t g_swaps = 0;
+uint64_t g_swaps = 0, g_swap_us = 0, g_frame_us = 0, g_last_swap_end = 0;
 #ifndef __vita__
 OSMesaContext g_mesa = nullptr;
 #endif
@@ -128,13 +298,26 @@ void stats_line() {
     for (auto& p : v) total += p.first;
     for (size_t i = 0; i < v.size() && i < 14; ++i) s += " " + v[i].second + "=" + std::to_string(v[i].first / 300);
     log("[not-bound] GL calls per frame (300-frame avg): total %llu,%s", (unsigned long long)(total / 300), s.c_str());
+    if (g_swap_us || g_frame_us)
+        log("[not-bound] GL frame: %.2f ms game+GL calls, %.2f ms in vglSwapBuffers (GPU wait + vblank)",
+            g_frame_us / 300.0 / 1000.0, g_swap_us / 300.0 / 1000.0);
+    g_swap_us = g_frame_us = 0;
+    if (g_st_draws)
+        log("[not-bound] GL batching: %llu game draws -> %llu GPU draws batched + %llu direct (per frame)",
+            (unsigned long long)(g_st_draws / 300), (unsigned long long)(g_st_batches / 300), (unsigned long long)(g_st_direct / 300));
+    g_st_draws = g_st_batches = g_st_direct = 0;
     for (auto& kv : *g_counts) kv.second = 0;
 }
 
 uint32_t swap(Cpu& c) {
+    batch_flush();
     ++g_swaps;
 #ifdef __vita__
+    const uint64_t t0 = wx86_now_us();
     vglSwapBuffers(GL_FALSE);
+    const uint64_t t1 = wx86_now_us();
+    g_swap_us += t1 - t0; if (g_last_swap_end) g_frame_us += t0 - g_last_swap_end;
+    g_last_swap_end = t1;
     present(c, 0, 0, 0, 0, nullptr);     // controller, sound pump, frame stats
 #else
     glFinish();
@@ -168,8 +351,15 @@ uint32_t gl_string(Cpu& c, uint32_t name) {
 
 void install_gl(d2rt::Bridge& br) {
     g_glbr = &br;
-    g_stats = std::getenv("DX_GLSTATS") && std::atoi(std::getenv("DX_GLSTATS"));
+    // GL call counts: on by default on the Vita (one line per 300 frames).
+    const char* gs = std::getenv("DX_GLSTATS");
+#ifdef __vita__
+    g_stats = !gs || std::atoi(gs) != 0;
+#else
+    g_stats = gs && std::atoi(gs) != 0;
+#endif
 #include "dx_gl_gen.inc"
+    if (!(std::getenv("DX_GLBATCH") && std::atoi(std::getenv("DX_GLBATCH")) == 0)) install_batcher();
 #ifdef __vita__
     // 640x480 game coordinates -> the 725x544 area in the middle of the screen.
     G("glViewport", 4, [](Cpu&, const uint32_t* A) -> uint32_t {

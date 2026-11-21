@@ -48,6 +48,7 @@
 extern "C" {
 extern uint64_t dyn86_jp_run_us, dyn86_jp_lookup_miss, dyn86_jp_created, dyn86_jp_recompiles, dyn86_jp_invalid, dyn86_jp_x86_insns, dyn86_sync_us;
 }
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -248,6 +249,7 @@ struct WaitSlot { std::atomic<uint32_t> type{0}; std::atomic<int> uid{0}; std::a
 WaitSlot g_waits[6];
 std::atomic<int> g_quit{0};
 std::atomic<bool> g_wipe_bars{false};
+void dx_sample_eip();
 int sampler_main(SceSize, void*) {
     wx86_vita_pin_self(SCE_KERNEL_CPU_MASK_USER_2, nullptr);
     while (!g_quit.load()) {
@@ -255,6 +257,7 @@ int sampler_main(SceSize, void*) {
         if (g_main_thread < 0) continue;
         SceKernelThreadInfo ti; std::memset(&ti, 0, sizeof ti); ti.size = sizeof ti;
         if (sceKernelGetThreadInfo(g_main_thread, &ti) < 0) continue;
+        if (ti.status & SCE_THREAD_RUNNING) dx_sample_eip();
         if (ti.status & SCE_THREAD_RUNNING) g_st_run++;
         else if (ti.status & SCE_THREAD_READY) g_st_ready++;
         else if (ti.status & SCE_THREAD_WAITING) {
@@ -279,8 +282,37 @@ void wait_name(int uid, char* out, unsigned n) {
 
 // Where the guest is: its EIP sampled once per displayed frame.
 const volatile uint32_t* g_ip = nullptr;
-uint32_t g_samples[6];   // exe, storm, other DLLs, inside a shim (host code), generated/heap code, other
+uint32_t g_samples[6];   // (StarCraft buckets, unused here)
 uint32_t g_storm_lo = 0, g_storm_hi = 0;
+// Where the guest spends its time, by module: sampled at ~1 kHz from core 2.
+// The EIP the engine keeps is the start of the last block it dispatched, so
+// this is a block-level picture, good enough to rank modules.
+struct ModRange { uint32_t lo = 0, hi = 0; const char* name = ""; };
+constexpr int kMaxMods = 16;
+ModRange g_mods[kMaxMods]; std::atomic<int> g_nmods{0};
+std::atomic<uint32_t> g_msamp[kMaxMods + 3];   // modules, then: shims, other memory, no sample
+void build_module_ranges() {
+    static const char* names[] = { "DeusEx.exe", "Core.dll", "Engine.dll", "Render.dll", "OpenGLDrv.dll", "SoftDrv.dll",
+                                   "DeusEx.dll", "Extension.dll", "ConSys.dll", "Fire.dll", "Galaxy.dll", "WinDrv.dll",
+                                   "Window.dll", "MSVCRT.dll", "IpDrv.dll" };
+    int n = 0;
+    for (const char* nm : names) {
+        if (n >= kMaxMods || !g_br) break;
+        std::string lo = nm; for (char& ch : lo) ch = (char)std::tolower((unsigned char)ch);
+        d2rt::PeImage* m = g_br->module(nm); if (!m) m = g_br->module(lo);
+        if (!m) continue;
+        g_mods[n].lo = m->load_base(); g_mods[n].hi = m->load_base() + m->image_size(); g_mods[n].name = nm; ++n;
+    }
+    g_nmods.store(n);
+}
+void dx_sample_eip() {
+    if (!g_ip) return;
+    const uint32_t ip = *g_ip;
+    const int n = g_nmods.load();
+    for (int i = 0; i < n; ++i) if (ip >= g_mods[i].lo && ip < g_mods[i].hi) { g_msamp[i]++; return; }
+    if (ip >= 0x0D100000u && ip < 0x0D800000u) { g_msamp[kMaxMods]++; return; }
+    g_msamp[kMaxMods + 1]++;
+}
 
 void display_cb(const void* data) {
     const DisplayData* d = (const DisplayData*)data;
@@ -506,6 +538,22 @@ void window_report(uint64_t now) {
             busy[0], busy[1], busy[2], g_samples[0] * 100 / tot, g_samples[1] * 100 / tot, g_samples[2] * 100 / tot,
             g_samples[3] * 100 / tot, g_samples[4] * 100 / tot, g_samples[5] * 100 / tot);
         std::memset(g_samples, 0, sizeof g_samples);
+        {   // guest time by module (while the guest thread was running)
+            uint32_t v[kMaxMods + 3], t = 0; for (int i = 0; i < kMaxMods + 3; ++i) { v[i] = g_msamp[i].exchange(0); t += v[i]; }
+            if (!t) t = 1;
+            int k = std::snprintf(line, sizeof line, "guest time by module (%u samples):", t);
+            const int n = g_nmods.load();
+            for (int pass = 0; pass < 6; ++pass) {   // the six biggest, largest first
+                int best = -1;
+                for (int i = 0; i < kMaxMods + 2; ++i) if (v[i] && (best < 0 || v[i] > v[best])) best = i;
+                if (best < 0) break;
+                const char* nm = best < n ? g_mods[best].name : best == kMaxMods ? "shims/GL" : "other (VirtualAlloc, heap)";
+                k += std::snprintf(line + k, sizeof line - k, " %s %u%%", nm, v[best] * 100 / t);
+                v[best] = 0;
+                if (k >= (int)sizeof line - 40) break;
+            }
+            log("[not-bound] %s", line);
+        }
         if (g_br && g_br->prof_window(line, sizeof line, 8) > 0) log("[not-bound] shim time (10 s):%s", line);
     }
     {
@@ -720,6 +768,7 @@ void present(d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t
     }
     if (!g_ip) {
         g_ip = c.ip_ptr();
+        build_module_ranges();
         if (d2rt::PeImage* st = g_br ? g_br->module("storm.dll") : nullptr) { g_storm_lo = st->load_base(); g_storm_hi = g_storm_lo + st->image_size(); }
     }
     if (w == (uint32_t)kSrcW && h == (uint32_t)kSrcH && !pal) {   // 32-bit frame (no palette)
