@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <signal.h>
 #include <errno.h>
+#include <sched.h>
 
 #include "box86context.h"
 #include "elfloader.h"
@@ -44,7 +45,9 @@ static size_t jmptbl_allocated = 0, jmptbl_allocated1 = 0;
 #endif
 static int                 mmapsize = 0;
 static uintptr_t           *box86_jmptbl[JMPTABL_SIZE];
+#ifndef WX86_JT3
 static uintptr_t           box86_jmptbl_default[1<<JMPTABL_SHIFT];
+#endif
 // lock addresses
 KHASH_SET_INIT_INT(lockaddress)
 static kh_lockaddress_t    *lockaddress = NULL;
@@ -929,6 +932,18 @@ void dyn86_arena_census(char* out, int n)
              (unsigned)(tot>>10), nlive, (unsigned)(live>>10), ngone, (unsigned)(gone>>10), (unsigned)(noself>>10), nfree, (unsigned)(fre>>10), (unsigned)(maxfr>>10));
 }
 
+extern void wx86_vita_progress_c(const char* msg);   /* src/platform/vita_host.cpp */
+/* Out of host heap for a jump table: said on stderr and in the Vita progress
+ * file, since the code at that address can then not be run. */
+static void jt_oom_note(uintptr_t addr, unsigned kb)
+{
+    char m[160];
+    snprintf(m, sizeof m, "dynarec: no host memory for the jump table of guest address %p (%u KiB of tables so far)", (void*)addr, kb);
+    fprintf(stderr, "%s\n", m);
+    wx86_vita_progress_c(m);
+}
+
+#ifndef WX86_JT3
 static uintptr_t getDBSize(uintptr_t addr, size_t maxsize, dynablock_t** db)
 {
     uintptr_t idx1 = addr>>JMPTABL_SHIFT;
@@ -1004,25 +1019,53 @@ void cleanDBFromAddressRange(uintptr_t addr, size_t size, int destroy)
     }
 }
 
+/* WC3 Vita build 4: level-2 jump tables (256 KiB each, one per 64 KiB guest
+ * page holding translated code) come out of the host newlib heap. Counted
+ * always, so the Vita log can say how many exist and how many failed.
+ * WX86_JMPTBL_MAX=<n> refuses table n+1 onwards (host reproduction of a
+ * console that ran out of heap). */
+static volatile unsigned jmptbl_lv2 = 0, jmptbl_oom = 0;
+static unsigned jmptbl_cap = 0;   /* 0 = not read yet */
+unsigned d2rt_box86_jmptbl_tables(void) { return jmptbl_lv2; }
+unsigned d2rt_box86_jmptbl_fails(void)  { return jmptbl_oom; }
+unsigned d2rt_box86_jmptbl_heap_kb(void) { return jmptbl_lv2 * (((1u<<JMPTABL_SHIFT)*sizeof(uintptr_t)) >> 10); }
+
+/* Returns the slot for (idx1, idx0) in a page-private level-2 table, or NULL
+ * when that table could not be allocated.
+ *
+ * NEVER return a pointer into box86_jmptbl_default here: every page without
+ * its own table shares that one array, and its entries all equal arm_next, so
+ * a caller's store-if-ref(arm_next) SUCCEEDS on it. The block for guest
+ * address A then answers for A + k*64 KiB on every other table-less page. On
+ * the Vita (build 3) that sent `call 0x0105ffa0` into the code translated for
+ * 0x0104ffa0 -- WC3's terrain-table constructor -- which recursed forever,
+ * reloading TerrainArt\Terrain.slk each time until guest memory ran out
+ * (Storm "SFile.cpp(4072) error 8"). */
 static uintptr_t *create_jmptbl(uintptr_t idx0, uintptr_t idx1)
 {
     if(box86_jmptbl[idx1] == box86_jmptbl_default) {
-        uintptr_t* tbl = (uintptr_t*)box_malloc((1<<JMPTABL_SHIFT)*sizeof(uintptr_t));
-        /* C13 (deep review): box_malloc was dereferenced unchecked — an OOM here
-         * wrote 64 Ki entries through NULL. Hand back the default table instead:
-         * the caller's store-if-ref then fails and the block is simply
-         * retranslated, which is survivable, unlike a null-page write storm. */
-        if(!tbl) return &box86_jmptbl[idx1][idx0];
+        if(!jmptbl_cap) {
+            const char* e = getenv("WX86_JMPTBL_MAX");
+            jmptbl_cap = (e && atoi(e) > 0) ? (unsigned)atoi(e) : 0xffffffffu;
+        }
+        uintptr_t* tbl = (jmptbl_lv2 < jmptbl_cap)
+            ? (uintptr_t*)box_malloc((1<<JMPTABL_SHIFT)*sizeof(uintptr_t)) : NULL;
+        if(!tbl) {
+            if(__atomic_add_fetch(&jmptbl_oom, 1, __ATOMIC_RELAXED) <= 4)
+                jt_oom_note((uintptr_t)(idx1<<JMPTABL_SHIFT), jmptbl_lv2 * 256);
+            return NULL;
+        }
         for(int i=0; i<(1<<JMPTABL_SHIFT); ++i)
             tbl[i] = (uintptr_t)arm_next;
         if(arm_lock_storeifref(&box86_jmptbl[idx1], tbl, box86_jmptbl_default)!=tbl)
             box_free(tbl);
-#ifdef TRACE_MEMSTAT
         else {
+            __atomic_add_fetch(&jmptbl_lv2, 1, __ATOMIC_RELAXED);
+#ifdef TRACE_MEMSTAT
             jmptbl_allocated += (1<<JMPTABL_SHIFT)*sizeof(uintptr_t);
             ++jmptbl_allocated1;
-        }
 #endif
+        }
     }
     return &box86_jmptbl[idx1][idx0];
 }
@@ -1032,8 +1075,9 @@ int addJumpTableIfDefault(void* addr, void* jmp)
     uintptr_t idx1, idx0;
     idx1 = (((uintptr_t)addr)>>JMPTABL_SHIFT)&JMPTABLE_MASK;
     idx0 = (((uintptr_t)addr)               )&JMPTABLE_MASK;
-
-    return (arm_lock_storeifref(create_jmptbl(idx0, idx1), jmp, arm_next)==jmp)?1:0;
+    uintptr_t* slot = create_jmptbl(idx0, idx1);
+    if(!slot) return 0;   /* not published: the caller frees the block */
+    return (arm_lock_storeifref(slot, jmp, arm_next)==jmp)?1:0;
 }
 void setJumpTableDefault(void* addr)
 {
@@ -1058,7 +1102,9 @@ int setJumpTableIfRef(void* addr, void* jmp, void* ref)
     uintptr_t idx1, idx0;
     idx1 = (((uintptr_t)addr)>>JMPTABL_SHIFT)&JMPTABLE_MASK;
     idx0 = (((uintptr_t)addr)               )&JMPTABLE_MASK;
-    return (arm_lock_storeifref(create_jmptbl(idx0, idx1), jmp, ref)==jmp)?1:0;
+    uintptr_t* slot = create_jmptbl(idx0, idx1);
+    if(!slot) return 0;
+    return (arm_lock_storeifref(slot, jmp, ref)==jmp)?1:0;
 }
 int isJumpTableDefault(void* addr)
 {
@@ -1079,7 +1125,40 @@ uintptr_t getJumpTableAddress(uintptr_t addr)
     uintptr_t idx1, idx0;
     idx1 = ((addr)>>JMPTABL_SHIFT)&JMPTABLE_MASK;
     idx0 = ((addr)               )&JMPTABLE_MASK;
-    return (uintptr_t)create_jmptbl(idx0, idx1);
+    uintptr_t* slot = create_jmptbl(idx0, idx1);
+    /* No table: hand the emitted code the shared default slot. It only ever
+     * READS it (always arm_next, so the jump goes through LinkNext and finds
+     * the right block); nothing may write there, see create_jmptbl. */
+    return slot ? (uintptr_t)slot : (uintptr_t)&box86_jmptbl_default[idx0];
+}
+/* Diagnostic census (slow: walks every allocated table). pages = level-2
+ * tables, sub4k = 4 KiB sub-pages holding at least one entry, entries = slots
+ * not on arm_next. */
+void d2rt_box86_jmptbl_census(unsigned* pages, unsigned* chunks, unsigned* entries)
+{
+    unsigned np = 0, ne = 0, nc[5] = {0};   /* chunks of 64 B .. 1 KiB */
+    for(size_t i1 = 0; i1 < JMPTABL_SIZE; ++i1) {
+        uintptr_t* t = box86_jmptbl[i1];
+        if(t == box86_jmptbl_default) continue;
+        ++np;
+        for(int g = 0; g < 5; ++g) {
+            const size_t cs = (size_t)64 << g;
+            for(size_t s0 = 0; s0 < (1<<JMPTABL_SHIFT); s0 += cs) {
+                unsigned here = 0;
+                for(size_t i0 = s0; i0 < s0 + cs; ++i0)
+                    if(t[i0] != (uintptr_t)arm_next) { ++here; if(g==0) ++ne; }
+                if(here) ++nc[g];
+            }
+        }
+    }
+    if(pages) *pages = np;
+    if(chunks) for(int g = 0; g < 5; ++g) chunks[g] = nc[g];
+    if(entries) *entries = ne;
+}
+int isJumpTableSharedSlot(uintptr_t p)
+{
+    return p >= (uintptr_t)box86_jmptbl_default
+        && p <  (uintptr_t)(box86_jmptbl_default + (1<<JMPTABL_SHIFT));
 }
 
 dynablock_t* getDB(uintptr_t addr)
@@ -1115,6 +1194,230 @@ uintptr_t getJumpAddress64(uintptr_t addr)
     idx0 = ((addr)               )&JMPTABLE_MASK;
     return (uintptr_t)box86_jmptbl[idx1][idx0];
 }
+
+#else /* WX86_JT3 */
+/* ---- three-level jump table (WarCraft III Vita build 4) ---------------------
+ * L1[addr>>16] -> L2[(addr>>6) & 1023] -> L3[addr & 63] = ARM code to run.
+ *
+ * The stock two-level table spends a 256 KiB level-2 array on every 64 KiB
+ * guest page that holds ANY translated code: 171 of them (43 MiB of host
+ * heap) by WC3's main menu, for 47 000 live entries (185 KiB of payload).
+ * The Vita's whole newlib heap is 48 MiB. Here a page costs 4 KiB (L2) and
+ * each 64-byte run of guest code that has an entry point costs 256 B (L3):
+ * 5.5 MiB for the same menu. Measured on the host with the census below.
+ *
+ * Pages and runs without a table of their own point at jt_l2_default /
+ * jt_l3_default, which are READ-ONLY: nothing may ever be stored into them
+ * (that sharing is what aliased guest pages on the Vita in build 3, see
+ * create_jmptbl). Tables are never freed: emitted code embeds L3 slot
+ * addresses (getJumpTableAddress), so freeing one would leave dangling
+ * pointers in other blocks; the memory involved is small.
+ * The emitted lookup (dynarec_arm_helper.c) is one UBFX + one LDR longer. */
+#define JT_L3_MASK  ((1<<JT_L3_SHIFT)-1)
+#define JT_L2_SIZE  (1<<(JMPTABL_SHIFT-JT_L3_SHIFT))
+#define JT_L3_SIZE  (1<<JT_L3_SHIFT)
+static uintptr_t* jt_l2_default[JT_L2_SIZE];
+static uintptr_t  jt_l3_default[JT_L3_SIZE];
+static volatile unsigned char jt_lock = 0;   /* leaf spinlock: only malloc runs under it */
+static uint8_t*   jt_slab = NULL;
+static size_t     jt_slab_left = 0;
+static volatile unsigned jt_n2 = 0, jt_n3 = 0, jt_oom = 0, jt_slab_kb = 0;
+static unsigned   jt_cap = 0;   /* WX86_JMPTBL_MAX: cap on L3 tables (host test) */
+unsigned d2rt_box86_jmptbl_tables(void) { return jt_n3; }
+unsigned d2rt_box86_jmptbl_fails(void)  { return jt_oom; }
+unsigned d2rt_box86_jmptbl_heap_kb(void) { return jt_slab_kb; }
+
+#define JT_L2(a)  (((uintptr_t**)box86_jmptbl[(uintptr_t)(a)>>JMPTABL_SHIFT]))
+#define JT_I2(a)  ((((uintptr_t)(a))>>JT_L3_SHIFT)&(JT_L2_SIZE-1))
+#define JT_I0(a)  (((uintptr_t)(a))&JT_L3_MASK)
+static inline uintptr_t* jt_l3_of(uintptr_t a) { return JT_L2(a)[JT_I2(a)]; }
+static inline uintptr_t  jt_get(uintptr_t a)   { return jt_l3_of(a)[JT_I0(a)]; }
+
+/* 64 KiB slabs, carved; never freed. Called with jt_lock held. */
+static void* jt_alloc(size_t n)
+{
+    if(jt_slab_left < n) {
+        uint8_t* sl = (uint8_t*)box_malloc(64<<10);
+        if(!sl) return NULL;
+        jt_slab = sl; jt_slab_left = 64<<10; jt_slab_kb += 64;
+    }
+    void* r = jt_slab; jt_slab += n; jt_slab_left -= n;
+    return r;
+}
+
+/* The page-private slot for addr, or NULL when no memory was left for it. */
+static uintptr_t *create_jmptbl(uintptr_t addr)
+{
+    uintptr_t* l3 = jt_l3_of(addr);
+    if(l3 != jt_l3_default)
+        return &l3[JT_I0(addr)];
+    while(__atomic_test_and_set(&jt_lock, __ATOMIC_ACQUIRE)) sched_yield();
+    if(!jt_cap) {
+        const char* e = getenv("WX86_JMPTBL_MAX");
+        jt_cap = (e && atoi(e) > 0) ? (unsigned)atoi(e) : 0xffffffffu;
+    }
+    uintptr_t** l2 = JT_L2(addr);
+    if(l2 == jt_l2_default) {
+        uintptr_t** n2 = (uintptr_t**)jt_alloc(JT_L2_SIZE*sizeof(uintptr_t*));
+        if(!n2) goto oom;
+        for(int i=0; i<JT_L2_SIZE; ++i) n2[i] = jt_l3_default;
+        __atomic_store_n(&box86_jmptbl[addr>>JMPTABL_SHIFT], (uintptr_t*)n2, __ATOMIC_RELEASE);
+        l2 = n2; ++jt_n2;
+    }
+    l3 = l2[JT_I2(addr)];
+    if(l3 == jt_l3_default) {
+        uintptr_t* n3 = (jt_n3 < jt_cap) ? (uintptr_t*)jt_alloc(JT_L3_SIZE*sizeof(uintptr_t)) : NULL;
+        if(!n3) goto oom;
+        for(int i=0; i<JT_L3_SIZE; ++i) n3[i] = (uintptr_t)arm_next;
+        __atomic_store_n(&l2[JT_I2(addr)], n3, __ATOMIC_RELEASE);
+        l3 = n3; ++jt_n3;
+    }
+    __atomic_clear(&jt_lock, __ATOMIC_RELEASE);
+    return &l3[JT_I0(addr)];
+oom:
+    __atomic_clear(&jt_lock, __ATOMIC_RELEASE);
+    if(__atomic_add_fetch(&jt_oom, 1, __ATOMIC_RELAXED) <= 4)
+        jt_oom_note(addr, jt_slab_kb);
+    return NULL;
+}
+
+/* Next address to look at from addr (bounded by maxsize), with *db set when
+ * a published block starts right before the returned address. */
+static uintptr_t getDBSize(uintptr_t addr, size_t maxsize, dynablock_t** db)
+{
+    *db = NULL;
+    uintptr_t** l2 = JT_L2(addr);
+    if(l2 == jt_l2_default)
+        return ((addr>>JMPTABL_SHIFT)+1)<<JMPTABL_SHIFT;
+    uintptr_t* l3 = l2[JT_I2(addr)];
+    if(l3 == jt_l3_default)
+        return (addr|JT_L3_MASK)+1;
+    uintptr_t i0 = JT_I0(addr);
+    uintptr_t last = (maxsize >= JT_L3_MASK) ? JT_L3_MASK : i0 + maxsize;   /* no wrap */
+    if(last > JT_L3_MASK) last = JT_L3_MASK;
+    for(; i0 <= last; ++i0)
+        if(l3[i0] != (uintptr_t)arm_next) {
+            *db = *(dynablock_t**)(l3[i0] - sizeof(void*));
+            return (addr&~(uintptr_t)JT_L3_MASK)+i0+1;
+        }
+    return (addr&~(uintptr_t)JT_L3_MASK)+i0;
+}
+
+void addDBFromAddressRange(uintptr_t addr, size_t size)
+{
+    dynarec_log(LOG_DEBUG, "addDBFromAddressRange %p -> %p\n", (void*)addr, (void*)(addr+size-1));
+}
+
+void cleanDBFromAddressRange(uintptr_t addr, size_t size, int destroy)
+{
+    uintptr_t start_addr = my_context?((addr<my_context->max_db_size)?0:(addr-my_context->max_db_size)):addr;
+    dynarec_log(LOG_DEBUG, "cleanDBFromAddressRange %p/%p -> %p %s\n", (void*)addr, (void*)start_addr, (void*)(addr+size-1), destroy?"destroy":"mark");
+    dynablock_t* db = NULL;
+    uintptr_t end = addr+size;
+    while (start_addr<end) {
+        uintptr_t next = getDBSize(start_addr, end-start_addr, &db);
+        if(next <= start_addr) break;   /* wrapped past 4 GiB */
+        start_addr = next;
+        if(db) {
+            if(destroy)
+                FreeRangeDynablock(db, addr, size);
+            else
+                MarkRangeDynablock(db, addr, size, 1);
+        }
+    }
+    /* Tables stay allocated (see the header comment). */
+}
+
+int addJumpTableIfDefault(void* addr, void* jmp)
+{
+    uintptr_t* slot = create_jmptbl((uintptr_t)addr);
+    if(!slot) return 0;   /* not published: the caller frees the block */
+    return (arm_lock_storeifref(slot, jmp, arm_next)==jmp)?1:0;
+}
+void setJumpTableDefault(void* addr)
+{
+    uintptr_t* l3 = jt_l3_of((uintptr_t)addr);
+    if(l3 == jt_l3_default) return;
+    arm_lock_stored(&l3[JT_I0(addr)], (uintptr_t)arm_next);
+}
+void setJumpTableDefaultRef(void* addr, void* jmp)
+{
+    uintptr_t* l3 = jt_l3_of((uintptr_t)addr);
+    if(l3 == jt_l3_default) return;
+    arm_lock_storeifref(&l3[JT_I0(addr)], arm_next, jmp);
+}
+int setJumpTableIfRef(void* addr, void* jmp, void* ref)
+{
+    uintptr_t* slot = create_jmptbl((uintptr_t)addr);
+    if(!slot) return 0;
+    return (arm_lock_storeifref(slot, jmp, ref)==jmp)?1:0;
+}
+int isJumpTableDefault(void* addr)
+{
+    return (jt_get((uintptr_t)addr)==(uintptr_t)arm_next)?1:0;
+}
+uintptr_t getJumpTable()
+{
+    return (uintptr_t)box86_jmptbl;
+}
+uintptr_t getJumpTableAddress(uintptr_t addr)
+{
+    uintptr_t* slot = create_jmptbl(addr);
+    /* No memory: the shared default slot, which emitted code only reads
+     * (always arm_next, so the jump goes through LinkNext). */
+    return slot ? (uintptr_t)slot : (uintptr_t)&jt_l3_default[JT_I0(addr)];
+}
+int isJumpTableSharedSlot(uintptr_t p)
+{
+    return p >= (uintptr_t)jt_l3_default && p < (uintptr_t)(jt_l3_default + JT_L3_SIZE);
+}
+/* Census: pages = L2 tables, chunks[0] = L3 tables (64 B runs), chunks[1..4]
+ * = runs of 128 B .. 1 KiB holding an entry, entries = live slots. */
+void d2rt_box86_jmptbl_census(unsigned* pages, unsigned* chunks, unsigned* entries)
+{
+    unsigned np = 0, ne = 0, nc[5] = {0};
+    for(size_t i1 = 0; i1 < JMPTABL_SIZE; ++i1) {
+        uintptr_t** l2 = (uintptr_t**)box86_jmptbl[i1];
+        if(l2 == jt_l2_default) continue;
+        ++np;
+        unsigned run[5] = {0};
+        for(size_t i2 = 0; i2 < JT_L2_SIZE; ++i2) {
+            unsigned here = 0;
+            if(l2[i2] != jt_l3_default)
+                for(int i0 = 0; i0 < JT_L3_SIZE; ++i0)
+                    if(l2[i2][i0] != (uintptr_t)arm_next) ++here;
+            ne += here;
+            for(int g = 0; g < 5; ++g) {
+                if(here) run[g] = 1;
+                if(((i2+1) & ((1u<<g)-1)) == 0) { nc[g] += run[g]; run[g] = 0; }
+            }
+        }
+    }
+    if(pages) *pages = np;
+    if(chunks) for(int g = 0; g < 5; ++g) chunks[g] = nc[g];
+    if(entries) *entries = ne;
+}
+
+dynablock_t* getDB(uintptr_t addr)
+{
+    return *(dynablock_t**)(jt_get(addr) - sizeof(void*));
+}
+
+extern int dyn86_link_direct(void);   // D2Vita scheduler quantum mode (src/dynarec86/dyn86.c)
+int getNeedTest(uintptr_t addr)
+{
+    uintptr_t ret = jt_get(addr);
+    dynablock_t* db = *(dynablock_t**)(ret - sizeof(void*));
+    if(db && !dyn86_link_direct() && ret==(uintptr_t)db->jmpnext && !db->dirty)
+        return 0;
+    return db?((ret!=(uintptr_t)db->block)?1:0):0;
+}
+
+uintptr_t getJumpAddress64(uintptr_t addr)
+{
+    return jt_get(addr);
+}
+#endif /* WX86_JT3 */
 
 // Remove the Write flag from an adress range, so DB can be executed
 extern int dyn86_protectdb(void);     // D2Vita SMC write-protection switch (src/dynarec86/dyn86.c)
@@ -1570,10 +1873,19 @@ void init_custommem_helper(box86context_t* ctx)
     memprot = init_rbtree();
 #ifdef DYNAREC
 #ifdef ARM
+#ifdef WX86_JT3
+    for(int i=0; i<JT_L3_SIZE; ++i)
+        jt_l3_default[i] = (uintptr_t)arm_next;
+    for(int i=0; i<JT_L2_SIZE; ++i)
+        jt_l2_default[i] = jt_l3_default;
+    for(int i=0; i<JMPTABL_SIZE; ++i)
+        box86_jmptbl[i] = (uintptr_t*)jt_l2_default;
+#else
     for(int i=0; i<(1<<JMPTABL_SHIFT); ++i)
         box86_jmptbl_default[i] = (uintptr_t)arm_next;
     for(int i=0; i<JMPTABL_SIZE; ++i)
         box86_jmptbl[i] = box86_jmptbl_default;
+#endif
 #else
 #error Unsupported architecture!
 #endif
@@ -1590,9 +1902,9 @@ void init_custommem_helper(box86context_t* ctx)
 void fini_custommem_helper(box86context_t *ctx)
 {
     (void)ctx;
-#ifdef TRACE_MEMSTAT
+#if defined(TRACE_MEMSTAT) && !defined(WX86_JT3)
     size_t njmps = 0, njmps_in_lv1_max = 0;
-    for (size_t idx1 = 0; idx1 < (1 << JMPTABL_SHIFT); ++idx1) {
+    for (size_t idx1 = 0; idx1 < JMPTABL_SIZE; ++idx1) {
         if (box86_jmptbl[idx1] == box86_jmptbl_default) continue;
         size_t njmps_in_cur_lv1 = 0;
         for (size_t idx0 = 0; idx0 < (1 << JMPTABL_SHIFT); ++idx0) {
@@ -1630,9 +1942,11 @@ void fini_custommem_helper(box86context_t *ctx)
         uintptr_t idx = 0;
         uintptr_t end = ((0xFFFFFFFF)>>DYNAMAP_SHIFT);
         box_free(mmaplist);
+#ifndef WX86_JT3   /* JT3 tables live in slabs that are never freed */
         for (int i=0; i<DYNAMAP_SIZE; ++i)
             if(box86_jmptbl[i]!=box86_jmptbl_default)
                 box_free(box86_jmptbl[i]);
+#endif
     }
     kh_destroy(lockaddress, lockaddress);
     lockaddress = NULL;

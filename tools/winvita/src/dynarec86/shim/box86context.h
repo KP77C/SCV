@@ -21,6 +21,9 @@ typedef struct kh_dynablocks_s kh_dynablocks_t;
 #define JMPTABL_SHIFT 16
 #define JMPTABL_SIZE (1<<(32-JMPTABL_SHIFT))
 #define JMPTABLE_MASK ((1<<JMPTABL_SHIFT)-1)
+/* WX86_JT3 (third_party/box86-dynarec/custommem.c): a third level splits each
+ * 64 KiB page into runs of 1<<JT_L3_SHIFT bytes, each with its own small table. */
+#define JT_L3_SHIFT 6
 
 #define MAX_SIGNAL 64
 

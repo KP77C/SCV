@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <malloc.h>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -30,6 +31,13 @@
 #include "runtime/pe_image.h"
 
 using d2rt::Cpu;
+
+extern "C" {
+unsigned d2rt_box86_jmptbl_tables(void);
+unsigned d2rt_box86_jmptbl_fails(void);
+unsigned d2rt_box86_jmptbl_heap_kb(void);
+void d2rt_box86_jmptbl_census(unsigned* pages, unsigned* chunks, unsigned* entries);
+}
 
 namespace sc {
 namespace {
@@ -87,8 +95,21 @@ void heartbeat(Cpu& c, bool force = false) {
     if (!force && !step && !(now - g_last_hb_ms >= 2000 && busy) && now - g_last_hb_ms < 20000) return;
     g_last_hb_ms = now; last_n = g_alloc_n; last_used = used;
     while (used >= g_next_step) g_next_step += 16ull << 20;
-    log("[not-bound] trace: thread %u, VA used %u KiB, Storm allocs %llu (%llu KiB total), mpq opens %llu, whole-file loads %llu; top:%s",
-        cur_tid(), used >> 10, (unsigned long long)g_alloc_n, (unsigned long long)(g_alloc_bytes >> 10),
+    // Host side: the newlib heap (Vita: a fixed _newlib_heap_size_user block)
+    // and the translator's jump tables, 256 KiB each, that live in it.
+    const struct mallinfo mi = mallinfo();
+    char jt[160] = "";
+    static const bool census = getenv("W3_TRACE_JT") != nullptr;
+    if (census || force) {
+        unsigned pg = 0, ch[5] = {}, ne = 0;
+        d2rt_box86_jmptbl_census(&pg, ch, &ne);
+        std::snprintf(jt, sizeof jt, " (census: %u pages, chunks 64/128/256/512/1K %u/%u/%u/%u/%u, %u entries)",
+                      pg, ch[0], ch[1], ch[2], ch[3], ch[4], ne);
+    }
+    log("[not-bound] trace: thread %u, VA used %u KiB, host heap %u/%u KiB, jump tables %u KiB in %u (%u refused)%s, Storm allocs %llu (%llu KiB total), mpq opens %llu, whole-file loads %llu; top:%s",
+        cur_tid(), used >> 10, (unsigned)mi.uordblks >> 10, (unsigned)mi.arena >> 10,
+        d2rt_box86_jmptbl_heap_kb(), d2rt_box86_jmptbl_tables(), d2rt_box86_jmptbl_fails(), jt,
+        (unsigned long long)g_alloc_n, (unsigned long long)(g_alloc_bytes >> 10),
         (unsigned long long)g_open_n, (unsigned long long)g_load_n, top_sites(c, 8).c_str());
 }
 

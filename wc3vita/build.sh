@@ -2,6 +2,11 @@
 # build.sh — WarCraft III Vita boot harness.
 #   ./build.sh               qemu-arm/Linux host test binary -> build-arm/w3vita_boot
 #   TARGET=vita ./build.sh   PS Vita package                 -> build-vita/w3vita.vpk
+# Engine (tools/winvita), built first with the WC3 flavour: the three-level
+# jump table (WX86_JT3, 43 -> ~6 MiB of host heap at the menu) + counters:
+#   cd ../tools/winvita && LIBTAG=_w3 EXTRA="-DWX86_JT3 -DPROF_COUNTERS" ./build.sh
+#   cd ../tools/winvita && LIBTAG=_w3 EXTRA="-DWX86_JT3 -DPROF_COUNTERS" TARGET=vita ./build.sh
+# then WXTAG=_w3 ./build.sh (host) or WXTAG=_w3 TARGET=vita ./build.sh.
 set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 WX="${WINX86:-$ROOT/../tools/winvita}"
@@ -46,13 +51,14 @@ if [ "${TARGET:-}" = vita ]; then
 fi
 OUT="$ROOT/build-arm"
 mkdir -p "$OUT"
-[ -f "$WX/build-arm/libwinx86.a" ] || (cd "$WX" && ./build.sh)
+WXLIB_HOST="$WX/build-arm/libwinx86${WXTAG:-}.a"
+[ -f "$WXLIB_HOST" ] || { echo "missing $WXLIB_HOST (see the engine line in the header)"; exit 1; }
 # Host GL: Mesa's OSMesa for armhf (apt: libosmesa6-dev:armhf), so the
 # binary is dynamic: run it as  qemu-arm -L / build-arm/w3vita_boot <game-dir>
 mkdir -p "$OUT/inc"; for d in GL KHR; do [ -e "$OUT/inc/$d" ] || ln -s "/usr/include/$d" "$OUT/inc/$d"; done
-arm-linux-gnueabihf-g++ -O1 -g -std=gnu++17 -marm -march=armv7-a+simd -mfpu=neon -mfloat-abi=hard \
+arm-linux-gnueabihf-g++ -O1 -g -std=gnu++17 -marm -march=armv7-a+simd -mfpu=neon -mfloat-abi=hard ${WXTAG:+-DPROF_COUNTERS} \
   -I"$WX/src" -I"$OUT/inc" -Wall -Wno-unused-parameter \
   $SRCS \
-  "$WX/build-arm/libwinx86.a" -L/usr/lib/arm-linux-gnueabihf -lOSMesa -lpthread -lm -ldl -no-pie -Wl,-Ttext-segment=0x40000000 \
+  "$WXLIB_HOST" -L/usr/lib/arm-linux-gnueabihf -lOSMesa -lpthread -lm -ldl -no-pie -Wl,-Ttext-segment=0x40000000 \
   -o "$OUT/w3vita_boot"
 echo "built $OUT/w3vita_boot"

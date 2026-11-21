@@ -310,6 +310,28 @@ void jump_to_epilog(dynarec_arm_t* dyn, uintptr_t ip, int reg, int ninst)
     D2EPH_ACC(je, D2EP_S_BLOCKEND);
 }
 
+/* x3 = jump-table entry for xEIP (x2 clobbered). WX86_JT3: three levels, see
+ * custommem.c. */
+#ifdef WX86_JT3
+#define JMPTABLE_LOOKUP_X3() do {                                           \
+        MOV32(x2, getJumpTable());                                          \
+        MOV_REG_LSR_IMM5(x3, xEIP, JMPTABL_SHIFT);                          \
+        LDR_REG_LSL_IMM5(x2, x2, x3, 2);                                    \
+        UBFX(x3, xEIP, JT_L3_SHIFT, JMPTABL_SHIFT-JT_L3_SHIFT);             \
+        LDR_REG_LSL_IMM5(x2, x2, x3, 2);                                    \
+        UBFX(x3, xEIP, 0, JT_L3_SHIFT);                                     \
+        LDR_REG_LSL_IMM5(x3, x2, x3, 2);                                    \
+    } while(0)
+#else
+#define JMPTABLE_LOOKUP_X3() do {                                           \
+        MOV32(x2, getJumpTable());                                          \
+        MOV_REG_LSR_IMM5(x3, xEIP, JMPTABL_SHIFT);                          \
+        LDR_REG_LSL_IMM5(x2, x2, x3, 2);    /* shiftsizeof(uintptr_t) */    \
+        UBFX(x3, xEIP, 0, JMPTABL_SHIFT);                                   \
+        LDR_REG_LSL_IMM5(x3, x2, x3, 2);    /* shiftsizeof(uintptr_t) */    \
+    } while(0)
+#endif
+
 void jump_to_next(dynarec_arm_t* dyn, uintptr_t ip, int reg, int ninst)
 {
     D2EPH_MARK(jn);
@@ -319,11 +341,7 @@ void jump_to_next(dynarec_arm_t* dyn, uintptr_t ip, int reg, int ninst)
         if(reg!=xEIP) {
             MOV_REG(xEIP, reg);
         }
-        MOV32(x2, getJumpTable());
-        MOV_REG_LSR_IMM5(x3, xEIP, JMPTABL_SHIFT);
-        LDR_REG_LSL_IMM5(x2, x2, x3, 2);    // shiftsizeof(uintptr_t)
-        UBFX(x3, xEIP, 0, JMPTABL_SHIFT);
-        LDR_REG_LSL_IMM5(x3, x2, x3, 2);    // shiftsizeof(uintptr_t)
+        JMPTABLE_LOOKUP_X3();
     } else {
         uintptr_t p = getJumpTableAddress(ip); 
         MOV32(x2, p);
@@ -354,11 +372,7 @@ void ret_to_epilog(dynarec_arm_t* dyn, int ninst)
         LDR_IMM9_COND(cNE, xSP, xEmu, offsetof(x86emu_t, xSPSave)); // load pointer only if not already on top
         SUB_COND_IMM8(cEQ, xSP, xSP, 8);   // unpop
     }
-    MOV32(x2, getJumpTable());
-    MOV_REG_LSR_IMM5(x3, xEIP, JMPTABL_SHIFT);
-    LDR_REG_LSL_IMM5(x2, x2, x3, 2);    // shiftsizeof(uintptr_t)
-    UBFX(x3, xEIP, 0, JMPTABL_SHIFT);
-    LDR_REG_LSL_IMM5(x3, x2, x3, 2);    // shiftsizeof(uintptr_t)
+    JMPTABLE_LOOKUP_X3();
     MOV_REG(x1, xEIP);
     #ifdef HAVE_TRACE
     MOV_REG(x2, 15);    // move current PC to x2, for tracing
@@ -387,11 +401,7 @@ void retn_to_epilog(dynarec_arm_t* dyn, int ninst, int n)
         LDR_IMM9_COND(cNE, xSP, xEmu, offsetof(x86emu_t, xSPSave));
         SUB_COND_IMM8(cEQ, xSP, xSP, 8);   // unpop
     }
-    MOV32(x2, getJumpTable());
-    MOV_REG_LSR_IMM5(x3, xEIP, JMPTABL_SHIFT);
-    LDR_REG_LSL_IMM5(x2, x2, x3, 2);    // shiftsizeof(uintptr_t)
-    UBFX(x3, xEIP, 0, JMPTABL_SHIFT);
-    LDR_REG_LSL_IMM5(x3, x2, x3, 2);    // shiftsizeof(uintptr_t)
+    JMPTABLE_LOOKUP_X3();
     MOV_REG(x1, xEIP);
     #ifdef HAVE_TRACE
     MOV_REG(x2, 15);    // move current PC to x2, for tracing

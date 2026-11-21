@@ -225,7 +225,7 @@ void* LinkNext(x86emu_t* emu, uintptr_t addr, void* x2)
     // for that single address.
     if(((dyn86_eiptrap && addr==dyn86_eiptrap) || (dyn86_eiptrap2 && addr==dyn86_eiptrap2)) && block->jmpnext) {
         uintptr_t* je = (uintptr_t*)getJumpTableAddress(addr);
-        if(je) *je = (uintptr_t)block->jmpnext;
+        if(je && !isJumpTableSharedSlot((uintptr_t)je)) *je = (uintptr_t)block->jmpnext;
     }
     return jblock;
 }

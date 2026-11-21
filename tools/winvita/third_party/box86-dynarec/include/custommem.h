@@ -44,6 +44,11 @@ void setJumpTableDefaultRef(void* addr, void* jmp);
 int isJumpTableDefault(void* addr);
 uintptr_t getJumpTable();
 uintptr_t getJumpTableAddress(uintptr_t addr);
+int isJumpTableSharedSlot(uintptr_t p); // 1 = the read-only default slot (page has no table)
+unsigned d2rt_box86_jmptbl_tables(void);   // level-2 tables allocated
+unsigned d2rt_box86_jmptbl_fails(void);    // level-2 allocations refused
+unsigned d2rt_box86_jmptbl_heap_kb(void);  // host heap the tables take
+void d2rt_box86_jmptbl_census(unsigned* pages, unsigned* chunks /*[5]: 256B..4K*/, unsigned* entries);
 uintptr_t getJumpAddress(uintptr_t addr);
 #endif
 
