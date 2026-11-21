@@ -234,6 +234,54 @@ void seed_registry() {
     reg_seed_dword(k + "\\video", "refreshrate", 60);
 }
 
+// ---- hot trivial imports as guest x86 ---------------------------------------
+// On Windows these are a few instructions on the thread block (fs:), never a
+// system call. MSVCR120 runs without the Fls* functions here, so nearly every
+// C runtime call does GetLastError + TlsGetValue + SetLastError; as shims each
+// one leaves the translated code (build 4 log: up to 4.5 s of 10 s during a
+// load). As guest code the translator inlines them. Layout as the shims:
+// last error at fs:[0x34], TLS slots at fs:[0xE10], 64 of them.
+void inline_hot_imports() {
+    struct Stub { const char* name; std::vector<uint8_t> code; uint32_t va; };
+    static std::vector<Stub> stubs = {
+        { "GetLastError", { 0x64, 0xA1, 0x34, 0, 0, 0,                    // mov eax, fs:[0x34]
+                            0xC3 }, 0 },                                   // ret
+        { "SetLastError", { 0x8B, 0x44, 0x24, 0x04,                       // mov eax, [esp+4]
+                            0x64, 0xA3, 0x34, 0, 0, 0,                    // mov fs:[0x34], eax
+                            0xC2, 0x04, 0x00 }, 0 },                       // ret 4
+        { "TlsGetValue",  { 0x8B, 0x44, 0x24, 0x04,                       // mov eax, [esp+4]
+                            0x83, 0xF8, 0x40,                             // cmp eax, 64
+                            0x73, 0x16,                                   // jae bad
+                            0x64, 0xC7, 0x05, 0x34, 0, 0, 0, 0, 0, 0, 0,  // mov dword fs:[0x34], 0
+                            0x64, 0x8B, 0x04, 0x85, 0x10, 0x0E, 0, 0,     // mov eax, fs:[eax*4+0xE10]
+                            0xC2, 0x04, 0x00,                             // ret 4
+                            0x31, 0xC0,                                   // bad: xor eax, eax
+                            0xC2, 0x04, 0x00 }, 0 },                       // ret 4
+        { "TlsSetValue",  { 0x8B, 0x44, 0x24, 0x04,                       // mov eax, [esp+4]
+                            0x83, 0xF8, 0x40,                             // cmp eax, 64
+                            0x73, 0x14,                                   // jae bad
+                            0x8B, 0x4C, 0x24, 0x08,                       // mov ecx, [esp+8]
+                            0x64, 0x89, 0x0C, 0x85, 0x10, 0x0E, 0, 0,     // mov fs:[eax*4+0xE10], ecx
+                            0xB8, 0x01, 0, 0, 0,                          // mov eax, 1
+                            0xC2, 0x08, 0x00,                             // ret 8
+                            0x31, 0xC0,                                   // bad: xor eax, eax
+                            0xC2, 0x08, 0x00 }, 0 },                       // ret 8
+    };
+    static const bool off = [] { const char* e = std::getenv("W3_INLINE_IMPORTS"); return e && e[0] == '0'; }();
+    if (off || !g_br || !g_cpu) return;
+    if (!stubs[0].va) {
+        for (Stub& st : stubs) {
+            st.va = wx86_scratch_alloc((uint32_t)st.code.size() + 16);
+            if (!st.va) return;
+            g_cpu->write(st.va, st.code.data(), (uint32_t)st.code.size());
+        }
+    }
+    int n = 0;
+    for (const Stub& st : stubs) n += g_br->repatch_import("KERNEL32.dll", st.name, st.va);
+    static int said = 0;
+    if (said++ < 4) log("[not-bound] inline imports: GetLastError/SetLastError/TlsGetValue/TlsSetValue as guest code at %d import slots", n);
+}
+
 void install_w3(d2rt::Bridge& br) {
     seed_registry();
     if (const d2rt::Shim* r = br.find_shim("KERNEL32.dll", "ReadFile")) g_read_sync = *r;

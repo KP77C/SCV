@@ -154,9 +154,23 @@ bool hook(Cpu& cpu, d2rt::Bridge& br, d2rt::PeImage* storm, uint32_t ord, const 
 
 void trace_report(Cpu& c) { heartbeat(c, true); }
 
+// Memory line for the 10 s report (any thread: no hook state is read).
+void trace_mem_line() {
+    const struct mallinfo mi = mallinfo();
+    log("[not-bound] memory: guest VA used %u KiB, host heap %u/%u KiB, jump tables %u KiB in %u (%u refused)",
+        va_used() >> 10, (unsigned)mi.uordblks >> 10, (unsigned)mi.arena >> 10,
+        d2rt_box86_jmptbl_heap_kb(), d2rt_box86_jmptbl_tables(), d2rt_box86_jmptbl_fails());
+}
+
 void install_w3_trace(Cpu& cpu, d2rt::Bridge& br) {
-    if (const char* e = std::getenv("W3_TRACE")) if (std::atoi(e) == 0) return;
+    // W3_TRACE=0: nothing. Default (1): file opens and whole-file loads.
+    // W3_TRACE=2 (or W3_TRACE_ALL=1): also every Storm allocation by
+    // file:line -- the build 3 diagnosis; it cost up to 7% of the game's core.
+    int level = 1;
+    if (const char* e = std::getenv("W3_TRACE")) level = std::atoi(e);
+    if (level <= 0) return;
     g_all = std::getenv("W3_TRACE_ALL") != nullptr;
+    if (g_all) level = 2;
     d2rt::PeImage* storm = br.module("Storm.dll");
     if (!storm) { log("[not-bound] trace: Storm.dll not loaded"); return; }
     int ok = 0;
@@ -168,7 +182,7 @@ void install_w3_trace(Cpu& cpu, d2rt::Bridge& br) {
         note_name(c, "load", gs(c, c.arg(0)), ++g_load_n, c.arg(4));
         heartbeat(c);
     });
-    ok += hook(cpu, br, storm, 401, "SMemAlloc", [](Cpu& c) {
+    if (level >= 2) ok += hook(cpu, br, storm, 401, "SMemAlloc", [](Cpu& c) {
         const uint32_t size = c.arg(0), file = c.arg(1), line = c.arg(2);
         Site& s = g_sites[(uint64_t)file << 32 | line];
         s.file = file; s.line = line; ++s.n; s.bytes += size;
@@ -178,7 +192,7 @@ void install_w3_trace(Cpu& cpu, d2rt::Bridge& br) {
                 gs(c, file, 64).c_str(), line, cur_tid(), va_used() >> 10, guest_stack(c).c_str());
         heartbeat(c);
     });
-    log("[not-bound] trace: %d of 3 Storm hooks on (file opens, whole-file loads, allocations)", ok);
+    log("[not-bound] trace: %d Storm hooks on (file opens, whole-file loads%s)", ok, level >= 2 ? ", allocations" : "");
 }
 
 }  // namespace sc

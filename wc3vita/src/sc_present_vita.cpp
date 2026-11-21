@@ -292,9 +292,10 @@ constexpr int kMaxMods = 16;
 ModRange g_mods[kMaxMods]; std::atomic<int> g_nmods{0};
 std::atomic<uint32_t> g_msamp[kMaxMods + 3];   // modules, then: shims, other memory, no sample
 void build_module_ranges() {
-    static const char* names[] = { "DeusEx.exe", "Core.dll", "Engine.dll", "Render.dll", "OpenGLDrv.dll", "SoftDrv.dll",
-                                   "DeusEx.dll", "Extension.dll", "ConSys.dll", "Fire.dll", "Galaxy.dll", "WinDrv.dll",
-                                   "Window.dll", "MSVCRT.dll", "IpDrv.dll" };
+    // WarCraft III's modules (Game.dll, MSVCP120 and the Miles plug-ins
+    // arrive by LoadLibraryA: window_report calls this again every 10 s).
+    static const char* names[] = { "War3.exe", "Game.dll", "Storm.dll", "MSVCR120.dll", "MSVCP120.dll", "mss32.dll",
+                                   "ijl15.dll", "Mp3dec.asi", "Mssdolby.m3d", "Msseax2.m3d", "Mssfast.m3d", "Reverb3.flt" };
     int n = 0;
     for (const char* nm : names) {
         if (n >= kMaxMods || !g_br) break;
@@ -305,12 +306,30 @@ void build_module_ranges() {
     }
     g_nmods.store(n);
 }
+// Hot spots: 64-byte code buckets, counted in a small open-addressed table
+// (written only by the sampler thread; read and cleared by the 10 s log).
+// The EIP is the start of the last block entered through the dispatcher, so
+// this ranks code reached by returns, indirect calls and shims, not every
+// directly linked block: read it as "around here", not as an exact profile.
+constexpr uint32_t kHot = 4096;
+std::atomic<uint32_t> g_hot_key[kHot], g_hot_n[kHot];
+void hot_add(uint32_t ip) {
+    const uint32_t key = (ip >> 6) | 0x80000000u;
+    uint32_t h = (key * 2654435761u) >> 20;
+    for (uint32_t i = 0; i < 16; ++i, h = (h + 1) & (kHot - 1)) {
+        const uint32_t k = g_hot_key[h].load(std::memory_order_relaxed);
+        if (k == key) { g_hot_n[h].fetch_add(1, std::memory_order_relaxed); return; }
+        if (!k) { g_hot_key[h].store(key, std::memory_order_relaxed); g_hot_n[h].store(1, std::memory_order_relaxed); return; }
+    }
+}
+constexpr uint32_t kTrapLo = 0x0E900000u, kTrapHi = 0x0EA00000u;   // boot.cpp kTrapBase: shim trap slots
 void dx_sample_eip() {
     if (!g_ip) return;
     const uint32_t ip = *g_ip;
+    hot_add(ip);
     const int n = g_nmods.load();
     for (int i = 0; i < n; ++i) if (ip >= g_mods[i].lo && ip < g_mods[i].hi) { g_msamp[i]++; return; }
-    if (ip >= 0x0D100000u && ip < 0x0D800000u) { g_msamp[kMaxMods]++; return; }
+    if (ip >= kTrapLo && ip < kTrapHi) { g_msamp[kMaxMods]++; return; }
     g_msamp[kMaxMods + 1]++;
 }
 
@@ -554,7 +573,28 @@ void window_report(uint64_t now) {
             }
             log("[not-bound] %s", line);
         }
+        {   // the 16 hottest 64-byte code spots, as module+offset
+            uint32_t key[kHot], cnt[kHot], tot = 0;
+            for (uint32_t i = 0; i < kHot; ++i) { key[i] = g_hot_key[i].exchange(0); cnt[i] = g_hot_n[i].exchange(0); tot += cnt[i]; }
+            if (!tot) tot = 1;
+            int k = std::snprintf(line, sizeof line, "hot spots (%u samples):", tot);
+            const int n = g_nmods.load();
+            for (int pass = 0; pass < 16; ++pass) {
+                uint32_t best = kHot;
+                for (uint32_t i = 0; i < kHot; ++i) if (key[i] && cnt[i] && (best == kHot || cnt[i] > cnt[best])) best = i;
+                if (best == kHot) break;
+                const uint32_t ip = (key[best] & 0x7FFFFFFFu) << 6;
+                const char* nm = (ip >= kTrapLo && ip < kTrapHi) ? "trap" : "?"; uint32_t off = ip;
+                for (int i = 0; i < n; ++i) if (ip >= g_mods[i].lo && ip < g_mods[i].hi) { nm = g_mods[i].name; off = ip - g_mods[i].lo; }
+                k += std::snprintf(line + k, sizeof line - k, " %s+%x %u.%u%%", nm, off, cnt[best] * 100 / tot, cnt[best] * 1000 / tot % 10);
+                cnt[best] = 0;
+                if (k >= (int)sizeof line - 48) break;
+            }
+            log("[not-bound] %s", line);
+        }
         if (g_br && g_br->prof_window(line, sizeof line, 8) > 0) log("[not-bound] shim time (10 s):%s", line);
+        trace_mem_line();
+        build_module_ranges();   // modules loaded since (LoadLibraryA)
     }
     {
         const uint32_t r = g_st_run.exchange(0), rd = g_st_ready.exchange(0), w = g_st_wait.exchange(0), o = g_st_other.exchange(0);

@@ -110,6 +110,11 @@ bool              g_on = false;              // is D2_SON set
 bool              g_log = false;             // D2_SONLOG
 bool              g_oldEnd = false;          // WX86_SONOLDEND=1: old park-at-end (A/B test only)
 int               g_voiceCap = 0;            // D2_SONVOICES, 0 = no cap
+// WX86_SON_STALE_MS: a looping ring not locked for this long is muted (Deus
+// Ex, build 5: speech ring replaying during loads). 0 = never mute: WarCraft
+// III's Miles mixer refills its ring from a timer thread that, at console
+// frame rates, routinely goes longer than that, and the rule silenced it.
+uint32_t          g_staleUs = 300000;
 uint64_t          g_maxFrames = 0;           // D2_SONMAXS: sink duration cap, in frames (0 = unlimited)
 std::string       g_sinkWant;                // "wav" / "null" / "vita"
 std::string       g_dumpPath;
@@ -255,7 +260,7 @@ void mix_grain(Cpu* c, int frames) {
             if (!v.host && c) v.host = (const uint8_t*)c->hostptr(v.buf, v.len);
             const uint64_t acc0 = v.posAcc;
             if (!v.host) c_nohost.fetch_add(1, std::memory_order_relaxed);
-            else if (v.looping && v.locks >= 8 && wx86_now_us() - v.lastLockUs > 300000u) {
+            else if (g_staleUs && v.looping && v.locks >= 8 && wx86_now_us() - v.lastLockUs > g_staleUs) {
                 c_stale.fetch_add(1, std::memory_order_relaxed);   // stale stream: silence
             }
             else if (!g_voiceCap || (int)g_snap.size() < g_voiceCap) {
@@ -968,6 +973,7 @@ void install(Bridge& br, Cpu& cpu, const HostOps& ops) {
     }
     g_log = env2("WX86_SONLOG", "D2_SONLOG") != nullptr;
     if (const char* n = env2("WX86_SONVOICES", "D2_SONVOICES")) g_voiceCap = atoi(n);
+    if (const char* n = getenv("WX86_SON_STALE_MS")) g_staleUs = (uint32_t)atoi(n) * 1000u;
     // Under a virtual clock, guest time can run far faster than real time, so
     // an unbounded proof WAV can grow huge. SONMAXS bounds what's written
     // (mixing itself keeps going — stopping the mixer would freeze cursors

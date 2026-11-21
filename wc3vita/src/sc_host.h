@@ -71,12 +71,14 @@ bool present_gl_mode();
 bool present_ime_open();   // Vita: the on-screen keyboard is up (GL mode draws it in vglSwapBuffers)
 void install_dx(d2rt::Bridge& br);       // Deus Ex extras (dx_shims.cpp)
 void install_w3(d2rt::Bridge& br);       // WarCraft III extras (w3_shims.cpp)
+void inline_hot_imports();               // TLS / last-error imports as guest x86 (w3_shims.cpp); after each module load
 void install_dshow(d2rt::Bridge& br);    // stand-in DirectShow graph (w3_dshow.cpp)
 void set_default_window_size(int w, int h);   // CW_USEDEFAULT window size (sc_user32.cpp)
 std::string guest_stack(d2rt::Cpu& c);       // " module+0xoff ..." return addresses on the guest stack
 void gl_render_size(uint32_t* w, uint32_t* h); // the size the game renders at (w3_gl.cpp, W3_RES)
 void install_w3_trace(d2rt::Cpu& cpu, d2rt::Bridge& br);   // Storm file/alloc trace (w3_trace.cpp)
 void trace_report(d2rt::Cpu& c);                       // one trace status line now
+void trace_mem_line();                                 // memory line (guest VA, host heap, jump tables)
 void install_net(d2rt::Bridge& br);      // offline Winsock (w3_net.cpp)
 void install_gl(d2rt::Bridge& br);       // OPENGL32 + pixel formats (w3_gl.cpp)
 

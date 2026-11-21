@@ -72,7 +72,7 @@ enum {
  * produced what. Shared bump-allocated arena; an overflow is reported, never
  * silent. */
 typedef struct { uint32_t x86; uint32_t off; } d2ep_map_t;
-#define D2EP_MAPCAP 1200000
+#define D2EP_MAPCAP 6000000
 
 typedef struct d2ep_block_s {
     uint64_t exec;                    /* incremented by the EMITTED PROLOGUE */
@@ -92,7 +92,7 @@ typedef struct d2ep_block_s {
     uint32_t sub_n[D2EP_S_NSUB];
 } d2ep_block_t;
 
-#define D2EP_MAXBLOCKS 32768
+#define D2EP_MAXBLOCKS 196608   /* WarCraft III: ~50k blocks by the menu */
 
 extern d2ep_block_t d2ep_blocks[D2EP_MAXBLOCKS];
 extern int          d2ep_nblocks;

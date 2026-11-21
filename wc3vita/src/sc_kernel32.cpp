@@ -28,6 +28,7 @@
 #include <ctime>
 #include <dirent.h>
 #include <map>
+#include <set>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -255,12 +256,25 @@ void mark_writable_sections_impl(Cpu& c, uint32_t base, const std::vector<uint8_
 
 uint32_t load_library(Cpu& c, const std::string& name) {
     std::string lb = lower(with_dll_ext(basename_of(name)));
+    {   // How often the game asks, by name: 1st, 2nd, 10th, 100th, ... call.
+        static std::map<std::string, uint32_t> calls;
+        const uint32_t k = ++calls[lb];
+        if (k == 2 || k == 10 || k == 100 || k == 1000 || k % 10000 == 0)
+            log("[not-bound] LoadLibraryA(%s) call #%u", name.c_str(), k);
+    }
     auto it = g_modkey.find(lb);
     if (it != g_modkey.end()) return g_br->module_base(it->second);
+    // Windows' own DLLs are answered without touching the memory card, and so
+    // are names already found missing: each probe is a file open on the Vita,
+    // and the game asks for some of these many times a second (build 4 log:
+    // LoadLibraryA up to 2.4 s of every 10 s).
+    if (is_system_dll(lb)) return sysmod_handle(lb);
+    static std::set<std::string> missing;
+    if (missing.count(lb)) { wx86_set_lasterr(c, 126); return 0; }
     std::string host = resolve_path(name);
     std::vector<uint8_t> bytes = read_file(host);
     if (bytes.empty()) {
-        if (is_system_dll(lb)) return sysmod_handle(lb);
+        missing.insert(lb);
         log("[not-bound] [cause: file not found] LoadLibraryA(%s)", name.c_str());
         wx86_set_lasterr(c, 126);   // ERROR_MOD_NOT_FOUND
         return 0;
@@ -280,6 +294,7 @@ uint32_t load_library(Cpu& c, const std::string& name) {
     if (!pi) { log("[not-bound] [cause: load error] LoadLibraryA(%s): %s", name.c_str(), err.c_str()); return 0; }
     g_modkey[lb] = lb; g_modbase[pi->load_base()] = lb;
     mark_writable_sections_impl(c, pi->load_base(), bytes, lb);
+    inline_hot_imports();   // the new module's own TLS / last-error imports
     log("[not-bound] LoadLibraryA(%s) -> 0x%08x", name.c_str(), pi->load_base());
     if (lb == "smackw32.dll" && std::getenv("SC_TRACE_SMK")) {
         // Debug: observe Smacker's sound-service routine (entry = base+0x8e20,

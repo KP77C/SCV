@@ -129,7 +129,12 @@ static void start_stall_watch() {
 }
 
 extern "C" { extern uint64_t dyn86_jp_created, dyn86_jp_invalid; }
+// Host profiling (engine built with -DD2_EMITPROF): W3_EPCSV=<file> writes
+// every translated block's execution count every 300 frames.
+extern "C" void d2ep_csv(const char* path) __attribute__((weak));
 static void present_pump(d2rt::Cpu& c) {
+    static const char* epcsv = std::getenv("W3_EPCSV");
+    if (epcsv && d2ep_csv && g_frames && g_frames % 300 == 0) d2ep_csv(epcsv);
     uint64_t now = wx86_now_us();
     start_stall_watch();
     ++g_frames; ++g_win_frames;

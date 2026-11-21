@@ -337,6 +337,10 @@ int main(int argc, char** argv) {
     // default NaN) to compare against the console.
     if (const char* fp = std::getenv("SC_FPSCR")) { uint32_t v = (uint32_t)std::strtoul(fp, nullptr, 16); asm volatile("vmsr fpscr, %0" :: "r"(v)); }
 #endif
+    // Never mute a looping sound ring for going unrefilled (a Deus Ex rule):
+    // Miles refills WarCraft III's mixer ring from a timer thread that goes
+    // longer than the rule's 300 ms at console frame rates.
+    setenv("WX86_SON_STALE_MS", "0", 0);
     // The ARM floating-point mode the guest's x87/SSE code runs under: the
     // Vita's default may differ from Linux's (flush-to-zero, default NaN).
     { uint32_t fpscr; asm volatile("vmrs %0, fpscr" : "=r"(fpscr)); log("[not-bound] fpscr 0x%08x", fpscr); }
@@ -684,6 +688,7 @@ int main(int argc, char** argv) {
     }
     uint32_t entry = br.module(kExeName)->entry_va();
     sched.set_main(entry, kMainStack + kMainStackSize - 0x1000u, 0);
+    sc::inline_hot_imports();   // fs: now points at each guest thread's own block
     log("[not-bound] entering %s at 0x%08x", kExeName, entry);
     sched.run();
     log("[not-bound] scheduler stopped: %s", sched.stop_reason());
