@@ -177,7 +177,7 @@ bool is_system_dll(const std::string& lb) {
     static const char* sys[] = { "kernel32.dll","user32.dll","gdi32.dll","advapi32.dll","shell32.dll",
         "version.dll","imm32.dll","comdlg32.dll","ddraw.dll","dsound.dll","winmm.dll","wsock32.dll",
         "ws2_32.dll","ntdll.dll","ole32.dll","tapi32.dll","dbghelp.dll","mscoree.dll","wininet.dll",
-        "msvcrt.dll","oleaut32.dll","comctl32.dll","rpcrt4.dll","psapi.dll","riched20.dll" };
+        "msvcrt.dll","oleaut32.dll","comctl32.dll","rpcrt4.dll","psapi.dll","riched20.dll","opengl32.dll" };
     for (auto* s : sys) if (lb == s) return true;
     return false;
 }

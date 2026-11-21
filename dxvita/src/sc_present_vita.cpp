@@ -203,6 +203,7 @@ SceGxmNotification g_notif[kSlots];
 int g_back = 0, g_front = kBuffers - 1;
 int g_interval = 1;                    // vblanks per frame: 1 = 60 Hz, 2 = 30 Hz
 bool g_ok = false;
+bool g_gl = false;                     // vitaGL owns the GPU (OpenGL renderer)
 
 // Guest -> display thread hand-off. The surface is read racily, exactly as a
 // real card scans out a DirectDraw primary; the palette is double-buffered by
@@ -658,9 +659,20 @@ bool present_init() {
     std::memset(&ai, 0, sizeof ai); std::memset(&bi, 0, sizeof bi);
     sceAppUtilInit(&ai, &bi);
     SceCommonDialogConfigParam cfg; sceCommonDialogConfigParamInit(&cfg); sceCommonDialogSetConfigParam(&cfg);
+    g_main_thread = sceKernelGetThreadId();
+    g_gl = present_gl_mode();
+    if (g_gl) {
+        // The OpenGL renderer: vitaGL sets up the GPU and the display when the
+        // game creates its GL context, and every frame is drawn and shown on
+        // the guest thread. No display thread of our own.
+        g_ok = true;
+        { SceUID t = sceKernelCreateThread("sc_sampler", sampler_main, 0x60, 0x2000, 0, SCE_KERNEL_CPU_MASK_USER_2, nullptr);
+          if (t >= 0) sceKernelStartThread(t, 0, nullptr); }
+        log("[not-bound] presenter: OpenGL renderer through vitaGL, 640x480 drawn at 725x544 pillarboxed");
+        return true;
+    }
     g_ok = gpu_init();
     if (!g_ok) return false;
-    g_main_thread = sceKernelGetThreadId();
     g_display_thread = sceKernelCreateThread("sc_display", display_main, 0x40, 0x10000, 0, SCE_KERNEL_CPU_MASK_USER_1, nullptr);
     if (g_display_thread < 0) { log("[not-bound] [cause: display thread rc=0x%08x]", (unsigned)g_display_thread); return false; }
     wx86_vita_core_register("display", g_display_thread, SCE_KERNEL_CPU_MASK_USER_1, 0);
@@ -687,8 +699,7 @@ bool present_init() {
 void present_shutdown() {
     g_quit.store(1);
     if (g_display_thread >= 0) { SceUInt to = 500000; sceKernelWaitThreadEnd(g_display_thread, nullptr, &to); }
-    sceGxmDisplayQueueFinish();
-    sceGxmFinish(g_ctx);
+    if (g_ctx) { sceGxmDisplayQueueFinish(); sceGxmFinish(g_ctx); }
     d2rt::dsound::shutdown();
     log_flush();
 }
@@ -698,6 +709,15 @@ void present(d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t
     static uint64_t last_us = 0;
     const uint64_t now = wx86_now_us();
     g_guest_presents.fetch_add(1);
+    if (g_gl) {   // one GL frame was just shown (vglSwapBuffers)
+        static uint64_t last_swap = 0;
+        if (last_swap) {
+            const uint64_t dt = now - last_swap, budget = 16667u * g_interval + 1500u;
+            ++g_win.frames; if (dt > budget) ++g_win.misses; if (dt > g_win.worst_us) g_win.worst_us = dt;
+        }
+        last_swap = now;
+        window_report(now);
+    }
     if (!g_ip) {
         g_ip = c.ip_ptr();
         if (d2rt::PeImage* st = g_br ? g_br->module("storm.dll") : nullptr) { g_storm_lo = st->load_base(); g_storm_hi = g_storm_lo + st->image_size(); }

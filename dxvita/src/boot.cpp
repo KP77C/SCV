@@ -238,19 +238,40 @@ void sc::dump_arena(d2rt::Cpu& c, const std::string& dir) {
 // The port's own settings file, System/DXVita.ini, made once from the game's
 // DeusEx.ini with the port's overrides; the game is started with
 // INI=DXVita.ini, so the PC settings in DeusEx.ini are never touched.
+bool sc::present_gl_mode() {
+#ifdef DX_NO_GL
+    return false;
+#else
+    const char* rs = std::getenv("DX_RENDER");
+    return !(rs && std::strcmp(rs, "soft") == 0);
+#endif
+}
+
 static void make_port_ini() {
+    // Made from DeusEx.ini the first time; after that the game's own saved
+    // settings in DXVita.ini are kept and only the port's overrides are
+    // applied again (so the renderer can be switched with DX_RENDER).
     const std::string out = resolve_path("DXVita.ini");
-    if (FILE* f = std::fopen(out.c_str(), "rb")) { std::fclose(f); return; }
-    std::vector<uint8_t> src = read_file(resolve_path("DeusEx.ini"));
+    std::vector<uint8_t> src = read_file(out);
+    if (src.empty()) src = read_file(resolve_path("DeusEx.ini"));
     if (src.empty()) { log("[not-bound] [cause: file not found] DeusEx.ini"); return; }
+    // DX_RENDER=soft: the software renderer (a 2D picture per frame);
+    // otherwise OpenGL (OSMesa on the host, the Vita GPU through vitaGL).
+    const bool soft = !sc::present_gl_mode();
+    const char* dev = soft ? "SoftDrv.SoftwareRenderDevice" : "OpenGLDrv.OpenGLRenderDevice";
     struct Ov { const char* section; const char* key; const char* value; };
-    static const Ov ov[] = {
-        { "Engine.Engine", "GameRenderDevice", "SoftDrv.SoftwareRenderDevice" },
-        { "Engine.Engine", "WindowedRenderDevice", "SoftDrv.SoftwareRenderDevice" },
-        { "Engine.Engine", "RenderDevice", "SoftDrv.SoftwareRenderDevice" },
+    const Ov ov[] = {
+        { "Engine.Engine", "GameRenderDevice", dev },
+        { "Engine.Engine", "WindowedRenderDevice", dev },
+        { "Engine.Engine", "RenderDevice", dev },
         { "WinDrv.WindowsClient", "StartupFullscreen", "False" },
         { "WinDrv.WindowsClient", "UseDirectDraw", "False" },
-        { "WinDrv.WindowsClient", "WindowedColorBits", "16" },
+        { "WinDrv.WindowsClient", "WindowedColorBits", soft ? "16" : "32" },
+        { "WinDrv.WindowsClient", "WindowedViewportX", "640" },
+        { "WinDrv.WindowsClient", "WindowedViewportY", "480" },
+        // Textures go up as plain RGBA, not as palettes with a lookup table.
+        { "OpenGLDrv.OpenGLRenderDevice", "UsePalette", "0" },
+        { "OpenGLDrv.OpenGLRenderDevice", "ShareLists", "0" },
     };
     std::string text(src.begin(), src.end()), res, section;
     size_t i = 0;
@@ -270,7 +291,7 @@ static void make_port_ini() {
         i = j + 1;
     }
     if (FILE* f = std::fopen(out.c_str(), "wb")) { std::fwrite(res.data(), 1, res.size(), f); std::fclose(f); }
-    log("[not-bound] wrote %s (software renderer, windowed)", out.c_str());
+    log("[not-bound] wrote %s (%s, windowed)", out.c_str(), dev);
 }
 
 static bool vquery(uint32_t a, uint32_t& base, uint32_t& size, uint32_t& state,
@@ -417,6 +438,9 @@ int main(int argc, char** argv) {
     sc::install_user32(br);
     sc::install_ddraw(br);
     sc::install_dx(br);
+#ifndef DX_NO_GL
+    sc::install_gl(br);
+#endif
     {   // DirectSound: the engine's COM emulation, mixed at 22.05 kHz for now.
         static d2rt::dsound::HostOps ops;
         ops.va_alloc = [](uint32_t n) { return g_va.alloc(n); };
