@@ -19,6 +19,7 @@
 // The game renders at its own size (640x480 by default); that picture is
 // scaled to the GL frame (Vita 960x544: 725x544, pillarboxed).
 #include "sc_host.h"
+#include "r6_jobs.h"
 
 #include "runtime/guest_scratch.h"
 #include "runtime/host_clock.h"
@@ -185,6 +186,9 @@ inline void write_px(uint8_t* p, uint32_t bpp, uint32_t v) {
                    default: std::memcpy(p, &v, 4); }
 }
 
+// Rows needed before a loop is split across cores: about 24k pixels.
+inline uint32_t big_rows(uint32_t w) { return w ? std::max<uint32_t>(8, 24576u / w) : 0xFFFFFFFFu; }
+
 // Whole surface -> RGBA8 (colour-keyed texels get alpha 0).
 void to_rgba(Cpu& c, const Surf& s, std::vector<uint8_t>& out) {
     out.resize((size_t)s.w * s.h * 4);
@@ -193,7 +197,8 @@ void to_rgba(Cpu& c, const Surf& s, std::vector<uint8_t>& out) {
     const uint32_t bpp = s.fmt.bpp, bytes = bpp / 8;
     if (s.fmt.pal8()) {
         const uint32_t* pe = s.pal ? s.pal->e : nullptr;
-        for (uint32_t y = 0; y < s.h; ++y) {
+        par_rows(s.h, [&](uint32_t y0, uint32_t y1) {
+        for (uint32_t y = y0; y < y1; ++y) {
             const uint8_t* row = src + y * s.pitch; uint8_t* o = &out[(size_t)y * s.w * 4];
             for (uint32_t x = 0; x < s.w; ++x) {
                 uint32_t i = row[x], v = pe ? pe[i] : (i | i << 8 | i << 16);
@@ -201,11 +206,13 @@ void to_rgba(Cpu& c, const Surf& s, std::vector<uint8_t>& out) {
                 o[3] = (s.ck && i >= s.ck_lo && i <= s.ck_hi) ? 0 : 255; o += 4;
             }
         }
+        }, big_rows(s.w));
         return;
     }
     const Ch r = ch_of(s.fmt.r), g = ch_of(s.fmt.g), b = ch_of(s.fmt.b), a = ch_of(s.fmt.a);
     const bool fast565 = bpp == 16 && s.fmt.r == 0xF800 && s.fmt.g == 0x07E0 && s.fmt.b == 0x1F;
-    for (uint32_t y = 0; y < s.h; ++y) {
+    par_rows(s.h, [&](uint32_t y0, uint32_t y1) {
+    for (uint32_t y = y0; y < y1; ++y) {
         const uint8_t* row = src + y * s.pitch; uint8_t* o = &out[(size_t)y * s.w * 4];
         for (uint32_t x = 0; x < s.w; ++x, row += bytes, o += 4) {
             const uint32_t v = read_px(row, bpp);
@@ -219,6 +226,7 @@ void to_rgba(Cpu& c, const Surf& s, std::vector<uint8_t>& out) {
             if (s.ck) { const uint32_t k = v & (s.fmt.r | s.fmt.g | s.fmt.b); if (k >= s.ck_lo && k <= s.ck_hi) o[3] = 0; }
         }
     }
+    }, big_rows(s.w));
 }
 
 Surf* new_surf(Cpu& c, uint32_t w, uint32_t h, const Fmt& f, uint32_t caps) {
@@ -531,7 +539,8 @@ void rt_to_mem(Cpu& c, const char* why = "?") {
     uint8_t* dst = (uint8_t*)c.hostptr(s.pixels, s.pitch * s.h);
     if (!dst) return;
     const uint32_t bytes = s.fmt.bpp / 8;
-    for (uint32_t y = 0; y < s.h; ++y) {
+    par_rows(s.h, [&](uint32_t y0, uint32_t y1) {
+    for (uint32_t y = y0; y < y1; ++y) {
         const uint32_t sy = (uint32_t)((uint64_t)(s.h - 1 - y) * g_oh / s.h);
         const uint8_t* srow = &px[(size_t)sy * g_ow * 4];
         uint8_t* drow = dst + y * s.pitch;
@@ -540,6 +549,7 @@ void rt_to_mem(Cpu& c, const char* why = "?") {
             write_px(drow + x * bytes, s.fmt.bpp, pack(p[0], p[1], p[2], 255, s.fmt));
         }
     }
+    }, big_rows(s.w));
 }
 
 // Read rectangle sr of the GL frame straight into dst (rect dr), unscaled
@@ -903,7 +913,8 @@ void blit_mem(Cpu& c, Surf& dst, const int dr[4], Surf& src, const int sr[4], bo
         x0 = std::max({ x0, -dr[0], -sr[0] }); x1 = std::min({ x1, (int)dst.w - dr[0], (int)src.w - sr[0] });
         y0 = std::max({ y0, -dr[1], -sr[1] }); y1 = std::min({ y1, (int)dst.h - dr[1], (int)src.h - sr[1] });
         if (x1 <= x0 || y1 <= y0) return;
-        for (int y = y0; y < y1; ++y) {
+        par_rows((uint32_t)(y1 - y0), [&](uint32_t r0, uint32_t r1) {
+        for (int y = y0 + (int)r0; y < y0 + (int)r1; ++y) {
             uint8_t* d = dp + (dr[1] + y) * dst.pitch + (dr[0] + x0) * db;
             const uint8_t* s = sp + (sr[1] + y) * src.pitch + (sr[0] + x0) * sb;
             if (!key) { std::memmove(d, s, (size_t)(x1 - x0) * db); continue; }
@@ -917,9 +928,11 @@ void blit_mem(Cpu& c, Surf& dst, const int dr[4], Surf& src, const int sr[4], bo
                 }
             }
         }
+        }, dst.pixels == src.pixels ? 0xFFFFFFFFu : big_rows((uint32_t)(x1 - x0)));
         return;
     }
-    for (int y = 0; y < dh; ++y) {
+    par_rows((uint32_t)dh, [&](uint32_t r0, uint32_t r1) {
+    for (int y = (int)r0; y < (int)r1; ++y) {
         const int dy = dr[1] + y; if (dy < 0 || dy >= (int)dst.h) continue;
         const int sy = sr[1] + (int)((int64_t)y * sh / dh); if (sy < 0 || sy >= (int)src.h) continue;
         for (int x = 0; x < dw; ++x) {
@@ -936,15 +949,23 @@ void blit_mem(Cpu& c, Surf& dst, const int dr[4], Surf& src, const int sr[4], bo
             write_px(dp + dy * dst.pitch + dx * db, dst.fmt.bpp, v);
         }
     }
+    }, dst.pixels == src.pixels ? 0xFFFFFFFFu : big_rows((uint32_t)dw));
 }
 
 void fill_mem(Cpu& c, Surf& dst, const int dr[4], uint32_t col) {
     uint8_t* dp = (uint8_t*)c.hostptr(dst.pixels, dst.pitch * dst.h);
     if (!dp) return;
     const uint32_t db = (dst.fmt.bpp + 7) / 8;
-    for (int y = std::max(0, dr[1]); y < std::min((int)dst.h, dr[3]); ++y)
-        for (int x = std::max(0, dr[0]); x < std::min((int)dst.w, dr[2]); ++x)
-            write_px(dp + y * dst.pitch + x * db, dst.fmt.bpp, col);
+    const int fy0 = std::max(0, dr[1]), fy1 = std::min((int)dst.h, dr[3]);
+    const int fx0 = std::max(0, dr[0]), fx1 = std::min((int)dst.w, dr[2]);
+    if (fy1 <= fy0 || fx1 <= fx0) return;
+    par_rows((uint32_t)(fy1 - fy0), [&](uint32_t r0, uint32_t r1) {
+        for (int y = fy0 + (int)r0; y < fy0 + (int)r1; ++y) {
+            uint8_t* row = dp + y * dst.pitch;
+            if (db == 2) { uint16_t* p16 = (uint16_t*)row; for (int x = fx0; x < fx1; ++x) p16[x] = (uint16_t)col; }
+            else for (int x = fx0; x < fx1; ++x) write_px(row + x * db, dst.fmt.bpp, col);
+        }
+    }, big_rows((uint32_t)(fx1 - fx0)));
 }
 
 // Blt and BltFast: dst/src rects, colour fill, source colour key.
