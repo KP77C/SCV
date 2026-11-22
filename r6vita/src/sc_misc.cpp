@@ -211,15 +211,21 @@ void install_misc(d2rt::Bridge& br) {
         br.register_shim("USER32.dll", "wsprintfA", s);
     }
     R(br, "KERNEL32.dll", "GetProfileIntA", 3, [](Cpu& c) { return c.arg(2); });   // no win.ini: defaults
-    // timeGetTime: R6 spins on it (up to 3 s) waiting for its sound thread to set a flag
-    // (R6BOLegacy.exe 0x44da12, on each reload). Guest threads are cooperative, so the
-    // spin must give the other threads a turn or it always runs out the full timeout.
-    // Only that loop yields (its two call sites' return addresses): a yield on every
-    // 32nd call anywhere crashed build 4 at startup on the Vita (JIT eviction thrash).
+    // timeGetTime: on each reload R6 (0x44da06..0x44da35) stops a sound object, then spins
+    // on timeGetTime for up to 3000 ms waiting for that object's "done" byte. Nothing in
+    // this port ever sets it (yielding to other guest threads did not help: build 4c still
+    // froze 3 s per reload), so the loop always ran to its timeout. Its own timeout path is
+    // kept, just reached after 40 ms: inside the loop the clock jumps to start + 3000.
     R(br, "WINMM.dll", "timeGetTime", 0, [](Cpu& c) {
+        static uint32_t t0 = 0;
         const uint32_t ra = c.read_u32(c.reg(d2rt::R_ESP));
-        if (ra == 0x0044da14u || ra == 0x0044da2cu) if (auto* s = wx86_sched()) s->yield();
-        return (uint32_t)wx86_now_ms(); });
+        const uint32_t now = (uint32_t)wx86_now_ms();
+        if (ra == 0x0044da0eu) { t0 = now; return now; }                     // loop start
+        if (ra == 0x0044da14u || ra == 0x0044da2cu) {
+            if (now - t0 < 40) { if (auto* s = wx86_sched()) s->yield(); return now; }
+            return t0 + 3000u;                                               // give up now
+        }
+        return now; });
     // ---- GDI pieces the Smacker player asks for -------------------------------
     R(br, "GDI32.dll", "GetSystemPaletteUse", 1, [](Cpu&) { return 1u; });   // SYSPAL_STATIC
     R(br, "GDI32.dll", "SetSystemPaletteUse", 2, [](Cpu&) { return 1u; });

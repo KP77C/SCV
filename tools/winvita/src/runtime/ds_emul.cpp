@@ -270,7 +270,7 @@ void guest_zero(Cpu& c, uint32_t va, uint32_t n) {
 // `loop`: a voice without DSBPLAY_LOOPING doesn't loop — it goes silent at the
 // end and the mixer stops it (see below).
 struct Snap { const uint8_t* host; uint32_t len, cur, blockAlign, rate; uint64_t acc;
-              int ch; uint32_t gL, gR; bool loop; };
+              int ch; uint32_t gL, gR; bool loop; int bits; };
 std::vector<Snap> g_snap;
 
 void mix_grain(Cpu* c, int frames) {
@@ -300,7 +300,7 @@ void mix_grain(Cpu* c, int frames) {
             }
             else if (!g_voiceCap || (int)g_snap.size() < g_voiceCap) {
                 g_snap.push_back(Snap{v.host, v.len, v.cursor, v.blockAlign, v.rate, acc0,
-                                      v.ch, v.gL, v.gR, v.looping});
+                                      v.ch, v.gL, v.gR, v.looping, v.bits});
                 if (v.rate != (uint32_t)kRate) c_resamp.fetch_add(1, std::memory_order_relaxed);
             }
             // Cursor advances for every voice that's playing, mixed or not: a
@@ -359,14 +359,19 @@ void mix_grain(Cpu* c, int frames) {
         // read 2 or 4 bytes past the end of the host view. The advance step
         // stays blockAlign — that's the DirectSound contract — the guard is
         // only on the read.
-        const uint32_t width = (s.ch == 2) ? 4u : 2u;
+        const bool b8 = s.bits == 8;
+        const uint32_t width = (uint32_t)(s.ch == 2 ? 2 : 1) * (b8 ? 1u : 2u);
         if (s.len < width) continue;
         uint32_t pos = s.cur % s.len;
         if (pos + width > s.len) pos = 0;
         uint64_t acc = s.acc;
         bool done = false;
         for (int i = 0; i < frames && !done; i++) {
-            if (s.ch == 2) {
+            if (b8) {   // unsigned 8-bit, centre 128
+                const int32_t l = ((int32_t)s.host[pos] - 128) << 8, r = s.ch == 2 ? ((int32_t)s.host[pos + 1] - 128) << 8 : l;
+                g_acc[2*i]   += (int32_t)(((int64_t)l * (int64_t)s.gL) >> 16);
+                g_acc[2*i+1] += (int32_t)(((int64_t)r * (int64_t)s.gR) >> 16);
+            } else if (s.ch == 2) {
                 int16_t l, r; std::memcpy(&l, s.host + pos, 2); std::memcpy(&r, s.host + pos + 2, 2);
                 g_acc[2*i]   += (int32_t)(((int64_t)l * (int64_t)s.gL) >> 16);
                 g_acc[2*i+1] += (int32_t)(((int64_t)r * (int64_t)s.gR) >> 16);
@@ -722,7 +727,7 @@ uint32_t m_ds_createbuffer(Cpu& c) {
         uint32_t w3 = c.read_u32(pwfx + 12);       // nBlockAlign | wBitsPerSample<<16
         blockAlign = w3 & 0xffffu; bits = (int)(w3 >> 16);
         if (!blockAlign) blockAlign = (uint32_t)ch * 2u;
-        if (bits != 16) bits = 16;                 // mixer only supports 16-bit PCM
+        if (bits != 8) bits = 16;                  // mixer: 16-bit, or 8-bit unsigned PCM (R6's .wav effects)
     }
     // The primary buffer is never mixed (PRIORITY cooperative level — the
     // game only ever writes silence to it) but it must still be a real,
@@ -929,7 +934,8 @@ uint32_t m_buf_setformat(Cpu& c) {
     uint32_t w0 = c.read_u32(pwfx), w3 = c.read_u32(pwfx + 12);
     int ch = (int)(w0 >> 16); if (ch >= 1 && ch <= 2) v->ch = ch;
     uint32_t r = c.read_u32(pwfx + 4); if (r) v->rate = r;
-    uint32_t ba = w3 & 0xffffu; v->blockAlign = ba ? ba : (uint32_t)v->ch * 2u;
+    v->bits = (w3 >> 16) == 8 ? 8 : 16;
+    uint32_t ba = w3 & 0xffffu; v->blockAlign = ba ? ba : (uint32_t)v->ch * (v->bits / 8u);
     return DS_OK;
 }
 uint32_t m_buf_setvolume(Cpu& c) {

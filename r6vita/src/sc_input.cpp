@@ -157,10 +157,10 @@ void card_step(const Pad& p) {
 // Q/E peek, Space use, Mouse1 fire, Mouse2 sniper mode, R reload, 5 next weapon,
 // Y map, N night vision.
 //   Left stick   move (W A S D)          Right stick  aim (mouse look)
-//   R            fire                    L            (free; no map key for now, K)
+//   R            fire                    L            sniper zoom (Mouse2, K 2026-11-22)
 //   Cross        use (Space)             Square       reload (R)
 //   Circle       crouch (Alt)            Triangle     next weapon (5)
-//   D-pad down   run on/off (Shift)      D-pad up     sniper zoom (Mouse2)
+//   D-pad down   run on/off (Shift)      D-pad up     (free; no map key for now, K)
 //   D-pad left/right  peek left/right (Q/E, held)
 //   Start        Escape                  Select       night vision (N)
 bool g_fps = false, g_run = false, g_fire = false, g_aim = false;
@@ -188,7 +188,7 @@ void fps_tick(const Pad& p, uint32_t pressed, uint32_t released, double dt) {
     if (dx || dy) { dinput_mouse_move(dx, dy); g_look_fx -= dx; g_look_fy -= dy; }
     // Fire and zoom.
     fps_btn(0, b & PAD_R);
-    fps_btn(1, b & PAD_UP);
+    fps_btn(1, b & PAD_L);
     // Held keys.
     key(VK_SPACE, b & PAD_CROSS);
     key('R', b & PAD_SQUARE);
