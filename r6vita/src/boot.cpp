@@ -218,20 +218,21 @@ using namespace sc;
 // (FFC11.dll ...) carry relocations and go in the module window.
 //   0x00000000  page 0 (main TIB)
 //   0x00400000  R6BOLegacy.exe       fixed, 0x4B0000
-//   0x00900000  HeapAlloc            32 MiB (the MSVC CRT heap)
-//   0x02900000  module window        4 MiB
-//   0x02D00000  scratch              16 MiB (DirectDraw surfaces, COM objects)
-//   0x03D00000  VirtualAlloc         128 MiB
+//   0x00900000  HeapAlloc            64 MiB (the MSVC CRT heap; a second mission
+//                                    load ran out of 32 MiB on the Vita)
+//   0x04900000  module window        4 MiB
+//   0x04D00000  scratch              16 MiB (DirectDraw surfaces, COM objects)
+//   0x05D00000  VirtualAlloc         96 MiB (peak seen ~42 MiB)
 //   0x0BD00000  worker stacks        16 x 1 MiB
 //   0x0CD00000  worker TIBs          1 MiB
 //   0x0CE00000  main stack           4 MiB
 //   0x0D200000  native-thunk window  1 MiB
 //   0x0D300000  end of arena (211 MiB)
 static constexpr uint32_t kExeBase     = 0x00400000, kExeSize     = 0x004B0000;
-static constexpr uint32_t kHeapBase    = 0x00900000, kHeapSize    = 0x02000000;
-static constexpr uint32_t kModBase     = 0x02900000, kModEnd      = 0x02D00000;
-static constexpr uint32_t kScratchBase = 0x02D00000, kScratchSize = 0x01000000;
-static constexpr uint32_t kVaBase      = 0x03D00000, kVaSize      = 0x08000000;
+static constexpr uint32_t kHeapBase    = 0x00900000, kHeapSize    = 0x04000000;
+static constexpr uint32_t kModBase     = 0x04900000, kModEnd      = 0x04D00000;
+static constexpr uint32_t kScratchBase = 0x04D00000, kScratchSize = 0x01000000;
+static constexpr uint32_t kVaBase      = 0x05D00000, kVaSize      = 0x06000000;
 static constexpr uint32_t kStacks      = 0x0BD00000;
 static constexpr uint32_t kTibs        = 0x0CD00000;
 static constexpr uint32_t kMainStack   = 0x0CE00000, kMainStackSize = 0x00400000;
