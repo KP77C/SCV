@@ -454,6 +454,238 @@ index 4e79963..c12e35d 100644
              voice.obstruction = obstructed ? std::min(voice.obstruction + delta, 0.5f) : std::max(voice.obstruction - delta, 0.0f);
              voice.doppler = live && voice.ambient ? dopplerShift(actor::Velocity(voice.actor), voice.location, s.viewer, s.dopplerSpeed) : 1.0f;
              refreshGains(s, voice);
+diff --git a/src/core/jobs.cc b/src/core/jobs.cc
+new file mode 100644
+index 0000000..c3a68ef
+--- /dev/null
++++ b/src/core/jobs.cc
+@@ -0,0 +1,189 @@
++#include "core/jobs.h"
++
++#include <condition_variable>
++#include <cstdlib>
++#include <deque>
++#include <mutex>
++#include <pthread.h>
++#include <utility>
++#include <vector>
++
++#ifdef __vita__
++#include <psp2/kernel/threadmgr.h>
++#endif
++
++namespace dx::jobs {
++    namespace {
++        struct Job {
++            Group* group;
++            std::function<void()> run;
++        };
++
++        struct Pool {
++            std::mutex mutex;
++            std::condition_variable wake;
++            std::condition_variable done;
++            std::deque<Job> queue;
++            int32_t count = 0;
++            bool started = false;
++        };
++
++        Pool& pool()
++        {
++            // Never destroyed: helpers may still wait on it while the
++            // program exits.
++            static Pool* p = new Pool();
++            return *p;
++        }
++
++        thread_local bool helperThread = false;
++
++        void finish(Job& job)
++        {
++            job.run();
++            if (job.group->pending.fetch_sub(1) == 1) {
++                std::lock_guard<std::mutex> lock(pool().mutex);
++                pool().done.notify_all();
++            }
++        }
++
++        struct HelperStart {
++            int32_t index;
++        };
++
++        void* helperMain(void* argument)
++        {
++            int32_t index = static_cast<HelperStart*>(argument)->index;
++            delete static_cast<HelperStart*>(argument);
++            helperThread = true;
++#ifdef __vita__
++            // Helpers on cores 2 and 1 (audio also lives on core 1, lightly).
++            sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), index == 0 ? 0x40000 : 0x20000);
++#else
++            (void)index;
++#endif
++            Pool& p = pool();
++            while (true) {
++                Job job;
++                {
++                    std::unique_lock<std::mutex> lock(p.mutex);
++                    p.wake.wait(lock, [&] { return !p.queue.empty(); });
++                    job = std::move(p.queue.front());
++                    p.queue.pop_front();
++                }
++                finish(job);
++            }
++            return nullptr;
++        }
++    }
++
++    Group::~Group()
++    {
++        wait(*this);
++    }
++
++    void start()
++    {
++        Pool& p = pool();
++        if (p.started) {
++            return;
++        }
++        p.started = true;
++        const char* setting = std::getenv("DX_JOBS");
++        int32_t wanted = setting ? std::atoi(setting) : 2;
++        if (wanted < 0) {
++            wanted = 0;
++        }
++        if (wanted > 2) {
++            wanted = 2;
++        }
++#ifdef __vita__
++        sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), 0x10000);
++#endif
++        for (int32_t i = 0; i < wanted; i++) {
++            pthread_attr_t attributes;
++            pthread_attr_init(&attributes);
++            pthread_attr_setstacksize(&attributes, 512 * 1024);
++            pthread_t thread;
++            if (pthread_create(&thread, &attributes, helperMain, new HelperStart { i }) == 0) {
++                pthread_detach(thread);
++                p.count++;
++            }
++            pthread_attr_destroy(&attributes);
++        }
++    }
++
++    int32_t helpers()
++    {
++        return pool().count;
++    }
++
++    bool onHelper()
++    {
++        return helperThread;
++    }
++
++    void submit(Group& group, std::function<void()> job)
++    {
++        Pool& p = pool();
++        group.pending.fetch_add(1);
++        if (p.count == 0) {
++            Job inline_ { &group, std::move(job) };
++            finish(inline_);
++            return;
++        }
++        {
++            std::lock_guard<std::mutex> lock(p.mutex);
++            p.queue.push_back({ &group, std::move(job) });
++        }
++        p.wake.notify_one();
++    }
++
++    void wait(Group& group)
++    {
++        Pool& p = pool();
++        while (group.pending.load() > 0) {
++            Job job;
++            bool have = false;
++            {
++                std::unique_lock<std::mutex> lock(p.mutex);
++                if (!p.queue.empty()) {
++                    job = std::move(p.queue.front());
++                    p.queue.pop_front();
++                    have = true;
++                } else {
++                    p.done.wait(lock, [&] { return group.pending.load() <= 0 || !p.queue.empty(); });
++                }
++            }
++            if (have) {
++                finish(job);
++            }
++        }
++    }
++
++    void parallelFor(int32_t count, const std::function<void(int32_t)>& body)
++    {
++        if (count <= 0) {
++            return;
++        }
++        int32_t parts = std::min<int32_t>(helpers() + 1, count);
++        if (parts <= 1) {
++            for (int32_t i = 0; i < count; i++) {
++                body(i);
++            }
++            return;
++        }
++        std::atomic<int32_t> next { 0 };
++        auto worker = [&] {
++            for (int32_t i = next.fetch_add(1); i < count; i = next.fetch_add(1)) {
++                body(i);
++            }
++        };
++        Group group;
++        for (int32_t i = 1; i < parts; i++) {
++            submit(group, worker);
++        }
++        worker();
++        wait(group);
++    }
++}
+diff --git a/src/core/jobs.h b/src/core/jobs.h
+new file mode 100644
+index 0000000..fefb741
+--- /dev/null
++++ b/src/core/jobs.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <functional>
++
++// Small worker pool for spreading frame work over spare CPU cores (PS Vita:
++// the main thread runs on core 0, two helpers on cores 1 and 2). Jobs must
++// only touch data no other running job or the main thread changes meanwhile.
++// DX_JOBS=0 turns the helpers off (jobs then run inline on submit).
++namespace dx::jobs {
++    class Group {
++    public:
++        Group() = default;
++        Group(const Group&) = delete;
++        Group& operator=(const Group&) = delete;
++        ~Group();
++
++        std::atomic<int32_t> pending { 0 };
++    };
++
++    void start();
++    int32_t helpers();
++    bool onHelper();
++    void submit(Group& group, std::function<void()> job);
++    // Waits for every job of the group, running queued jobs on this thread
++    // meanwhile.
++    void wait(Group& group);
++    // Runs body(i) for i in [0, count), split over the helpers and this thread.
++    void parallelFor(int32_t count, const std::function<void(int32_t)>& body);
++}
 diff --git a/src/core/objects.cc b/src/core/objects.cc
 index d5f4d4a..948f3a8 100644
 --- a/src/core/objects.cc
@@ -532,11 +764,12 @@ index 8c72219..705595c 100644
          UClass* objectClass();
 diff --git a/src/core/prof.cc b/src/core/prof.cc
 new file mode 100644
-index 0000000..4dc213e
+index 0000000..cb23b3f
 --- /dev/null
 +++ b/src/core/prof.cc
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,113 @@
 +#include "core/prof.h"
++#include "core/jobs.h"
 +
 +#include <algorithm>
 +#include <cstdio>
@@ -552,7 +785,7 @@ index 0000000..4dc213e
 +    namespace {
 +        const char* const names[Count] = {
 +            "other", "game (rest)", "drawing (rest)", "actor ticks", "physics", "movement", "scripts", "AI", "audio", "menus/UI",
-+            "visibility", "sky", "level", "meshes", "mesh lights", "sprites", "translucent", "HUD/canvas", "GL calls", "water/fire textures",
++            "visibility", "sky", "level", "meshes", "mesh lights", "sprites", "translucent", "HUD/canvas", "GL calls", "water/fire textures", "mesh posing", "waiting for other cores",
 +        };
 +    }
 +
@@ -591,6 +824,11 @@ index 0000000..4dc213e
 +        return sink ? static_cast<double>(elapsed) / 1000.0 : 0.0;
 +    }
 +
++    bool onHelperThread()
++    {
++        return jobs::onHelper();
++    }
++
 +    State& state()
 +    {
 +        static State s;
@@ -615,11 +853,22 @@ index 0000000..4dc213e
 +        for (int i = 0; i < Count; i++) {
 +            int section = order[i];
 +            double ms = static_cast<double>(s.total[section]) / 1000.0 / frames;
-+            if (ms < 0.5) {
++            if (ms < (std::getenv("DX_PROF_ALL") ? 0.001 : 0.5)) {
 +                break;
 +            }
 +            char item[96];
 +            std::snprintf(item, sizeof(item), " %s %.1f ms (%u),", names[section], ms, static_cast<unsigned>(s.calls[section] / frames));
++            line += item;
++        }
++        bool firstHelper = true;
++        for (int i = 0; i < Count; i++) {
++            double ms = static_cast<double>(s.helperTotal[i].exchange(0)) / 1000.0 / frames;
++            if (ms < 0.5) {
++                continue;
++            }
++            char item[96];
++            std::snprintf(item, sizeof(item), "%s %s %.1f ms,", firstHelper ? " | other cores:" : "", names[i], ms);
++            firstHelper = false;
 +            line += item;
 +        }
 +        if (line.back() == ',') {
@@ -634,12 +883,13 @@ index 0000000..4dc213e
 +}
 diff --git a/src/core/prof.h b/src/core/prof.h
 new file mode 100644
-index 0000000..0413eb9
+index 0000000..ac20c4b
 --- /dev/null
 +++ b/src/core/prof.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,113 @@
 +#pragma once
 +
++#include <atomic>
 +#include <cstdint>
 +#include <string>
 +
@@ -668,6 +918,8 @@ index 0000000..0413eb9
 +        Canvas,
 +        GLCalls,
 +        Procedural,
++        MeshPose,
++        Waiting,
 +        Count
 +    };
 +
@@ -681,14 +933,16 @@ index 0000000..0413eb9
 +        uint64_t stamp = 0;
 +        uint64_t total[Count] {};
 +        uint32_t calls[Count] {};
++        std::atomic<uint64_t> helperTotal[Count] {};
 +    };
 +    State& state();
++    bool onHelperThread();
 +
 +    class Scope {
 +    public:
 +        explicit Scope(Section section)
 +        {
-+            if (!enabled()) {
++            if (!enabled() || onHelperThread()) {
 +                active = false;
 +                return;
 +            }
@@ -717,6 +971,29 @@ index 0000000..0413eb9
 +    private:
 +        bool active = true;
 +        Section previous = Other;
++    };
++
++    // Time spent by helper threads (other cores) on a section; shown
++    // separately, as it does not add to the main thread's frame time.
++    class HelperScope {
++    public:
++        explicit HelperScope(Section s)
++            : section(s)
++            , start(enabled() ? nowMicros() : 0)
++        {
++        }
++        ~HelperScope()
++        {
++            if (enabled()) {
++                state().helperTotal[section].fetch_add(nowMicros() - start);
++            }
++        }
++        HelperScope(const HelperScope&) = delete;
++        HelperScope& operator=(const HelperScope&) = delete;
++
++    private:
++        Section section;
++        uint64_t start;
 +    };
 +
 +    // Per-frame averages of the busiest sections since the last report, as
@@ -998,7 +1275,7 @@ index 4a62583..610a690 100644
              return false;
          }
 diff --git a/src/engine/package.cc b/src/engine/package.cc
-index 2291142..57db334 100644
+index 2291142..e58d80f 100644
 --- a/src/engine/package.cc
 +++ b/src/engine/package.cc
 @@ -1,6 +1,9 @@
@@ -1011,7 +1288,7 @@ index 2291142..57db334 100644
  #include <cctype>
  #include <fstream>
  #include <stdexcept>
-@@ -119,20 +122,175 @@ namespace dx {
+@@ -119,20 +122,177 @@ namespace dx {
          return Reader(owner.data(), nativeStart);
      }
  
@@ -1059,7 +1336,7 @@ index 2291142..57db334 100644
 +        constexpr size_t CacheBlock = 64 * 1024;
 +        constexpr size_t CacheBlocks = 96;
 +        struct CachedBlock {
-+            const void* owner = nullptr;
++            uint64_t owner = 0;
 +            size_t index = 0;
 +            uint64_t used = 0;
 +            size_t size = 0;
@@ -1075,7 +1352,7 @@ index 2291142..57db334 100644
 +            return cache;
 +        }
 +
-+        const CachedBlock* cachedBlock(const void* owner, std::FILE* file, size_t index, size_t fileSize)
++        const CachedBlock* cachedBlock(uint64_t owner, std::FILE* file, size_t index, size_t fileSize)
 +        {
 +            BlockCache& cache = blockCache();
 +            cache.clock++;
@@ -1095,7 +1372,7 @@ index 2291142..57db334 100644
 +            }
 +            size_t start = index * CacheBlock;
 +            size_t size = std::min(CacheBlock, fileSize - start);
-+            victim->owner = nullptr;
++            victim->owner = 0;
 +            victim->data.resize(CacheBlock);
 +            if (std::fseek(file, static_cast<long>(start), SEEK_SET) != 0 || std::fread(victim->data.data(), 1, size, file) != size) {
 +                return nullptr;
@@ -1140,7 +1417,7 @@ index 2291142..57db334 100644
 +        size_t done = 0;
 +        while (done < size) {
 +            size_t at = offset + done;
-+            const CachedBlock* block = cachedBlock(this, file, at / CacheBlock, fileBytes);
++            const CachedBlock* block = cachedBlock(cacheId, file, at / CacheBlock, fileBytes);
 +            if (!block) {
 +                throw fail();
 +            }
@@ -1159,6 +1436,8 @@ index 2291142..57db334 100644
 -        std::ifstream file(path, std::ios::binary);
 +        size_t fileSize = static_cast<size_t>(std::filesystem::file_size(path));
 +        fileBytes = fileSize;
++        static uint64_t nextCacheId = 0;
++        cacheId = ++nextCacheId;
 +        resident = keepPackagesInMemory();
 +        if (std::getenv("DX_PACKAGE_LOG")) {
 +            std::printf("package %s: %u KiB\n", path.string().c_str(), static_cast<unsigned>(fileSize / 1024));
@@ -1193,7 +1472,7 @@ index 2291142..57db334 100644
          if (reader.u32() != 0x9E2A83C1) {
              throw std::runtime_error("not an unreal package: " + path.string());
          }
-@@ -149,47 +307,83 @@ namespace dx {
+@@ -149,47 +309,83 @@ namespace dx {
          uint32_t importCount = reader.u32();
          uint32_t importOffset = reader.u32();
  
@@ -1316,7 +1595,7 @@ index 2291142..57db334 100644
  
      const std::string& Package::name() const
 diff --git a/src/engine/package.h b/src/engine/package.h
-index 653cdc6..809f802 100644
+index 653cdc6..e587214 100644
 --- a/src/engine/package.h
 +++ b/src/engine/package.h
 @@ -101,6 +101,9 @@ namespace dx {
@@ -1329,13 +1608,16 @@ index 653cdc6..809f802 100644
  
          const std::string& nameAt(int32_t index) const;
          const ImportEntry& importAt(int32_t ref) const;
-@@ -113,7 +116,10 @@ namespace dx {
+@@ -113,7 +116,13 @@ namespace dx {
  
      private:
          std::string packageName;
 +        std::filesystem::path filePath;
          std::vector<uint8_t> bytes;
 +        bool resident = true;
++        // Unique per Package object: the block cache keys on it, so a new
++        // package allocated at a freed one's address never sees its blocks.
++        uint64_t cacheId = 0;
 +        size_t fileBytes = 0;
          uint16_t fileVersion = 0;
          uint16_t licenseeMode = 0;
@@ -1793,18 +2075,19 @@ index 590d1aa..bbaa55c 100644
          s.time += static_cast<double>(deltaSeconds);
          if (s.root && !s.root->destroyed) {
 diff --git a/src/game/main.cc b/src/game/main.cc
-index f4ca511..3685fff 100644
+index f4ca511..f0100a0 100644
 --- a/src/game/main.cc
 +++ b/src/game/main.cc
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,8 @@
  #include "audio/audio.h"
  #include "core/config.h"
  #include "core/objects.h"
 +#include "core/prof.h"
++#include "core/jobs.h"
  #include "core/url.h"
  #include "core/vm.h"
  #include "deusex/deusex.h"
-@@ -15,6 +16,7 @@
+@@ -15,6 +17,7 @@
  #include "extension/extension.h"
  #include "render/lighting.h"
  #include "render/scene_renderer.h"
@@ -1812,7 +2095,7 @@ index f4ca511..3685fff 100644
  #ifdef DX_NETWORKING
  #include "net/gns_transport.h"
  #endif
-@@ -22,6 +24,27 @@
+@@ -22,6 +25,27 @@
  #include <SDL.h>
  #include <glad/gl.h>
  
@@ -1840,7 +2123,7 @@ index f4ca511..3685fff 100644
  #ifndef _WIN32
  #include <sys/select.h>
  #include <unistd.h>
-@@ -1066,13 +1089,16 @@ namespace {
+@@ -1066,13 +1090,16 @@ namespace {
              if (world && world->level) {
                  previousTravelInfo = world->level->travelInfo;
              }
@@ -1857,7 +2140,7 @@ index f4ca511..3685fff 100644
              canvasObject = nullptr;
              world = std::make_unique<dx::World>();
              world->netMode = netMode;
-@@ -1174,8 +1200,123 @@ namespace {
+@@ -1174,8 +1201,123 @@ namespace {
              dx::console::key(key, action, 0);
          }
  
@@ -1981,7 +2264,7 @@ index f4ca511..3685fff 100644
              SDL_Event event;
              while (SDL_PollEvent(&event)) {
                  switch (event.type) {
-@@ -1287,6 +1428,7 @@ namespace {
+@@ -1287,6 +1429,7 @@ namespace {
                  }
                  renderer->drawScene(world->level, world->actors, viewLocation, viewRotation, viewFov, viewActor);
                  dx::UObject* canvasActor = canvas(width, height);
@@ -1989,7 +2272,7 @@ index f4ca511..3685fff 100644
                  if (player && !player->destroyed) {
                      dx::vm::Call(player, dx::Name("PreRender")).obj(canvasActor).run();
                      if (viewActor) {
-@@ -1432,6 +1574,9 @@ namespace {
+@@ -1432,6 +1575,9 @@ namespace {
  
          void step()
          {
@@ -1999,7 +2282,7 @@ index f4ca511..3685fff 100644
              processEvents();
              bool gui = dx::extension::wantsMouse();
              if (gui != guiMode) {
-@@ -1439,7 +1584,15 @@ namespace {
+@@ -1439,7 +1585,15 @@ namespace {
                  SDL_SetRelativeMouseMode(gui ? SDL_FALSE : SDL_TRUE);
                  float cursorX = 0;
                  float cursorY = 0;
@@ -2015,7 +2298,7 @@ index f4ca511..3685fff 100644
                      int windowWidth = 0;
                      int windowHeight = 0;
                      SDL_GetWindowSize(window, &windowWidth, &windowHeight);
-@@ -1462,6 +1615,7 @@ namespace {
+@@ -1462,6 +1616,7 @@ namespace {
              dx::deusex::applyVanillaFixes();
              applyRenderOptions();
              if (world) {
@@ -2023,7 +2306,7 @@ index f4ca511..3685fff 100644
                  world->tick(delta);
              }
              pollNetwork(delta);
-@@ -1477,7 +1631,13 @@ namespace {
+@@ -1477,7 +1632,13 @@ namespace {
              int width = 0;
              int height = 0;
              SDL_GL_GetDrawableSize(window, &width, &height);
@@ -2038,7 +2321,7 @@ index f4ca511..3685fff 100644
              renderer->applyBrightness(static_cast<float>(std::atof(dx::config::system().get(videoSection(), "Brightness").value_or("0.5").c_str())));
              dx::audio::update(viewLocation, viewRotation, delta);
              if (!pendingShot.empty()) {
-@@ -1511,7 +1671,26 @@ namespace {
+@@ -1511,7 +1672,26 @@ namespace {
                  }
                  running = false;
              }
@@ -2065,10 +2348,11 @@ index f4ca511..3685fff 100644
              limitFrameRate();
              if (options.fps > 0) {
                  SDL_Delay(static_cast<uint32_t>(1000 / options.fps));
-@@ -1665,6 +1844,37 @@ int main(int argc, char** argv)
+@@ -1665,6 +1845,38 @@ int main(int argc, char** argv)
      if (options.dedicated || options.headless) {
          return runHeadless(options);
      }
++    dx::jobs::start();
 +#ifdef __vita__
 +    vita::initialize();
 +    if (SDL_Init(SDL_INIT_EVENTS | SDL_INIT_TIMER) != 0) {
@@ -2103,7 +2387,7 @@ index f4ca511..3685fff 100644
      if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
          std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
          return 1;
-@@ -1756,4 +1966,5 @@ int main(int argc, char** argv)
+@@ -1756,4 +1968,5 @@ int main(int argc, char** argv)
      SDL_Quit();
      return result;
  #endif
@@ -2693,7 +2977,7 @@ index 66508ac..eee4a26 100644
  
      class GammaPass {
 diff --git a/src/render/procedural.cc b/src/render/procedural.cc
-index 60247eb..a4934f4 100644
+index 60247eb..9f025b1 100644
 --- a/src/render/procedural.cc
 +++ b/src/render/procedural.cc
 @@ -1,3 +1,5 @@
@@ -2723,7 +3007,62 @@ index 60247eb..a4934f4 100644
              };
              const uint8_t* wave = fractal.wave + 512;
              const uint8_t* table = renderTable + 512;
-@@ -1503,15 +1510,41 @@ namespace dx {
+@@ -1477,16 +1484,30 @@ namespace dx {
+         constantRate = rate;
+     }
+ 
+-    bool ProceduralTextures::update(UTexture* texture, double time, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height)
++    bool ProceduralTextures::update(UTexture* texture, double time, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height, bool allowCreate)
+     {
+-        auto& slot = states[texture];
++        std::lock_guard<std::recursive_mutex> updateLock(updateMutex);
++        ProceduralState* found = nullptr;
++        {
++            std::lock_guard<std::mutex> lock(statesMutex);
++            auto it = states.find(texture);
++            if (it != states.end()) {
++                found = it->second.get();
++            }
++        }
+         bool created = false;
+-        if (!slot) {
+-            slot = std::make_unique<ProceduralState>();
+-            slot->init(texture);
++        if (!found) {
++            if (!allowCreate) {
++                return false;
++            }
++            auto fresh = std::make_unique<ProceduralState>();
++            fresh->init(texture);
++            found = fresh.get();
++            std::lock_guard<std::mutex> lock(statesMutex);
++            states[texture] = std::move(fresh);
+             created = true;
+         }
+-        ProceduralState& state = *slot;
++        ProceduralState& state = *found;
+         if (state.kind == Kind::Wet || state.kind == Kind::Ice) {
+             UObject* sources[2] = { state.kind == Kind::Wet ? wettexture::SourceTexture(texture) : icetexture::SourceTexture(texture), state.kind == Kind::Ice ? icetexture::GlassTexture(texture) : nullptr };
+             for (int i = 0; i < 2; i++) {
+@@ -1497,21 +1518,56 @@ namespace dx {
+                 std::vector<uint8_t> scratch;
+                 uint32_t sourceWidth = 0;
+                 uint32_t sourceHeight = 0;
+-                update(source, time, scratch, sourceWidth, sourceHeight);
+-                const ProceduralState& sourceState = *states[source];
+-                state.refreshBitmap(i == 0 ? state.sourceBitmap : state.glassBitmap, sourceState.pixels, sourceState.usize, sourceState.vsize, state.kind == Kind::Wet);
++                update(source, time, scratch, sourceWidth, sourceHeight, allowCreate);
++                const ProceduralState* sourceState = nullptr;
++                {
++                    std::lock_guard<std::mutex> lock(statesMutex);
++                    auto it = states.find(source);
++                    if (it == states.end()) {
++                        continue;
++                    }
++                    sourceState = it->second.get();
++                }
++                const ProceduralState& sourceStateRef = *sourceState;
++                state.refreshBitmap(i == 0 ? state.sourceBitmap : state.glassBitmap, sourceStateRef.pixels, sourceStateRef.usize, sourceStateRef.vsize, state.kind == Kind::Wet);
              }
          }
          bool changed = state.tick(time, constantRate);
@@ -2766,17 +3105,52 @@ index 60247eb..a4934f4 100644
          for (size_t i = 0; i < state.pixels.size(); i++) {
              uint8_t index = state.pixels[i];
              uint32_t color = colors ? colors[index] : (0xff000000u | index * 0x010101u);
+diff --git a/src/render/procedural.h b/src/render/procedural.h
+index 3c6f2a2..ff1d1c1 100644
+--- a/src/render/procedural.h
++++ b/src/render/procedural.h
+@@ -4,6 +4,7 @@
+ 
+ #include <cstdint>
+ #include <memory>
++#include <mutex>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -18,7 +19,9 @@ namespace dx {
+         ProceduralTextures& operator=(const ProceduralTextures&) = delete;
+ 
+         static bool isProcedural(UTexture* texture);
+-        bool update(UTexture* texture, double time, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height);
++        // allowCreate false: only advance a texture whose state already
++        // exists (safe on a helper core, as creating reads game files).
++        bool update(UTexture* texture, double time, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height, bool allowCreate = true);
+         void clear();
+         void reset(UTexture* texture);
+         void setConstantRate(float rate);
+@@ -26,5 +29,8 @@ namespace dx {
+     private:
+         std::unordered_map<UTexture*, std::unique_ptr<ProceduralState>> states;
+         float constantRate = 0;
++        std::mutex statesMutex;
++        // One update at a time: the textures share one random generator.
++        std::recursive_mutex updateMutex;
+     };
+ }
 diff --git a/src/render/scene_renderer.cc b/src/render/scene_renderer.cc
-index 259a101..8af6e38 100644
+index 259a101..4c6318f 100644
 --- a/src/render/scene_renderer.cc
 +++ b/src/render/scene_renderer.cc
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,8 @@
  #include "render/scene_renderer.h"
++#include "core/jobs.h"
++#include <atomic>
++#include <optional>
 +#include "core/prof.h"
  
  #include "core/objects.h"
  #include "engine/mesh.h"
-@@ -8,6 +9,7 @@
+@@ -8,6 +12,7 @@
  #include "render/lighting.h"
  
  #include <algorithm>
@@ -2784,7 +3158,7 @@ index 259a101..8af6e38 100644
  #include <bit>
  #include <chrono>
  #include <cmath>
-@@ -43,6 +45,46 @@ namespace dx {
+@@ -43,6 +48,46 @@ namespace dx {
          constexpr uint32_t PF_Unlit = 0x00400000;
          constexpr uint32_t PF_Portal = 0x04000000;
          constexpr uint32_t PF_Mirrored = 0x08000000;
@@ -2831,7 +3205,7 @@ index 259a101..8af6e38 100644
          constexpr int32_t MaxFrameRecursion = 4;
  
          constexpr uint8_t DT_Sprite = 1;
-@@ -274,6 +316,9 @@ namespace dx {
+@@ -274,6 +319,9 @@ namespace dx {
  
      void SceneRenderer::flushLevel()
      {
@@ -2841,7 +3215,7 @@ index 259a101..8af6e38 100644
          if (levelData.vao) {
              device->deleteStatic(levelData.vao);
          }
-@@ -508,22 +553,86 @@ namespace dx {
+@@ -508,22 +556,86 @@ namespace dx {
  
      void SceneRenderer::occludeView(View& view, const std::vector<ScreenSpan>* open)
      {
@@ -2932,7 +3306,7 @@ index 259a101..8af6e38 100644
          float scaleX = halfWidth / view.tanHalfWidth;
          float scaleY = halfHeight / view.tanHalfHeight;
          float guardWidth = view.tanHalfWidth * 1.02f;
-@@ -572,7 +681,7 @@ namespace dx {
+@@ -572,7 +684,7 @@ namespace dx {
              float bottom = std::numeric_limits<float>::lowest();
              for (const Vector& corner : corners) {
                  if ((corner - eye).dot(axes.xAxis) < sceneNearPlane) {
@@ -2941,7 +3315,7 @@ index 259a101..8af6e38 100644
                  }
                  ScreenPoint point = project(corner);
                  left = std::min(left, point.x);
-@@ -580,13 +689,13 @@ namespace dx {
+@@ -580,13 +692,13 @@ namespace dx {
                  top = std::min(top, point.y);
                  bottom = std::max(bottom, point.y);
              }
@@ -2960,7 +3334,7 @@ index 259a101..8af6e38 100644
          const std::vector<BspNode>& nodes = model->nodes;
          int32_t sequence = 0;
          Vector clipA[64];
-@@ -626,7 +735,7 @@ namespace dx {
+@@ -626,7 +738,7 @@ namespace dx {
                  int32_t produced = 0;
                  for (int32_t i = 0; i < count; i++) {
                      const Vector& a = input[i];
@@ -2969,7 +3343,7 @@ index 259a101..8af6e38 100644
                      float da = distance(plane, a);
                      float db = distance(plane, b);
                      if (da >= 0) {
-@@ -1241,6 +1350,7 @@ namespace dx {
+@@ -1241,6 +1353,7 @@ namespace dx {
  
      void SceneRenderer::drawLevelGeometry(const View& view, bool translucentPass)
      {
@@ -2977,7 +3351,7 @@ index 259a101..8af6e38 100644
          if (!levelData.vao) {
              return;
          }
-@@ -1259,7 +1369,7 @@ namespace dx {
+@@ -1259,7 +1372,7 @@ namespace dx {
              });
          }
          bool skyActive = levelData.hasBackdrop;
@@ -2986,7 +3360,7 @@ index 259a101..8af6e38 100644
          if (translucentPass) {
              std::vector<TranslucentSurface>& surfaces = scratchTranslucentSurfaces;
              surfaces.clear();
-@@ -1440,6 +1550,7 @@ namespace dx {
+@@ -1440,6 +1553,7 @@ namespace dx {
  
      void SceneRenderer::drawSky(const View& frame, const std::vector<UObject*>& actors, UObject* viewActor)
      {
@@ -2994,7 +3368,7 @@ index 259a101..8af6e38 100644
          UObject* skyZone = frameSkyZone(zoneActor(pointZone(frame.location)));
          if (!skyZone) {
              levelData.hasBackdrop = false;
-@@ -1887,6 +1998,7 @@ namespace dx {
+@@ -1887,6 +2001,7 @@ namespace dx {
  
      void SceneRenderer::selectActorLights(UObject* actor)
      {
@@ -3002,7 +3376,7 @@ index 259a101..8af6e38 100644
          actorLights.clear();
          actorLightPrepared.clear();
          actorLightColors.clear();
-@@ -2297,6 +2409,7 @@ namespace dx {
+@@ -2297,6 +2412,7 @@ namespace dx {
  
      void SceneRenderer::flushTranslucent(const View& view)
      {
@@ -3010,15 +3384,141 @@ index 259a101..8af6e38 100644
          applyView(view);
          std::vector<size_t> order(translucentCount);
          for (size_t i = 0; i < translucentCount; i++) {
-@@ -2510,6 +2623,7 @@ namespace dx {
+@@ -2508,7 +2624,99 @@ namespace dx {
+         drawMeshWith(weapon, actor, weaponMesh, weapon, attach, view, nullptr);
+     }
  
-     void SceneRenderer::drawMeshWith(UObject* actor, UObject* lightActor, UMesh* mesh, UObject* animSource, const MeshTransform& transform, const View& view, std::vector<Vector>* worldOut)
+-    void SceneRenderer::drawMeshWith(UObject* actor, UObject* lightActor, UMesh* mesh, UObject* animSource, const MeshTransform& transform, const View& view, std::vector<Vector>* worldOut)
++    // Poses the meshes in view on the helper cores (and this one) before the
++    // draw pass needs them; drawMeshWith then finds the geometry up to date.
++    // Runs while a helper works out visibility, so it must not read
++    // view.visibility.
++    void SceneRenderer::prepassMeshes(const std::vector<UObject*>& actors, const View& view, UObject* viewActor)
++    {
++        struct Item {
++            MeshDrawCache* cache;
++            MeshPoseCaches* poseCache;
++            const std::vector<MeshTriangle>* triangles;
++            UObject* actor;
++            UMesh* mesh;
++            UObject* animSource;
++            MeshTransform transform;
++        };
++        static std::vector<Item> items;
++        items.clear();
++        bool behindView = viewActor && viewActor->data && viewActor->isA(namePawn) && pawn::bBehindView(viewActor) != 0;
++        for (UObject* actor : actors) {
++            if (!actor || actor->destroyed || !actor->data || actor::DrawType(actor) != DT_Mesh || !actor->isA(nameActor)) {
++                continue;
++            }
++            if (actor::bHidden(actor) || actor::bDeleteMe(actor) || (actor == viewActor && !behindView) || actor->isA(nameDecal)) {
++                continue;
++            }
++            UObject* owner = actor::Owner(actor);
++            if (actor::bOnlyOwnerSee(actor) && (owner != viewActor || behindView)) {
++                continue;
++            }
++            if (actor::bOwnerNoSee(actor) && owner == viewActor && viewActor && !behindView) {
++                continue;
++            }
++            uint8_t zone = actorZone(actor);
++            if (zone != 0 && !(view.zoneMask & (1ull << (zone & 63)))) {
++                continue;
++            }
++            UObject* meshObject = actor::Mesh(actor);
++            if (!meshObject) {
++                continue;
++            }
++            objects::ensureLoaded(meshObject);
++            UMesh* mesh = cast<UMesh>(meshObject);
++            if (!mesh || mesh->frameVerts <= 0) {
++                continue;
++            }
++            if (!inFrustum(view, actor::Location(actor), actorRadius(actor))) {
++                continue;
++            }
++            UObject* animSource = actor;
++            if (actor::bAnimByOwner(actor) && owner && owner->data) {
++                animSource = owner;
++            }
++            Coords rotation = rotationAxes(actor::Rotation(actor));
++            float drawScale = actor::DrawScale(actor);
++            Item item;
++            item.transform.origin = actor::Location(actor) + actor::PrePivot(actor);
++            item.transform.x = rotation.xAxis * drawScale;
++            item.transform.y = rotation.yAxis * drawScale;
++            item.transform.z = rotation.zAxis * drawScale;
++            item.cache = &meshDrawCaches[{ actor, mesh, actor }];
++            item.poseCache = &poseCaches[{ animSource, mesh }];
++            item.triangles = &meshTriangles(mesh);
++            item.actor = actor;
++            item.mesh = mesh;
++            item.animSource = animSource;
++            items.push_back(item);
++        }
++        helperScratch.resize(static_cast<size_t>(jobs::helpers()));
++        std::atomic<int32_t> next { 0 };
++        int32_t count = static_cast<int32_t>(items.size());
++        auto work = [&](MeshScratch& scratch, bool helper) {
++            std::optional<prof::HelperScope> helperScope;
++            if (helper) {
++                helperScope.emplace(prof::MeshPose);
++            }
++            for (int32_t i = next.fetch_add(1); i < count; i = next.fetch_add(1)) {
++                Item& item = items[static_cast<size_t>(i)];
++                updateMeshGeometry(*item.cache, *item.poseCache, *item.triangles, item.actor, item.mesh, item.animSource, item.transform, view, scratch);
++            }
++        };
++        jobs::Group group;
++        for (int32_t h = 0; h < jobs::helpers() && h < count - 1; h++) {
++            MeshScratch* scratch = &helperScratch[static_cast<size_t>(h)];
++            jobs::submit(group, [&work, scratch] { work(*scratch, true); });
++        }
++        {
++            prof::Scope poseScope(prof::MeshPose);
++            work(mainScratch, false);
++        }
++        jobs::wait(group);
++    }
++
++    bool SceneRenderer::updateMeshGeometry(MeshDrawCache& cache, MeshPoseCaches& poseCache, const std::vector<MeshTriangle>& triangles, UObject* actor, UMesh* mesh, UObject* animSource, const MeshTransform& transform, const View& view, MeshScratch& scratch)
      {
-+        prof::Scope profScope(prof::Meshes);
          MeshAnimState animState;
          animState.sequence = actor::AnimSequence(animSource);
-         animState.frame = actor::AnimFrame(animSource);
-@@ -2615,8 +2729,22 @@ namespace dx {
+@@ -2517,7 +2725,6 @@ namespace dx {
+             animState.blendSequences[slot] = actor::BlendAnimSequence(animSource, slot);
+             animState.blendFrames[slot] = actor::BlendAnimFrame(animSource, slot);
+         }
+-        MeshDrawCache& cache = meshDrawCaches[{ actor, mesh, lightActor }];
+         bool sameGeometry = cache.valid && sameVector(cache.transform.origin, transform.origin) && sameVector(cache.transform.x, transform.x) && sameVector(cache.transform.y, transform.y) && sameVector(cache.transform.z, transform.z) && cache.sequence == animState.sequence && cache.frame == animState.frame;
+         for (int slot = 0; slot < 4 && sameGeometry; slot++) {
+             sameGeometry = cache.blendSequences[slot] == animState.blendSequences[slot] && cache.blendFrames[slot] == animState.blendFrames[slot];
+@@ -2555,16 +2762,16 @@ namespace dx {
+         if (cache.lodTarget != targetSubset) {
+             sameGeometry = false;
+         }
+-        const std::vector<MeshTriangle>* triangleSource = &meshTriangles(mesh);
+-        std::vector<MeshTriangle>& lodTriangles = scratchLodTriangles;
+-        std::vector<float>& lodAlphas = scratchLodAlphas;
+-        std::vector<Vector>& pose = scratchPose;
+-        std::vector<Vector>& normals = scratchNormals;
+-        std::vector<Vector>& world = scratchWorld;
+-        std::vector<Vector>& worldNormals = scratchWorldNormals;
++        const std::vector<MeshTriangle>* triangleSource = &triangles;
++        std::vector<MeshTriangle>& lodTriangles = scratch.lodTriangles;
++        std::vector<float>& lodAlphas = scratch.lodAlphas;
++        std::vector<Vector>& pose = scratch.pose;
++        std::vector<Vector>& normals = scratch.normals;
++        std::vector<Vector>& world = scratch.world;
++        std::vector<Vector>& worldNormals = scratch.worldNormals;
+         auto computeGeometry = [&]() {
+             int32_t requested = lodMesh && doLod ? vertexSubset + static_cast<int32_t>(lodMesh->specialVerts) : mesh->frameVerts;
+-            int32_t returned = mesh->animatedPose(animState, poseCaches[{ animSource, mesh }], pose, requested);
++            int32_t returned = mesh->animatedPose(animState, poseCache, pose, requested);
+             if (lodMesh && doLod) {
+                 vertexSubset = std::max(returned - static_cast<int32_t>(lodMesh->specialVerts), 0);
+                 if (doMorph && nonMorph >= vertexSubset) {
+@@ -2615,8 +2822,24 @@ namespace dx {
                  worldNormals[i] = (transform.x * normals[i].x + transform.y * normals[i].y + transform.z * normals[i].z).normal();
              }
          };
@@ -3036,21 +3536,45 @@ index 259a101..8af6e38 100644
 +            sameGeometry = true;
 +        }
          if (!sameGeometry) {
++            prof::Scope poseScope(prof::MeshPose);
              computeGeometry();
 +            cache.builtFrame = sceneFrame;
++            cache.geometryDirty = true;
              boundingSphere(world, cache.sphereCenter, cache.sphereRadius);
              cache.valid = true;
              cache.transform = transform;
-@@ -2670,7 +2798,7 @@ namespace dx {
+@@ -2634,6 +2857,15 @@ namespace dx {
+                 cache.triangles.swap(lodTriangles);
+             }
+         }
++        return throttled;
++    }
++
++    void SceneRenderer::drawMeshWith(UObject* actor, UObject* lightActor, UMesh* mesh, UObject* animSource, const MeshTransform& transform, const View& view, std::vector<Vector>* worldOut)
++    {
++        prof::Scope profScope(prof::Meshes);
++        MeshDrawCache& cache = meshDrawCaches[{ actor, mesh, lightActor }];
++        bool throttled = updateMeshGeometry(cache, poseCaches[{ animSource, mesh }], meshTriangles(mesh), actor, mesh, animSource, transform, view, mainScratch);
++        const std::vector<MeshTriangle>* triangleSource;
+         triangleSource = cache.lodTriangles ? &cache.triangles : &meshTriangles(mesh);
+         const std::vector<Vector>& meshWorld = cache.world;
+         const std::vector<Vector>& meshNormals = cache.worldNormals;
+@@ -2670,7 +2902,7 @@ namespace dx {
              }
          }
  
 -        bool cacheHit = sameGeometry && cache.cacheable && sameVector(cache.eye, view.location) && cache.slotInfo == slotInfo && cache.slotFlags == slotFlags && cache.actorFlags == actorFlags && cache.unlitActor == unlitActor && cache.scaleGlow == scaleGlow && cache.glowScale == clampedGlow && sameVector(cache.ambient, ambient) && sameLights(cache.lights);
-+        bool cacheHit = (throttled && cache.slotInfo == slotInfo && cache.slotFlags == slotFlags) || (sameGeometry && cache.cacheable && meshEyeClose(cache.eye, view.location) && cache.slotInfo == slotInfo && cache.slotFlags == slotFlags && cache.actorFlags == actorFlags && cache.unlitActor == unlitActor && cache.scaleGlow == scaleGlow && cache.glowScale == clampedGlow && sameVector(cache.ambient, ambient) && sameLights(cache.lights));
++        bool cacheHit = (throttled && cache.slotInfo == slotInfo && cache.slotFlags == slotFlags) || (!cache.geometryDirty && cache.cacheable && meshEyeClose(cache.eye, view.location) && cache.slotInfo == slotInfo && cache.slotFlags == slotFlags && cache.actorFlags == actorFlags && cache.unlitActor == unlitActor && cache.scaleGlow == scaleGlow && cache.glowScale == clampedGlow && sameVector(cache.ambient, ambient) && sameLights(cache.lights));
          if (cacheHit) {
              if (worldOut) {
                  *worldOut = meshWorld;
-@@ -2795,6 +2923,7 @@ namespace dx {
+@@ -2790,11 +3022,13 @@ namespace dx {
+             }
+         }
+         cache.cacheable = cacheable;
++        cache.geometryDirty = false;
+         appendGroups(cache.groups, meshBatches);
+     }
  
      void SceneRenderer::drawSprite(UObject* actor, const View& view)
      {
@@ -3058,7 +3582,7 @@ index 259a101..8af6e38 100644
          UTexture* texture = asTexture(actor::Texture(actor));
          if (!texture) {
              return;
-@@ -3326,6 +3455,12 @@ namespace dx {
+@@ -3326,6 +3560,12 @@ namespace dx {
          occlusionBoxes.clear();
          occlusionIssued.clear();
          occlusionUnconfirmed.clear();
@@ -3071,7 +3595,29 @@ index 259a101..8af6e38 100644
          size_t kept = 0;
          for (UObject* actor : candidates) {
              bool keep = true;
-@@ -3541,7 +3676,7 @@ namespace dx {
+@@ -3534,14 +3774,28 @@ namespace dx {
+         }
+         view.fog = true;
+         if (!wireframe) {
+-            occludeView(view, nullptr);
++            // Visibility on a helper core while this core (and the other
++            // helper) pose the meshes in view.
++            static const bool parallel = std::getenv("DX_NO_PARALLEL_FRAME") == nullptr;
++            if (parallel && jobs::helpers() > 0) {
++                jobs::Group visibilityJob;
++                jobs::submit(visibilityJob, [this, &view] {
++                    prof::HelperScope helperScope(prof::Visibility);
++                    occludeView(view, nullptr);
++                });
++                prepassMeshes(actors, view, viewActor);
++                prof::Scope waitScope(prof::Waiting);
++                jobs::wait(visibilityJob);
++            } else {
++                occludeView(view, nullptr);
++            }
+         }
+         if (levelData.hasBackdrop && !wireframe) {
+             drawSky(view, actors, viewActor);
              device->setDepthWrite(true);
              device->clear(false, true, 1.0f);
          }
@@ -3081,18 +3627,46 @@ index 259a101..8af6e38 100644
              device->setDepthWrite(true);
              device->clear(false, true, 1.0f);
 diff --git a/src/render/scene_renderer.h b/src/render/scene_renderer.h
-index fc07fb2..41c9507 100644
+index fc07fb2..c573b8c 100644
 --- a/src/render/scene_renderer.h
 +++ b/src/render/scene_renderer.h
-@@ -230,6 +230,7 @@ namespace dx {
+@@ -230,6 +230,17 @@ namespace dx {
              Vector eye;
              LightState lights;
              std::vector<EmittedGroup> groups;
 +            uint64_t builtFrame = 0;
++            bool geometryDirty = true;
++        };
++
++        struct MeshScratch {
++            std::vector<Vector> pose;
++            std::vector<Vector> normals;
++            std::vector<Vector> world;
++            std::vector<Vector> worldNormals;
++            std::vector<MeshTriangle> lodTriangles;
++            std::vector<float> lodAlphas;
          };
  
          struct BrushDrawCache {
-@@ -403,6 +404,27 @@ namespace dx {
+@@ -304,6 +315,8 @@ namespace dx {
+         void drawActor(UObject* actor, const View& view);
+         void drawMesh(UObject* actor, const View& view);
+         void drawMeshWith(UObject* actor, UObject* lightActor, UMesh* mesh, UObject* animSource, const MeshTransform& transform, const View& view, std::vector<Vector>* worldOut);
++        bool updateMeshGeometry(MeshDrawCache& cache, MeshPoseCaches& poseCache, const std::vector<MeshTriangle>& triangles, UObject* actor, UMesh* mesh, UObject* animSource, const MeshTransform& transform, const View& view, MeshScratch& scratch);
++        void prepassMeshes(const std::vector<UObject*>& actors, const View& view, UObject* viewActor);
+         void drawSprite(UObject* actor, const View& view);
+         void drawBrush(UObject* actor, const View& view);
+         void drawMoverSurfaces(UObject* actor, UModel* brush);
+@@ -383,6 +396,8 @@ namespace dx {
+         int32_t lightFrameCount = 0;
+         double lastFrameTime = -1;
+         std::vector<Vector> scratchPose;
++        MeshScratch mainScratch;
++        std::vector<MeshScratch> helperScratch;
+         std::vector<Vector> scratchNormals;
+         std::vector<Vector> scratchWorld;
+         std::vector<Vector> scratchWorldNormals;
+@@ -403,6 +418,27 @@ namespace dx {
          std::vector<UObject*> scratchDecals;
          std::vector<GLVertex> occlusionBoxes;
          SpanBuffer spans;
@@ -3121,7 +3695,7 @@ index fc07fb2..41c9507 100644
          std::vector<int32_t> scratchNodes;
          std::vector<int32_t> scratchFirsts;
 diff --git a/src/render/texture_cache.cc b/src/render/texture_cache.cc
-index 4640c7c..e885b31 100644
+index 4640c7c..5092ec8 100644
 --- a/src/render/texture_cache.cc
 +++ b/src/render/texture_cache.cc
 @@ -1,4 +1,5 @@
@@ -3149,7 +3723,88 @@ index 4640c7c..e885b31 100644
              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
              if (smooth) {
-@@ -152,6 +157,7 @@ namespace dx {
+@@ -59,6 +64,7 @@ namespace dx {
+         }
+         maskedTextures.clear();
+         animations.clear();
++        waitProcedural();
+         proceduralFrames.clear();
+         procedural.clear();
+         replacements.rescan();
+@@ -66,6 +72,7 @@ namespace dx {
+ 
+     void TextureCache::resetProcedural(UTexture* texture)
+     {
++        waitProcedural();
+         procedural.reset(texture);
+     }
+ 
+@@ -132,6 +139,35 @@ namespace dx {
+         return animation.current ? animation.current : texture;
+     }
+ 
++    void TextureCache::waitProcedural()
++    {
++        for (auto& [texture, job] : proceduralJobs) {
++            jobs::wait(job->group);
++        }
++        proceduralJobs.clear();
++    }
++
++    bool TextureCache::uploadProcedural(UTexture* texture, GLTextureInfo& info, const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height)
++    {
++        info.procedural = true;
++        if (!info.id) {
++            glGenTextures(1, &info.id);
++        }
++        info.width = width;
++        info.height = height;
++        info.masked = texture->masked();
++        glBindTexture(GL_TEXTURE_2D, info.id);
++#ifdef __vita__
++        glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_PALETTE8_RGBA8_OES, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, static_cast<GLsizei>(rgba.size()), rgba.data());
++#else
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
++#endif
++        info.smooth = true;
++        info.levels = 1;
++        setParameters(true, 1, trilinear, anisotropy);
++        return true;
++    }
++
+     const GLTextureInfo* TextureCache::get(UTexture* texture)
+     {
+         if (!texture) {
+@@ -149,9 +185,36 @@ namespace dx {
+                 return &it->second;
+             }
+             lastFrame = frame;
++            // Once a procedural texture exists, the next frame's animation
++            // runs on a helper core while this frame goes on; its result is
++            // uploaded on the next use (one frame later).
++            static const bool async = std::getenv("DX_SYNC_PROCEDURAL") == nullptr;
++            if (async && jobs::helpers() > 0 && it != textures.end()) {
++                std::unique_ptr<ProceduralJob>& job = proceduralJobs[texture];
++                if (!job) {
++                    job = std::make_unique<ProceduralJob>();
++                } else {
++                    {
++                        prof::Scope waitScope(prof::Waiting);
++                        jobs::wait(job->group);
++                    }
++                    if (job->changed && !job->rgba.empty()) {
++                        prof::Scope profScope(prof::Procedural);
++                        uploadProcedural(texture, it->second, job->rgba, job->width, job->height);
++                    }
++                }
++                ProceduralJob* running = job.get();
++                double now = time;
++                jobs::submit(running->group, [this, running, texture, now] {
++                    prof::HelperScope helperScope(prof::Procedural);
++                    running->changed = procedural.update(texture, now, running->rgba, running->width, running->height, false);
++                });
++                return &it->second;
++            }
              std::vector<uint8_t> rgba;
              uint32_t width = 0;
              uint32_t height = 0;
@@ -3157,19 +3812,27 @@ index 4640c7c..e885b31 100644
              bool changed = procedural.update(texture, time, rgba, width, height);
              if (it != textures.end() && !changed) {
                  return &it->second;
-@@ -168,7 +174,11 @@ namespace dx {
-             info.height = height;
-             info.masked = texture->masked();
-             glBindTexture(GL_TEXTURE_2D, info.id);
-+#ifdef __vita__
-+            glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_PALETTE8_RGBA8_OES, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, static_cast<GLsizei>(rgba.size()), rgba.data());
-+#else
-             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-+#endif
-             info.smooth = true;
-             info.levels = 1;
-             setParameters(true, 1, trilinear, anisotropy);
-@@ -209,6 +219,25 @@ namespace dx {
+@@ -160,18 +223,7 @@ namespace dx {
+                 return it != textures.end() ? &it->second : nullptr;
+             }
+             GLTextureInfo& info = textures[texture];
+-            info.procedural = true;
+-            if (!info.id) {
+-                glGenTextures(1, &info.id);
+-            }
+-            info.width = width;
+-            info.height = height;
+-            info.masked = texture->masked();
+-            glBindTexture(GL_TEXTURE_2D, info.id);
+-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+-            info.smooth = true;
+-            info.levels = 1;
+-            setParameters(true, 1, trilinear, anisotropy);
++            uploadProcedural(texture, info, rgba, width, height);
+             return &info;
+         }
+ 
+@@ -209,6 +261,25 @@ namespace dx {
          }
          glGenTextures(1, &info.id);
          glBindTexture(GL_TEXTURE_2D, info.id);
@@ -3195,7 +3858,7 @@ index 4640c7c..e885b31 100644
          int32_t levels = 0;
          for (size_t mip = 0; mip < texture->mips.size(); mip++) {
              const TextureMip& level = texture->mips[mip];
-@@ -252,6 +281,107 @@ namespace dx {
+@@ -252,6 +323,107 @@ namespace dx {
          return true;
      }
  
@@ -3304,10 +3967,19 @@ index 4640c7c..e885b31 100644
      {
          ReplacementImage image;
 diff --git a/src/render/texture_cache.h b/src/render/texture_cache.h
-index e839bb5..9d65bc3 100644
+index e839bb5..4870c14 100644
 --- a/src/render/texture_cache.h
 +++ b/src/render/texture_cache.h
-@@ -38,6 +38,9 @@ namespace dx {
+@@ -1,5 +1,8 @@
+ #pragma once
+ 
++#include "core/jobs.h"
++#include <memory>
++
+ #include "engine/resources.h"
+ #include "render/procedural.h"
+ #include "render/render_device.h"
+@@ -38,12 +41,25 @@ namespace dx {
      private:
          bool upload(UTexture* texture, GLTextureInfo& info, bool masked);
          bool uploadReplacement(UTexture* texture, GLTextureInfo& info);
@@ -3317,6 +3989,22 @@ index e839bb5..9d65bc3 100644
  
          std::unordered_map<UTexture*, GLTextureInfo> textures;
          std::unordered_map<UTexture*, GLTextureInfo> maskedTextures;
+         std::unordered_map<UTexture*, TextureAnimation> animations;
+         std::unordered_map<UTexture*, uint64_t> proceduralFrames;
+         ProceduralTextures procedural;
++        struct ProceduralJob {
++            jobs::Group group;
++            std::vector<uint8_t> rgba;
++            uint32_t width = 0;
++            uint32_t height = 0;
++            bool changed = false;
++        };
++        std::unordered_map<UTexture*, std::unique_ptr<ProceduralJob>> proceduralJobs;
++        void waitProcedural();
++        bool uploadProcedural(UTexture* texture, GLTextureInfo& info, const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height);
+         TextureReplacements replacements;
+         uint32_t whiteTexture = 0;
+         double time = 0;
 diff --git a/src/render/vita_shader.cc b/src/render/vita_shader.cc
 new file mode 100644
 index 0000000..541fa99
