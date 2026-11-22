@@ -72,7 +72,7 @@ index 55dc5ea..fa1e80f 100644
      add_subdirectory(tests/unit)
  endif()
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 827f6f3..ed0896d 100644
+index 827f6f3..8a07c5d 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -7,6 +7,11 @@ set(DEUSEX_WARNINGS
@@ -87,7 +87,18 @@ index 827f6f3..ed0896d 100644
  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
    list(APPEND DEUSEX_WARNINGS -Wno-restrict)
  endif()
-@@ -80,7 +85,7 @@ if(EMSCRIPTEN)
+@@ -50,6 +55,10 @@ target_link_libraries(dx-render PUBLIC dx-engine glad stb_image)
+ 
+ file(GLOB DX_GAME_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/game/*.cc)
+ add_executable(deusex ${DX_GAME_SOURCES})
++if(VITA)
++  set(VITA_TEXT_PAD 1 CACHE STRING "Bytes of padding at the end of the code segment (see game/vita_pad.cc)")
++  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/game/vita_pad.cc PROPERTIES COMPILE_DEFINITIONS VITA_TEXT_PAD=${VITA_TEXT_PAD})
++endif()
+ target_link_libraries(deusex PRIVATE dx-render SDL2::SDL2-static SDL2::SDL2main)
+ if(DX_NETWORKING)
+   file(GLOB DX_NET_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/net/*.cc)
+@@ -80,7 +89,7 @@ if(EMSCRIPTEN)
      "SHELL:--preload-file ${DEUSEX_GAME_DATA}/Sounds@/game/Sounds"
      "SHELL:--preload-file ${DEUSEX_GAME_DATA}/Textures@/game/Textures"
    )
@@ -96,7 +107,7 @@ index 827f6f3..ed0896d 100644
    target_compile_definitions(deusex PRIVATE DEUSEX_GAME_DATA="${DEUSEX_GAME_DATA}")
  endif()
  
-@@ -89,6 +94,7 @@ if(DX_NETWORKING)
+@@ -89,6 +98,7 @@ if(DX_NETWORKING)
    list(APPEND DX_TARGETS dx-net)
  endif()
  
@@ -104,7 +115,7 @@ index 827f6f3..ed0896d 100644
  file(GLOB DX_COMPILER_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/compiler/*.cc)
  add_library(dx-compiler STATIC ${DX_COMPILER_SOURCES})
  target_include_directories(dx-compiler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-@@ -114,6 +120,8 @@ if(DX_EDITOR_SOURCES)
+@@ -114,6 +124,8 @@ if(DX_EDITOR_SOURCES)
    list(APPEND DX_TARGETS deused)
  endif()
  
@@ -113,7 +124,7 @@ index 827f6f3..ed0896d 100644
  foreach(tgt ${DX_TARGETS})
    target_compile_options(${tgt} PRIVATE ${DEUSEX_WARNINGS})
  
-@@ -127,6 +135,12 @@ foreach(tgt ${DX_TARGETS})
+@@ -127,6 +139,12 @@ foreach(tgt ${DX_TARGETS})
    )
  endforeach()
  
@@ -1701,6 +1712,23 @@ index f4ca511..848f904 100644
  #endif
 +#endif
  }
+diff --git a/src/game/vita_pad.cc b/src/game/vita_pad.cc
+new file mode 100644
+index 0000000..d3ed127
+--- /dev/null
++++ b/src/game/vita_pad.cc
+@@ -0,0 +1,11 @@
++// PS Vita: vita-elf-create appends its import tables (a few KiB) to the end
++// of the code segment, so the gap before the data segment must be big
++// enough. build.sh measures the gap and, when it is too small, relinks with
++// VITA_TEXT_PAD bytes of padding here to push the data segment one 64 KiB
++// step further.
++#ifdef __vita__
++#ifndef VITA_TEXT_PAD
++#define VITA_TEXT_PAD 1
++#endif
++extern "C" __attribute__((used, section(".rodata.vitapad"))) const unsigned char dx_vita_pad[VITA_TEXT_PAD] = { 1 };
++#endif
 diff --git a/src/game/vita_platform.cc b/src/game/vita_platform.cc
 new file mode 100644
 index 0000000..d9a7572

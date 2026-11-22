@@ -29,6 +29,21 @@ OUT="$ROOT/build-vita"; mkdir -p "$OUT/sce_sys"
 cmake -S "$SRC" -B "$OUT/cmake" -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
     -DCMAKE_BUILD_TYPE=Release -DSKIP_QA=ON -DSKIP_UT=ON -DVITAGL_PREFIX="$VGL" > "$OUT/cmake.log"
 cmake --build "$OUT/cmake" -j"$(nproc)" --target deusex
+# vita-elf-create needs room (~5 KiB) after the code segment for its tables;
+# when the gap to the 64 KiB aligned data segment is smaller, pad the code
+# past the next boundary and relink.
+gap=$(arm-vita-eabi-readelf -lW "$OUT/cmake/bin/deusex" | awk '$1=="LOAD"{print $3, $5}' | python3 -c '
+import sys
+rows=[l.split() for l in sys.stdin if l.strip()]
+(t,ts),(d,_)=rows[0],rows[1]
+print(int(d,16)-(int(t,16)+int(ts,16)))')
+if [ "$gap" -lt 12288 ]; then
+    pad=$(grep -E "^VITA_TEXT_PAD:" "$OUT/cmake/CMakeCache.txt" | cut -d= -f2)
+    pad=$((pad + gap + 256))
+    echo "code segment gap $gap bytes: padding by $pad"
+    cmake "$OUT/cmake" -DVITA_TEXT_PAD="$pad" > /dev/null
+    cmake --build "$OUT/cmake" -j"$(nproc)" --target deusex
+fi
 cp "$OUT/cmake/bin/deusex" "$OUT/opendevita.elf"
 vita-elf-create "$OUT/opendevita.elf" "$OUT/opendevita.velf"
 vita-make-fself -c "$OUT/opendevita.velf" "$OUT/eboot.bin"
