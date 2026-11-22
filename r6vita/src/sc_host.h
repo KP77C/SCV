@@ -39,6 +39,8 @@ void mark_writable_sections(d2rt::Cpu& c, uint32_t base, const std::vector<uint8
 // Run guest stdcall `fn` to completion from inside a shim; returns its EAX (sc_user32.cpp).
 uint32_t guest_call(d2rt::Cpu& c, uint32_t fn, std::initializer_list<uint32_t> args);
 bool run_nested(d2rt::Cpu& c, uint32_t eip, const char** fault);
+// MSVC C++ exception dispatch for RaiseException (r6_cxxeh.cpp); true = caught, return redirected.
+bool cxx_dispatch(d2rt::Cpu& c, uint32_t code, uint32_t nparams, uint32_t params, uint32_t shim_esp_add);
 // Write every mapped, in-use guest region to <dir>/mem_<addr>.bin (boot.cpp).
 void dump_arena(d2rt::Cpu& c, const std::string& dir);
 

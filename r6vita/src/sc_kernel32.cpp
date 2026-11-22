@@ -647,6 +647,7 @@ void install_kernel32(d2rt::Bridge& br) {
             if ((n++ & (n - 1)) == 0) log("[not-bound] FP exception 0x%08x treated as masked (%llu so far)", c.arg(0), (unsigned long long)n);
             return 0;
         }
+        if (cxx_dispatch(c, c.arg(0), c.arg(2), c.arg(3), 4 + 16)) return 0;
         log("[not-bound] [cause: guest exception] RaiseException(0x%08x) at ra=0x%08x — not dispatched yet",
             c.arg(0), c.trap_retaddr());
         log("[not-bound]   stack:%s", guest_stack(c).c_str());   // where from

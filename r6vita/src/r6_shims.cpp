@@ -11,6 +11,8 @@
 #include "runtime/win32_shims_window.h"
 #include "runtime/win32_shims_gdi32.h"
 
+#include <memory>
+#include <cctype>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -129,14 +131,34 @@ void dinput_mouse_move(int dx, int dy) {
 
 namespace {
 // ---- WINMM multimedia file I/O (the engine reads its .wav files with it) ----
-struct Mmio { std::vector<uint8_t> data; uint32_t pos = 0; std::string name; };
+struct Mmio { std::shared_ptr<const std::vector<uint8_t>> buf; uint32_t pos = 0; std::string name;
+              const std::vector<uint8_t>& data_() const { return *buf; } };
+// The radio voices and effects are reopened every time they play: keep the
+// recent files in memory (most recent last), up to 8 MiB.
+std::vector<std::pair<std::string, std::shared_ptr<const std::vector<uint8_t>>>> g_mmio_cache;
+size_t g_mmio_cache_bytes = 0;
+std::shared_ptr<const std::vector<uint8_t>> mmio_load(const std::string& guest) {
+    std::string key = guest; for (auto& ch : key) ch = (char)std::tolower((unsigned char)ch);
+    for (size_t i = 0; i < g_mmio_cache.size(); ++i)
+        if (g_mmio_cache[i].first == key) {
+            auto e = g_mmio_cache[i]; g_mmio_cache.erase(g_mmio_cache.begin() + (long)i); g_mmio_cache.push_back(e);
+            return e.second;
+        }
+    auto v = std::make_shared<const std::vector<uint8_t>>(read_file(resolve_path(guest)));
+    if (v->empty() || v->size() > (2u << 20)) return v;
+    g_mmio_cache.emplace_back(key, v); g_mmio_cache_bytes += v->size();
+    while (g_mmio_cache_bytes > (8u << 20) && !g_mmio_cache.empty()) {
+        g_mmio_cache_bytes -= g_mmio_cache.front().second->size(); g_mmio_cache.erase(g_mmio_cache.begin());
+    }
+    return v;
+}
 std::map<uint32_t, Mmio*> g_mmio;
 uint32_t g_next_mmio = 0x4D4D0001u;
 void W(d2rt::Bridge& br, const char* name, uint32_t argc, std::function<uint32_t(Cpu&)> fn) {
     Shim s; s.argc = argc; s.stdcall_cleanup = true; s.tag = std::string("WINMM.dll!") + name; s.fn = std::move(fn);
     br.register_shim("WINMM.dll", name, s);
 }
-uint32_t rd32(const Mmio& m, uint32_t at) { if (at + 4 > m.data.size()) return 0; uint32_t v; std::memcpy(&v, &m.data[at], 4); return v; }
+uint32_t rd32(const Mmio& m, uint32_t at) { const auto& d = m.data_(); if (at + 4 > d.size()) return 0; uint32_t v; std::memcpy(&v, &d[at], 4); return v; }
 }  // namespace
 
 void install_r6(d2rt::Bridge& br) {
@@ -154,8 +176,8 @@ void install_r6(d2rt::Bridge& br) {
         std::string g = wx86_gread_mb(c, c.arg(0), -1);
         const uint32_t flags = c.arg(2);
         if (flags & 0x3) { log("[not-bound] [cause: unsupported] mmioOpenA %s for writing (flags 0x%x)", g.c_str(), flags); return 0; }
-        Mmio* m = new Mmio(); m->name = g; m->data = read_file(resolve_path(g));
-        if (m->data.empty()) { delete m; if (c.arg(1)) c.write_u32(c.arg(1) + 12, 257); return 0; }   // MMIOERR_CANNOTOPEN in wErrorRet
+        Mmio* m = new Mmio(); m->name = g; m->buf = mmio_load(g);
+        if (m->buf->empty()) { delete m; if (c.arg(1)) c.write_u32(c.arg(1) + 12, 257); return 0; }   // MMIOERR_CANNOTOPEN in wErrorRet
         const uint32_t h = g_next_mmio++; g_mmio[h] = m;
         return h;
     });
@@ -165,10 +187,10 @@ void install_r6(d2rt::Bridge& br) {
     });
     W(br, "mmioRead", 3, [](Cpu& c) -> uint32_t {
         auto it = g_mmio.find(c.arg(0)); if (it == g_mmio.end()) return 0xFFFFFFFFu;
-        Mmio& m = *it->second; uint32_t n = c.arg(2);
-        if (m.pos >= m.data.size()) return 0;
-        if (n > m.data.size() - m.pos) n = (uint32_t)(m.data.size() - m.pos);
-        c.write(c.arg(1), &m.data[m.pos], n); m.pos += n; return n;
+        Mmio& m = *it->second; uint32_t n = c.arg(2); const auto& data = m.data_();
+        if (m.pos >= data.size()) return 0;
+        if (n > data.size() - m.pos) n = (uint32_t)(data.size() - m.pos);
+        c.write(c.arg(1), &data[m.pos], n); m.pos += n; return n;
     });
     W(br, "mmioWrite", 3, [](Cpu&) -> uint32_t { return 0xFFFFFFFFu; });
     W(br, "mmioCreateChunk", 3, [](Cpu&) -> uint32_t { return 264; });   // MMIOERR_CANNOTWRITE
@@ -176,7 +198,7 @@ void install_r6(d2rt::Bridge& br) {
     W(br, "mmioDescend", 4, [](Cpu& c) -> uint32_t {
         auto it = g_mmio.find(c.arg(0)); if (it == g_mmio.end()) return 257;
         Mmio& m = *it->second; const uint32_t ck = c.arg(1), par = c.arg(2), flags = c.arg(3);
-        uint32_t end = (uint32_t)m.data.size();
+        uint32_t end = (uint32_t)m.data_().size();
         if (par) { const uint32_t pe = c.read_u32(par + 12) + c.read_u32(par + 4); if (pe < end) end = pe; }
         const uint32_t want_id = c.read_u32(ck), want_type = c.read_u32(ck + 8);
         const uint32_t RIFF = 0x46464952u, LIST = 0x5453494Cu;

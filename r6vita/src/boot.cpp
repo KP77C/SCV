@@ -41,6 +41,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <set>
+#include <unordered_map>
 #include <algorithm>
 #include <vector>
 #include <functional>
@@ -133,21 +134,34 @@ uint32_t put_str(d2rt::Cpu& c, uint32_t dst, const std::string& s, uint32_t cap)
     return n;
 }
 
-// Case-insensitive match of one component inside a host directory.
+// Case-insensitive match of one component inside a host directory. Each
+// directory is listed once (lower-case name -> real name): opendir/readdir on
+// the Vita costs ~1 ms per few entries, and the sound folders hold hundreds.
+static std::mutex g_path_mx;
+static std::unordered_map<std::string, std::unordered_map<std::string, std::string>> g_dir_names;
+static std::unordered_map<std::string, std::string> g_path_memo;
+static std::string lower(std::string s) { for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch); return s; }
 static std::string match_ci(const std::string& dir, const std::string& comp) {
-    struct stat st{};
-    if (stat((dir + "/" + comp).c_str(), &st) == 0) return comp;
-    if (DIR* d = opendir(dir.c_str())) {
-        while (dirent* e = readdir(d))
-            if (!strcasecmp(e->d_name, comp.c_str())) { std::string n = e->d_name; closedir(d); return n; }
-        closedir(d);
+    auto it = g_dir_names.find(dir);
+    if (it == g_dir_names.end()) {
+        auto& m = g_dir_names[dir];
+        if (DIR* d = opendir(dir.c_str())) {
+            while (dirent* e = readdir(d)) m.emplace(lower(e->d_name), e->d_name);
+            closedir(d);
+        }
+        it = g_dir_names.find(dir);
     }
-    return comp;
+    auto f = it->second.find(lower(comp));
+    if (f != it->second.end()) return f->second;
+    return comp;   // not there (yet): a file the game creates keeps its own case
 }
 
 std::string resolve_path(const std::string& guest) {
     // Guest paths: absolute ("C:\DeusEx\Maps\x.dx"), or relative to the
     // game's working directory, System ("..\Maps\x.dx", "DeusEx.ini").
+    std::lock_guard<std::mutex> lk(g_path_mx);
+    std::string key = lower(guest);
+    if (auto m = g_path_memo.find(key); m != g_path_memo.end()) return m->second;
     std::string p = guest;
     for (auto& ch : p) if (ch == '/') ch = '\\';
     std::string full;
@@ -169,7 +183,14 @@ std::string resolve_path(const std::string& guest) {
     size_t k = 0;
     if (!comps.empty() && !strcasecmp(comps[0].c_str(), gdir.c_str())) k = 1;
     std::string host = g_root;
-    for (; k < comps.size(); ++k) host += "/" + match_ci(host, comps[k]);
+    bool found = true;
+    for (; k < comps.size(); ++k) {
+        const std::string n = match_ci(host, comps[k]);
+        auto& dm = g_dir_names[host];
+        if (!dm.count(lower(comps[k]))) found = false;
+        host += "/" + n;
+    }
+    if (found) g_path_memo.emplace(key, host);   // only names that exist: new files may appear later
     return host;
 }
 

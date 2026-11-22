@@ -149,6 +149,7 @@ uint32_t g_mode_w = 640, g_mode_h = 480, g_mode_bpp = 16;
 Surf* g_primary = nullptr;
 Surf* g_rt = nullptr;            // render target (back buffer)
 bool g_gl_dirty = false, g_mem_dirty = false;
+uint64_t g_part_rb = 0;
 uint64_t g_flips = 0, g_draw_calls = 0, g_tris = 0, g_readbacks = 0, g_uploads = 0, g_blt_gl = 0, g_blt_mem = 0, g_tex_uploads = 0;
 
 uint32_t surf_obj(Cpu& c, Surf* s, bool v4) {
@@ -507,10 +508,21 @@ void apply_state(Cpu& c) {
 
 // ---- render-target sync ------------------------------------------------------------
 void rt_dirty_all();
-void rt_to_mem(Cpu& c) {
+// Full-frame read-backs by cause, for the 5 s stats line.
+std::map<std::pair<const char*, uint32_t>, uint32_t> g_rb_why;
+void rb_note(const char* why, uint32_t ra) { if (g_rb_why.size() < 64 || g_rb_why.count({ why, ra })) ++g_rb_why[{ why, ra }]; }
+std::string rb_report() {
+    std::string r; char b[96];
+    for (auto& e : g_rb_why) { std::snprintf(b, sizeof b, " %s@0x%08x x%u", e.first.first, e.first.second, e.second); r += b; }
+    g_rb_why.clear(); return r;
+}
+void rt_to_mem(Cpu& c, const char* why = "?") {
     if (!g_rt || !g_gl_dirty || !g_gl_ok) return;
     g_gl_dirty = false;
     ++g_readbacks;
+    static const bool trace_rb = std::getenv("R6_TRACE_RB") != nullptr;
+    if (trace_rb) log("[rb] read-back for %s, ra=0x%08x frame %llu", why, c.read_u32(c.reg(d2rt::R_ESP)), (unsigned long long)g_flips);
+    rb_note(why, c.read_u32(c.reg(d2rt::R_ESP)));
     rt_dirty_all();
     static std::vector<uint8_t> px;
     px.resize((size_t)g_ow * g_oh * 4);
@@ -526,6 +538,42 @@ void rt_to_mem(Cpu& c) {
         for (uint32_t x = 0; x < s.w; ++x) {
             const uint8_t* p = srow + (size_t)((uint64_t)x * g_ow / s.w) * 4;
             write_px(drow + x * bytes, s.fmt.bpp, pack(p[0], p[1], p[2], 255, s.fmt));
+        }
+    }
+}
+
+// Read rectangle sr of the GL frame straight into dst (rect dr), unscaled
+// in RT coordinates; nearest sampling from the offscreen frame.
+void rt_rect_to(Cpu& c, Surf& dst, const int dr[4], const int sr[4], bool key) {
+    Surf& s = *g_rt;
+    int x0 = std::max(0, sr[0]), y0 = std::max(0, sr[1]), x1 = std::min((int)s.w, sr[2]), y1 = std::min((int)s.h, sr[3]);
+    if (x1 <= x0 || y1 <= y0) return;
+    ++g_part_rb;
+    // RT rows -> offscreen frame pixels (GL is bottom-up).
+    const int fx0 = (int)((int64_t)x0 * g_ow / s.w), fx1 = std::max(fx0 + 1, (int)(((int64_t)x1 * g_ow + s.w - 1) / s.w));
+    const int fy0 = (int)((int64_t)(s.h - y1) * g_oh / s.h), fy1 = std::max(fy0 + 1, (int)(((int64_t)(s.h - y0) * g_oh + s.h - 1) / s.h));
+    const int fw = fx1 - fx0, fh = fy1 - fy0;
+    static std::vector<uint8_t> px; px.resize((size_t)fw * fh * 4);
+    glReadPixels(g_ox + fx0, g_oy + fy0, fw, fh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    uint8_t* dp = (uint8_t*)c.hostptr(dst.pixels, dst.pitch * dst.h);
+    if (!dp) return;
+    const uint32_t db = (dst.fmt.bpp + 7) / 8;
+    const int dw = dr[2] - dr[0], dh = dr[3] - dr[1], sw = sr[2] - sr[0], sh = sr[3] - sr[1];
+    if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return;
+    for (int y = 0; y < dh; ++y) {
+        const int dy = dr[1] + y; if (dy < 0 || dy >= (int)dst.h) continue;
+        const int sy = sr[1] + (int)((int64_t)y * sh / dh); if (sy < y0 || sy >= y1) continue;
+        int fy = (int)((int64_t)(s.h - 1 - sy) * g_oh / s.h) - fy0; fy = std::min(std::max(fy, 0), fh - 1);
+        for (int x = 0; x < dw; ++x) {
+            const int dx = dr[0] + x; if (dx < 0 || dx >= (int)dst.w) continue;
+            const int sx = sr[0] + (int)((int64_t)x * sw / dw); if (sx < x0 || sx >= x1) continue;
+            int fx = (int)((int64_t)sx * g_ow / s.w) - fx0; fx = std::min(std::max(fx, 0), fw - 1);
+            const uint8_t* p = &px[((size_t)fy * fw + fx) * 4];
+            const uint32_t v = pack(p[0], p[1], p[2], 255, s.fmt);
+            if (key && v >= g_rt->ck_lo && v <= g_rt->ck_hi) continue;
+            uint32_t o = v;
+            if (dst.fmt.bpp != s.fmt.bpp || dst.fmt.r != s.fmt.r || dst.fmt.g != s.fmt.g) o = pack(p[0], p[1], p[2], 255, dst.fmt);
+            write_px(dp + dy * dst.pitch + dx * db, dst.fmt.bpp, o);
         }
     }
 }
@@ -639,10 +687,10 @@ void present_frame(Cpu& c) {
     static uint64_t t0 = 0, last_flips = 0, last_draws = 0, last_tris = 0, last_rb = 0, last_up = 0, last_tex = 0;
     const uint64_t now = wx86_now_us(); if (!t0) t0 = now;
     if (now - t0 >= 5000000) {
-        log("[not-bound] d3d(5s): %llu flips, %llu draws, %llu triangles, %llu read-backs, %llu frame uploads, %llu texture uploads, blts gl %llu mem %llu",
+        log("[not-bound] d3d(5s): %llu flips, %llu draws, %llu triangles, %llu read-backs, %llu frame uploads, %llu texture uploads, blts gl %llu mem %llu, rect read-backs %llu;%s",
             (unsigned long long)(g_flips - last_flips), (unsigned long long)(g_draw_calls - last_draws), (unsigned long long)(g_tris - last_tris),
             (unsigned long long)(g_readbacks - last_rb), (unsigned long long)(g_uploads - last_up), (unsigned long long)(g_tex_uploads - last_tex),
-            (unsigned long long)g_blt_gl, (unsigned long long)g_blt_mem);
+            (unsigned long long)g_blt_gl, (unsigned long long)g_blt_mem, (unsigned long long)g_part_rb, rb_report().c_str());
         t0 = now; last_flips = g_flips; last_draws = g_draw_calls; last_tris = g_tris; last_rb = g_readbacks; last_up = g_uploads; last_tex = g_tex_uploads;
     }
     {
@@ -922,7 +970,7 @@ uint32_t do_blt(Cpu& c, Surf* dst, const int dr_in[4], Surf* src, const int sr_i
             ++g_blt_gl;
             return DD_OK;
         }
-        if (to_rt) rt_to_mem(c);
+        if (to_rt) rt_to_mem(c, "fill");
         fill_mem(c, *dst, dr, col); if (!to_rt) mark_dirty(dst);
         if (to_rt) { g_mem_dirty = true; rt_dirty_add(dr); }
         ++g_blt_mem;
@@ -930,13 +978,20 @@ uint32_t do_blt(Cpu& c, Surf* dst, const int dr_in[4], Surf* src, const int sr_i
     }
     if (!src) return DDERR_INVALIDPARAMS;
     int sr[4] = { sr_in[0], sr_in[1], sr_in[2], sr_in[3] };
-    if (src == g_rt) rt_to_mem(c);
+    if (src == g_rt && dst != g_rt && g_gl_dirty && !g_mem_dirty && !fill && g_gl_ok && !std::getenv("R6_NO_PARTRB")) {
+        // The game copies a piece of the frame out (a save-under for a HUD
+        // element): read only that rectangle back, the frame stays in GL.
+        rt_rect_to(c, *dst, dr, sr, key && src->ck);
+        mark_dirty(dst); ++g_blt_mem;
+        return DD_OK;
+    }
+    if (src == g_rt) rt_to_mem(c, "blt from rt");
     if (to_rt && !g_mem_dirty && src != g_rt && !g_2d) {
         draw_surface_quad(c, src, sr, dr, key && src->ck);
         g_gl_dirty = true; ++g_blt_gl;
         return DD_OK;
     }
-    if (to_rt) rt_to_mem(c);
+    if (to_rt) rt_to_mem(c, g_mem_dirty ? "blt, mem dirty" : "blt 2d");
     const bool k = key && src->ck;
     blit_mem(c, *dst, dr, *src, sr, k);
     if (!to_rt) mark_dirty(dst);
@@ -1239,7 +1294,7 @@ void install_d3d(d2rt::Bridge& br) {
             { "IsLost", 1, [](Cpu&) { return DD_OK; } },
             { "Lock", 5, [](Cpu& c) -> uint32_t {
                 Surf* s = S(c, c.arg(0)); if (!s || !s->pixels) return DDERR_INVALIDPARAMS;
-                if (s == g_rt) rt_to_mem(c);
+                if (s == g_rt) rt_to_mem(c, "lock");
                 fill_desc(c, c.arg(2), *s, true);
                 if (uint32_t r = c.arg(1)) {
                     uint32_t x = c.read_u32(r), y = c.read_u32(r + 4);
