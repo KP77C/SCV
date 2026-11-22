@@ -866,7 +866,6 @@ static int dyn86_clock_cold(dynablock_t* db)
 {
     return db->probed && getJumpAddress64((uintptr_t)db->x86_addr) != (uintptr_t)db->block;
 }
-static uint64_t dyn86_tick_last_us = 0;   /* last per-frame clock tick */
 static uint64_t dyn86_clock_now_us(void)
 {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -906,7 +905,6 @@ int dyn86_jit_collect_victims(dynablock_t** out, int max)
     { static int on = -1;
       if(on < 0) { const char* e = getenv("WX86_JITCLOCK"); on = (e && *e=='0') ? 0 : 1; }
       if(on) dyn86_clock_live = 1; }
-    const int walk_probes = dyn86_clock_live && dyn86_clock_now_us() - dyn86_tick_last_us > 500000u;
     mmaplist_t* list0 = list; int ci0 = ci;
     for(int pass = 0; pass < 2 && n == 0; ++pass) {
     if(pass) { list = list0; ci = ci0; if(!dyn86_clock_live) break; ++dyn86_clock_fallbacks; }
@@ -932,19 +930,6 @@ int dyn86_jit_collect_victims(dynablock_t** out, int max)
                          * anything if that finds none (progress first). */
                         if(!dyn86_clock_live || pass || dyn86_clock_cold(db))
                             out[n++] = db;
-                        else if(walk_probes && !db->probed && db->done && db->block && db->jmpnext) {
-                            /* The walk becomes the clock hand (build 12)
-                             * while no frame has ticked the clock for 0.5 s:
-                             * an unprobed block gets its second chance here,
-                             * so aging never stops during loads (K's build 11
-                             * log: loads froze the per-frame tick, then every
-                             * round fell back to random victims). Only then:
-                             * a pressure-driven hand turns fast and takes
-                             * warm code (host: ~2k retranslations per 5 s in
-                             * game against ~50 with the frame tick alone). */
-                            db->probed = 1;
-                            if(setJumpTableIfRef(db->x86_addr, db->jmpnext, db->block)) ++dyn86_clock_probes;
-                        }
                     }
                 }
                 m = NEXT_BLOCK(m);
@@ -969,23 +954,45 @@ void dyn86_jit_clock_tick(int chunks)
 {
     static int on = -1;
     if(on < 0) { const char* e = getenv("WX86_JITCLOCK"); on = (e && *e=='0') ? 0 : 1; }
-    if(!on || !dyn86_ev_rounds || !dyn86_evict_armed() || chunks <= 0)
+    (void)chunks;
+    if(!on || !dyn86_ev_rounds || !dyn86_evict_armed())
         return;
     mutex_lock(&my_context->mutex_dyndump);
-    dyn86_tick_last_us = dyn86_clock_now_us();
-    dyn86_jit_clock_tick_locked(chunks);
+    dyn86_jit_clock_tick_locked(0);
     mutex_unlock(&my_context->mutex_dyndump);
 }
 /* Same, with mutex_dyndump already held (the eviction round itself: the clock
  * must keep turning while the game translates without presenting frames,
  * i.e. during loads; K's build 11 log: probes froze at the first load and
  * every later eviction fell back to random victims). */
+/* Build 13: the hand turns on a TIMER, WX86_JITCLOCK_RATE chunks per second
+ * (default 10: one lap of the 16 MiB pool in ~26 s; build 11/12 did 15 per
+ * second at a steady 15 fps), whoever calls it: the presented frame or the
+ * eviction round. Build 11 ticked per frame only, so loads froze it; build 12
+ * let the eviction walk probe whenever frames were 0.5 s apart, and on K's
+ * Vita a slow battle after a save load turned that into a spiral (fast hand
+ * -> warm code evicted -> slower frames -> hand stays fast; 4-6k
+ * retranslations per 10 s for minutes). `chunks` > 0 forces that many. */
 void dyn86_jit_clock_tick_locked(int chunks)
 {
-    static int on = -1;
-    if(on < 0) { const char* e = getenv("WX86_JITCLOCK"); on = (e && *e=='0') ? 0 : 1; }
-    if(!on || chunks <= 0)
+    static int on = -1, rate = 10;
+    static uint64_t last = 0;
+    if(on < 0) {
+        const char* e = getenv("WX86_JITCLOCK"); on = (e && *e=='0') ? 0 : 1;
+        const char* r = getenv("WX86_JITCLOCK_RATE"); if(r && atoi(r) > 0) rate = atoi(r);
+    }
+    if(!on)
         return;
+    if(chunks <= 0) {
+        const uint64_t now = dyn86_clock_now_us();
+        const uint64_t period = 1000000u / (uint64_t)rate;
+        if(!last) last = now - period;
+        if(now - last < period)
+            return;
+        uint64_t n = (now - last) / period;
+        if(n > 32) { n = 32; last = now; } else last += n * period;
+        chunks = (int)n;
+    }
     mutex_lock(&mutex_dynarec);
     if(mmaplist) {
         mmaplist_t* list = mmaplist; int ci = 0;

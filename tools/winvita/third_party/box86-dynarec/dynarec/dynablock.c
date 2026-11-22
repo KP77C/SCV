@@ -735,6 +735,7 @@ static int dyn86_evict_round(x86emu_t* emu, size_t want)
      * anti-emballement ne prouverait rien. */
     if(dyn86_ev_rounds == 1) { atexit(dyn86_ev_atexit); dyn86_ev_say("premier tour"); }
     const int base = dyn86_wave_base();
+    { extern void dyn86_jit_clock_tick_locked(int); dyn86_jit_clock_tick_locked(0); }  /* JIT clock on its timer, loads included */
     size_t freed = dyn86_reclaim_wave(emu);  /* vague precedente, si mure */
     if(freed) { g_wave = base; return 1; }
     dyn86_retire_wave(emu, g_wave);          /* sinon, en preparer une */
