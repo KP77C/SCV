@@ -275,7 +275,8 @@ int sampler_main(SceSize, void*) {
                     log("[not-bound] [cause: guest stall] watchdog: no frame for 10 s (%llu frames so far), RAM free %u KiB; guest threads:",
                         (unsigned long long)p, (unsigned)(fm.size_user >> 10));
                     if (d2rt::ThreadScheduler* sc = wx86_sched()) sc->dump_threads_to([](const char* m) { log("[not-bound]   %s", m); });
-                    window_report(wx86_now_us());   // module/hot-spot/JIT/shim timings for the stalled window (no present calls it now)
+                    // (no window_report here: it is main-thread code; calling it from this
+                    //  sampler thread during the startup folder scan crashed build 4/4b)
                 }
                 wd_presents = p;
             }
