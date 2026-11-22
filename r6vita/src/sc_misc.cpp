@@ -214,9 +214,11 @@ void install_misc(d2rt::Bridge& br) {
     // timeGetTime: R6 spins on it (up to 3 s) waiting for its sound thread to set a flag
     // (R6BOLegacy.exe 0x44da12, on each reload). Guest threads are cooperative, so the
     // spin must give the other threads a turn or it always runs out the full timeout.
-    R(br, "WINMM.dll", "timeGetTime", 0, [](Cpu&) {
-        static uint32_t n = 0;
-        if ((++n & 31) == 0) if (auto* s = wx86_sched()) s->yield();
+    // Only that loop yields (its two call sites' return addresses): a yield on every
+    // 32nd call anywhere crashed build 4 at startup on the Vita (JIT eviction thrash).
+    R(br, "WINMM.dll", "timeGetTime", 0, [](Cpu& c) {
+        const uint32_t ra = c.read_u32(c.reg(d2rt::R_ESP));
+        if (ra == 0x0044da14u || ra == 0x0044da2cu) if (auto* s = wx86_sched()) s->yield();
         return (uint32_t)wx86_now_ms(); });
     // ---- GDI pieces the Smacker player asks for -------------------------------
     R(br, "GDI32.dll", "GetSystemPaletteUse", 1, [](Cpu&) { return 1u; });   // SYSPAL_STATIC
