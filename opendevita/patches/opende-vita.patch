@@ -456,38 +456,66 @@ index 4e79963..c12e35d 100644
              refreshGains(s, voice);
 diff --git a/src/core/jobs.cc b/src/core/jobs.cc
 new file mode 100644
-index 0000000..c3a68ef
+index 0000000..cd72599
 --- /dev/null
 +++ b/src/core/jobs.cc
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,256 @@
 +#include "core/jobs.h"
 +
-+#include <condition_variable>
++#include <atomic>
++#include <cstdio>
 +#include <cstdlib>
 +#include <deque>
-+#include <mutex>
-+#include <pthread.h>
 +#include <utility>
 +#include <vector>
 +
 +#ifdef __vita__
 +#include <psp2/kernel/threadmgr.h>
++#else
++#include <chrono>
++#include <semaphore>
++#include <thread>
 +#endif
 +
++// Helpers sleep on a counting semaphore (one count per queued job); the
++// queue itself sits behind a small spin lock. Waiting for a group runs queued
++// jobs, then naps briefly until the group's last job is done. The Vita build
++// uses only kernel threads and semaphores (no pthread), created after the
++// platform start-up.
 +namespace dx::jobs {
 +    namespace {
 +        struct Job {
-+            Group* group;
++            Group* group = nullptr;
 +            std::function<void()> run;
 +        };
 +
++        class SpinLock {
++        public:
++            void lock()
++            {
++                while (flag.test_and_set(std::memory_order_acquire)) {
++                }
++            }
++            void unlock()
++            {
++                flag.clear(std::memory_order_release);
++            }
++
++        private:
++            std::atomic_flag flag = ATOMIC_FLAG_INIT;
++        };
++
 +        struct Pool {
-+            std::mutex mutex;
-+            std::condition_variable wake;
-+            std::condition_variable done;
++            SpinLock lock;
 +            std::deque<Job> queue;
 +            int32_t count = 0;
 +            bool started = false;
++#ifdef __vita__
++            SceUID semaphore = -1;
++            uintptr_t mainThread = 0;
++#else
++            std::counting_semaphore<1 << 20> semaphore { 0 };
++#endif
 +        };
 +
 +        Pool& pool()
@@ -498,45 +526,71 @@ index 0000000..c3a68ef
 +            return *p;
 +        }
 +
++#ifdef __vita__
++        // The thread ID register: a cheap per-thread value, no system call.
++        uintptr_t threadRegister()
++        {
++            uintptr_t value;
++            asm volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(value));
++            return value;
++        }
++#else
 +        thread_local bool helperThread = false;
++#endif
++
++        bool pop(Job& job)
++        {
++            Pool& p = pool();
++            p.lock.lock();
++            if (p.queue.empty()) {
++                p.lock.unlock();
++                return false;
++            }
++            job = std::move(p.queue.front());
++            p.queue.pop_front();
++            p.lock.unlock();
++            return true;
++        }
 +
 +        void finish(Job& job)
 +        {
 +            job.run();
-+            if (job.group->pending.fetch_sub(1) == 1) {
-+                std::lock_guard<std::mutex> lock(pool().mutex);
-+                pool().done.notify_all();
-+            }
++            job.group->pending.fetch_sub(1);
 +        }
 +
-+        struct HelperStart {
-+            int32_t index;
-+        };
-+
-+        void* helperMain(void* argument)
++        void nap()
 +        {
-+            int32_t index = static_cast<HelperStart*>(argument)->index;
-+            delete static_cast<HelperStart*>(argument);
-+            helperThread = true;
 +#ifdef __vita__
-+            // Helpers on cores 2 and 1 (audio also lives on core 1, lightly).
-+            sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), index == 0 ? 0x40000 : 0x20000);
++            sceKernelDelayThread(20);
 +#else
-+            (void)index;
++            std::this_thread::sleep_for(std::chrono::microseconds(20));
 +#endif
++        }
++
++        void helperLoop()
++        {
 +            Pool& p = pool();
 +            while (true) {
++#ifdef __vita__
++                sceKernelWaitSema(p.semaphore, 1, nullptr);
++#else
++                p.semaphore.acquire();
++#endif
 +                Job job;
-+                {
-+                    std::unique_lock<std::mutex> lock(p.mutex);
-+                    p.wake.wait(lock, [&] { return !p.queue.empty(); });
-+                    job = std::move(p.queue.front());
-+                    p.queue.pop_front();
++                // The job may already have been taken by a waiting thread.
++                if (pop(job)) {
++                    finish(job);
 +                }
-+                finish(job);
 +            }
-+            return nullptr;
 +        }
++
++#ifdef __vita__
++        int helperEntry(SceSize, void*)
++        {
++            helperLoop();
++            return 0;
++        }
++#endif
 +    }
 +
 +    Group::~Group()
@@ -560,19 +614,34 @@ index 0000000..c3a68ef
 +            wanted = 2;
 +        }
 +#ifdef __vita__
-+        sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), 0x10000);
-+#endif
-+        for (int32_t i = 0; i < wanted; i++) {
-+            pthread_attr_t attributes;
-+            pthread_attr_init(&attributes);
-+            pthread_attr_setstacksize(&attributes, 512 * 1024);
-+            pthread_t thread;
-+            if (pthread_create(&thread, &attributes, helperMain, new HelperStart { i }) == 0) {
-+                pthread_detach(thread);
-+                p.count++;
++        p.mainThread = threadRegister();
++        if (wanted > 0) {
++            p.semaphore = sceKernelCreateSema("dx_jobs", 0, 0, 1 << 20, nullptr);
++            if (p.semaphore < 0) {
++                std::printf("worker threads: semaphore failed (0x%08x)\n", static_cast<unsigned>(p.semaphore));
++                wanted = 0;
 +            }
-+            pthread_attr_destroy(&attributes);
 +        }
++        for (int32_t i = 0; i < wanted; i++) {
++            // Cores 2 and 1 (the sound thread also lives on core 1, lightly).
++            int affinity = i == 0 ? 0x40000 : 0x20000;
++            SceUID thread = sceKernelCreateThread(i == 0 ? "dx_worker0" : "dx_worker1", helperEntry, 0x10000100, 512 * 1024, 0, affinity, nullptr);
++            if (thread >= 0 && sceKernelStartThread(thread, 0, nullptr) >= 0) {
++                p.count++;
++            } else {
++                std::printf("worker threads: thread %d failed (0x%08x)\n", static_cast<int>(i), static_cast<unsigned>(thread));
++            }
++        }
++        std::printf("worker threads: %d started\n", static_cast<int>(p.count));
++#else
++        for (int32_t i = 0; i < wanted; i++) {
++            std::thread([] {
++                helperThread = true;
++                helperLoop();
++            }).detach();
++            p.count++;
++        }
++#endif
 +    }
 +
 +    int32_t helpers()
@@ -582,7 +651,12 @@ index 0000000..c3a68ef
 +
 +    bool onHelper()
 +    {
++#ifdef __vita__
++        Pool& p = pool();
++        return p.count > 0 && threadRegister() != p.mainThread;
++#else
 +        return helperThread;
++#endif
 +    }
 +
 +    void submit(Group& group, std::function<void()> job)
@@ -590,35 +664,28 @@ index 0000000..c3a68ef
 +        Pool& p = pool();
 +        group.pending.fetch_add(1);
 +        if (p.count == 0) {
-+            Job inline_ { &group, std::move(job) };
-+            finish(inline_);
++            Job now { &group, std::move(job) };
++            finish(now);
 +            return;
 +        }
-+        {
-+            std::lock_guard<std::mutex> lock(p.mutex);
-+            p.queue.push_back({ &group, std::move(job) });
-+        }
-+        p.wake.notify_one();
++        p.lock.lock();
++        p.queue.push_back({ &group, std::move(job) });
++        p.lock.unlock();
++#ifdef __vita__
++        sceKernelSignalSema(p.semaphore, 1);
++#else
++        p.semaphore.release();
++#endif
 +    }
 +
 +    void wait(Group& group)
 +    {
-+        Pool& p = pool();
 +        while (group.pending.load() > 0) {
 +            Job job;
-+            bool have = false;
-+            {
-+                std::unique_lock<std::mutex> lock(p.mutex);
-+                if (!p.queue.empty()) {
-+                    job = std::move(p.queue.front());
-+                    p.queue.pop_front();
-+                    have = true;
-+                } else {
-+                    p.done.wait(lock, [&] { return group.pending.load() <= 0 || !p.queue.empty(); });
-+                }
-+            }
-+            if (have) {
++            if (pop(job)) {
 +                finish(job);
++            } else {
++                nap();
 +            }
 +        }
 +    }
@@ -687,10 +754,60 @@ index 0000000..fefb741
 +    void parallelFor(int32_t count, const std::function<void(int32_t)>& body);
 +}
 diff --git a/src/core/objects.cc b/src/core/objects.cc
-index d5f4d4a..948f3a8 100644
+index d5f4d4a..9d55be9 100644
 --- a/src/core/objects.cc
 +++ b/src/core/objects.cc
-@@ -639,7 +639,8 @@ namespace dx {
+@@ -1,4 +1,6 @@
+ #include "core/objects.h"
++#include "core/prof.h"
++#include <cstdio>
+ 
+ #include "core/config.h"
+ #include "core/vm.h"
+@@ -279,10 +281,21 @@ namespace dx {
+     int32_t Linker::findExport(Name objectName, Name className, std::string_view group) const
+     {
+         const auto& table = package->exports();
+-        for (size_t i = 0; i < table.size(); i++) {
+-            if (names[static_cast<size_t>(table[i].name)] != objectName) {
+-                continue;
+-            }
++        if (exportsByName.size() != table.size()) {
++            exportsByName.clear();
++            exportsByName.reserve(table.size());
++            for (size_t i = 0; i < table.size(); i++) {
++                exportsByName.emplace_back(names[static_cast<size_t>(table[i].name)].index(), static_cast<uint32_t>(i));
++            }
++            std::stable_sort(exportsByName.begin(), exportsByName.end(), [](const auto& a, const auto& b) {
++                return a.first < b.first;
++            });
++        }
++        auto range = std::equal_range(exportsByName.begin(), exportsByName.end(), std::pair<uint32_t, uint32_t> { objectName.index(), 0 }, [](const auto& a, const auto& b) {
++            return a.first < b.first;
++        });
++        for (auto it = range.first; it != range.second; ++it) {
++            size_t i = it->second;
+             int32_t ref = static_cast<int32_t>(i + 1);
+             if (!className.none()) {
+                 Name actualClass = table[i].classRef == 0 ? Name("Class") : Name(package->objectName(table[i].classRef));
+@@ -525,10 +538,16 @@ namespace dx {
+             if (path == reg.paths.end()) {
+                 return nullptr;
+             }
++            uint64_t started = prof::startupLogging() ? prof::nowMicros() : 0;
+             auto linker = std::make_unique<Linker>(packageName, std::make_unique<Package>(path->second));
+             Linker* result = linker.get();
+             reg.linkers.emplace(packageName, std::move(linker));
+             result->packageObject = packageObject(packageName);
++            if (started) {
++                char line[160];
++                std::snprintf(line, sizeof(line), "package %s opened in %.0f ms", packageName.c_str(), static_cast<double>(prof::nowMicros() - started) / 1000.0);
++                prof::startupMark(line);
++            }
+             return result;
+         }
+ 
+@@ -639,7 +658,8 @@ namespace dx {
                  registry().deferredData.push_back(object);
              }
              if (entry.size > 0) {
@@ -700,7 +817,7 @@ index d5f4d4a..948f3a8 100644
                  int32_t stackNode = 0;
                  int32_t stackState = 0;
                  int32_t stackOffset = -1;
-@@ -682,6 +683,37 @@ namespace dx {
+@@ -682,6 +702,37 @@ namespace dx {
              object->postLoad();
          }
  
@@ -739,7 +856,7 @@ index d5f4d4a..948f3a8 100644
          {
              UClass* cls = object->cls;
 diff --git a/src/core/objects.h b/src/core/objects.h
-index 8c72219..705595c 100644
+index 8c72219..9eeb42a 100644
 --- a/src/core/objects.h
 +++ b/src/core/objects.h
 @@ -23,6 +23,8 @@ namespace dx {
@@ -751,7 +868,16 @@ index 8c72219..705595c 100644
  
          Name packageName;
          UObject* packageObject = nullptr;
-@@ -74,6 +76,10 @@ namespace dx {
+@@ -38,6 +40,8 @@ namespace dx {
+         std::vector<UObject*> exports;
+         std::vector<UObject*> imports;
+         std::vector<bool> importResolved;
++        // (name id, export index) sorted by name, built on first lookup.
++        mutable std::vector<std::pair<uint32_t, uint32_t>> exportsByName;
+     };
+ 
+     using ObjectFactory = std::function<UObject*()>;
+@@ -74,6 +78,10 @@ namespace dx {
          uint64_t destroyCount();
          Name uniqueName(UClass* cls);
          void readTaggedProperties(UStruct* structType, uint8_t* data, Reader& reader, Linker& linker);
@@ -764,10 +890,10 @@ index 8c72219..705595c 100644
          UClass* objectClass();
 diff --git a/src/core/prof.cc b/src/core/prof.cc
 new file mode 100644
-index 0000000..cb23b3f
+index 0000000..5a1eb23
 --- /dev/null
 +++ b/src/core/prof.cc
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,160 @@
 +#include "core/prof.h"
 +#include "core/jobs.h"
 +
@@ -822,6 +948,53 @@ index 0000000..cb23b3f
 +        }
 +        uint64_t elapsed = nowMicros() - start;
 +        return sink ? static_cast<double>(elapsed) / 1000.0 : 0.0;
++    }
++
++    std::atomic<uint32_t> fileOpens { 0 };
++    std::atomic<uint32_t> fileReads { 0 };
++    std::atomic<uint64_t> fileBytes { 0 };
++
++    namespace {
++        uint64_t launchTime = nowMicros();
++        bool startupOver = false;
++    }
++
++    bool startupLogging()
++    {
++#ifdef __vita__
++        return !startupOver;
++#else
++        static const bool on = std::getenv("DX_STARTUP_LOG") != nullptr;
++        return on && !startupOver;
++#endif
++    }
++
++    namespace {
++        char lastStep[160] = "launch";
++    }
++
++    const char* lastStartupStep()
++    {
++        return lastStep;
++    }
++
++    void startupMark(const char* what)
++    {
++        if (!startupLogging()) {
++            return;
++        }
++        std::snprintf(lastStep, sizeof(lastStep), "%s", what);
++        std::printf("start-up %.2f s: %s (files: %u opens, %u reads, %.1f MiB)\n", static_cast<double>(nowMicros() - launchTime) / 1e6, what, static_cast<unsigned>(fileOpens.load()), static_cast<unsigned>(fileReads.load()), static_cast<double>(fileBytes.load()) / 1048576.0);
++        std::fflush(stdout);
++    }
++
++    void startupDone()
++    {
++        if (startupOver) {
++            return;
++        }
++        startupMark("first frame drawn");
++        startupOver = true;
 +    }
 +
 +    bool onHelperThread()
@@ -883,10 +1056,10 @@ index 0000000..cb23b3f
 +}
 diff --git a/src/core/prof.h b/src/core/prof.h
 new file mode 100644
-index 0000000..ac20c4b
+index 0000000..668d9b7
 --- /dev/null
 +++ b/src/core/prof.h
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,125 @@
 +#pragma once
 +
 +#include <atomic>
@@ -995,6 +1168,18 @@ index 0000000..ac20c4b
 +        Section section;
 +        uint64_t start;
 +    };
++
++    // Start-up trace: prints the seconds since launch and what just
++    // happened (always on the Vita, DX_STARTUP_LOG=1 elsewhere). Stops after
++    // the first frames are drawn.
++    // File counters for the start-up trace (package opens and reads).
++    extern std::atomic<uint32_t> fileOpens;
++    extern std::atomic<uint32_t> fileReads;
++    extern std::atomic<uint64_t> fileBytes;
++    bool startupLogging();
++    void startupMark(const char* what);
++    void startupDone();
++    const char* lastStartupStep();
 +
 +    // Per-frame averages of the busiest sections since the last report, as
 +    // one line; resets the counters.
@@ -1275,20 +1460,25 @@ index 4a62583..610a690 100644
              return false;
          }
 diff --git a/src/engine/package.cc b/src/engine/package.cc
-index 2291142..e58d80f 100644
+index 2291142..cd907af 100644
 --- a/src/engine/package.cc
 +++ b/src/engine/package.cc
-@@ -1,6 +1,9 @@
+@@ -1,9 +1,14 @@
 +#include <cstdio>
 +#include <cstdlib>
  #include "engine/package.h"
++#include "core/prof.h"
  
  #include <algorithm>
 +#include <cstring>
  #include <cctype>
  #include <fstream>
  #include <stdexcept>
-@@ -119,20 +122,177 @@ namespace dx {
++#include <unordered_map>
+ 
+ namespace dx {
+     bool iequals(std::string_view a, std::string_view b)
+@@ -119,20 +124,240 @@ namespace dx {
          return Reader(owner.data(), nativeStart);
      }
  
@@ -1317,6 +1507,7 @@ index 2291142..e58d80f 100644
 +                }
 +            }
 +            std::FILE* file = std::fopen(path.c_str(), "rb");
++            prof::fileOpens++;
 +            if (!file) {
 +                return nullptr;
 +            }
@@ -1331,20 +1522,29 @@ index 2291142..e58d80f 100644
 +        }
 +
 +        // Objects are mostly small and neighbours load together, so reads of
-+        // non-resident packages go through a small cache of 64 KiB blocks:
-+        // one card access per block instead of one (or several) per object.
-+        constexpr size_t CacheBlock = 64 * 1024;
-+        constexpr size_t CacheBlocks = 96;
++        // non-resident packages go through a cache of blocks: one card access
++        // per block instead of one (or several) per object. Class loading at
++        // start-up touches one small export in nearly every block of the big
++        // packages, so blocks are small and the cache holds the working set.
++        size_t envSize(const char* name, size_t fallback)
++        {
++            const char* value = std::getenv(name);
++            long parsed = value ? std::atol(value) : 0;
++            return parsed > 0 ? static_cast<size_t>(parsed) : fallback;
++        }
++        const size_t CacheBlock = envSize("DX_BLOCK_KIB", 16) * 1024;
++        const size_t CacheBlocks = envSize("DX_BLOCK_CACHE_MIB", 12) * 1024 * 1024 / CacheBlock;
 +        struct CachedBlock {
-+            uint64_t owner = 0;
-+            size_t index = 0;
++            uint64_t key = 0;
 +            uint64_t used = 0;
 +            size_t size = 0;
 +            std::vector<uint8_t> data;
 +        };
 +        struct BlockCache {
 +            std::vector<CachedBlock> blocks;
++            std::unordered_map<uint64_t, size_t> index;
 +            uint64_t clock = 0;
++            size_t hand = 0;
 +        };
 +        BlockCache& blockCache()
 +        {
@@ -1356,31 +1556,47 @@ index 2291142..e58d80f 100644
 +        {
 +            BlockCache& cache = blockCache();
 +            cache.clock++;
-+            CachedBlock* victim = nullptr;
-+            for (CachedBlock& block : cache.blocks) {
-+                if (block.owner == owner && block.index == index) {
-+                    block.used = cache.clock;
-+                    return &block;
-+                }
-+                if (!victim || block.used < victim->used) {
-+                    victim = &block;
-+                }
++            uint64_t key = (owner << 24) | static_cast<uint64_t>(index);
++            auto found = cache.index.find(key);
++            if (found != cache.index.end()) {
++                CachedBlock& block = cache.blocks[found->second];
++                block.used = cache.clock;
++                return &block;
 +            }
++            size_t slot;
 +            if (cache.blocks.size() < CacheBlocks) {
++                slot = cache.blocks.size();
 +                cache.blocks.emplace_back();
-+                victim = &cache.blocks.back();
++            } else {
++                // Approximate LRU: the oldest of a few slots after the hand.
++                slot = cache.hand;
++                for (size_t i = 1; i < 8; i++) {
++                    size_t other = (cache.hand + i) % cache.blocks.size();
++                    if (cache.blocks[other].used < cache.blocks[slot].used) {
++                        slot = other;
++                    }
++                }
++                cache.hand = (slot + 1) % cache.blocks.size();
++                cache.index.erase(cache.blocks[slot].key);
 +            }
++            CachedBlock* victim = &cache.blocks[slot];
 +            size_t start = index * CacheBlock;
 +            size_t size = std::min(CacheBlock, fileSize - start);
-+            victim->owner = 0;
++            victim->key = 0;
 +            victim->data.resize(CacheBlock);
++            static const bool trace = std::getenv("DX_IO_TRACE") != nullptr;
++            if (trace) {
++                std::fprintf(stderr, "io block %llu %u\n", static_cast<unsigned long long>(owner), static_cast<unsigned>(index));
++            }
++            prof::fileReads++;
++            prof::fileBytes += size;
 +            if (std::fseek(file, static_cast<long>(start), SEEK_SET) != 0 || std::fread(victim->data.data(), 1, size, file) != size) {
 +                return nullptr;
 +            }
-+            victim->owner = owner;
-+            victim->index = index;
++            victim->key = key;
 +            victim->size = size;
 +            victim->used = cache.clock;
++            cache.index[key] = slot;
 +            return victim;
 +        }
 +
@@ -1408,25 +1624,56 @@ index 2291142..e58d80f 100644
 +        if (!file || offset + size > fileBytes) {
 +            throw fail();
 +        }
-+        if (size >= 4 * CacheBlock) {
-+            if (std::fseek(file, static_cast<long>(offset), SEEK_SET) != 0 || std::fread(scratch.data(), 1, size, file) != size) {
-+                throw fail();
++        // Blocks are read when the parser first touches them: texture and
++        // sound data it skips (kept on disk until needed) is never read.
++        struct LazyFill : ReaderFill {
++            uint64_t owner;
++            std::string path;
++            size_t fileSize;
++            size_t start;
++            size_t size;
++            uint8_t* data;
++            size_t firstBlock;
++            std::vector<uint8_t> filled;
++
++            void ensure(size_t position, size_t count, size_t& readyFrom, size_t& readyTo) override
++            {
++                size_t first = position / CacheBlock;
++                size_t last = (position + count - 1) / CacheBlock;
++                readyFrom = std::max(first * CacheBlock, start);
++                readyTo = std::min((last + 1) * CacheBlock, start + size);
++                for (size_t index = first; index <= last; index++) {
++                    uint8_t& done = filled[index - firstBlock];
++                    if (done) {
++                        continue;
++                    }
++                    std::FILE* file = openPackageFile(path);
++                    const CachedBlock* block = file ? cachedBlock(owner, file, index, fileSize) : nullptr;
++                    if (!block) {
++                        throw std::runtime_error("cannot read block " + std::to_string(index) + " of " + path);
++                    }
++                    size_t blockStart = index * CacheBlock;
++                    size_t from = std::max(blockStart, start);
++                    size_t to = std::min(blockStart + block->size, start + size);
++                    if (to > from) {
++                        std::memcpy(data + (from - start), block->data.data() + (from - blockStart), to - from);
++                    }
++                    done = 1;
++                }
 +            }
-+            return Reader(scratch, offset, offset);
-+        }
-+        size_t done = 0;
-+        while (done < size) {
-+            size_t at = offset + done;
-+            const CachedBlock* block = cachedBlock(cacheId, file, at / CacheBlock, fileBytes);
-+            if (!block) {
-+                throw fail();
-+            }
-+            size_t within = at % CacheBlock;
-+            size_t count = std::min(size - done, block->size - within);
-+            std::memcpy(scratch.data() + done, block->data.data() + within, count);
-+            done += count;
-+        }
-+        return Reader(scratch, offset, offset);
++        };
++        auto fill = std::make_shared<LazyFill>();
++        fill->owner = cacheId;
++        fill->path = filePath.string();
++        fill->fileSize = fileBytes;
++        fill->start = offset;
++        fill->size = size;
++        fill->data = scratch.data();
++        fill->firstBlock = offset / CacheBlock;
++        fill->filled.assign(size == 0 ? 1 : (offset + size - 1) / CacheBlock - fill->firstBlock + 1, 0);
++        Reader reader(scratch, offset, offset);
++        reader.setFill(std::move(fill));
++        return reader;
 +    }
 +
      Package::Package(const std::filesystem::path& path)
@@ -1438,6 +1685,9 @@ index 2291142..e58d80f 100644
 +        fileBytes = fileSize;
 +        static uint64_t nextCacheId = 0;
 +        cacheId = ++nextCacheId;
++        if (std::getenv("DX_IO_TRACE")) {
++            std::fprintf(stderr, "io package %llu %s %u\n", static_cast<unsigned long long>(cacheId), path.string().c_str(), static_cast<unsigned>(fileSize));
++        }
 +        resident = keepPackagesInMemory();
 +        if (std::getenv("DX_PACKAGE_LOG")) {
 +            std::printf("package %s: %u KiB\n", path.string().c_str(), static_cast<unsigned>(fileSize / 1024));
@@ -1454,7 +1704,10 @@ index 2291142..e58d80f 100644
 +            std::FILE* file;
 +            ~Closer() { std::fclose(file); }
 +        } closer { file };
++        prof::fileOpens++;
 +        auto readRange = [&](size_t offset, size_t size, std::vector<uint8_t>& out) {
++            prof::fileReads++;
++            prof::fileBytes += size;
 +            out.resize(size);
 +            if (std::fseek(file, static_cast<long>(offset), SEEK_SET) != 0 || std::fread(out.data(), 1, size, file) != size) {
 +                throw std::runtime_error("cannot read package " + path.string());
@@ -1472,7 +1725,7 @@ index 2291142..e58d80f 100644
          if (reader.u32() != 0x9E2A83C1) {
              throw std::runtime_error("not an unreal package: " + path.string());
          }
-@@ -149,47 +309,83 @@ namespace dx {
+@@ -149,47 +374,83 @@ namespace dx {
          uint32_t importCount = reader.u32();
          uint32_t importOffset = reader.u32();
  
@@ -1545,20 +1798,7 @@ index 2291142..e58d80f 100644
 +                }
 +                entry.flags = tableReader.u32();
 +                nameTable.push_back(std::move(entry));
-             }
--            exportTable.push_back(entry);
--        }
--
--        reader.seek(importOffset);
--        importTable.reserve(importCount);
--        for (uint32_t i = 0; i < importCount; i++) {
--            ImportEntry entry;
--            entry.classPackage = reader.index();
--            entry.className = reader.index();
--            entry.outer = reader.i32();
--            entry.name = reader.index();
--            importTable.push_back(entry);
--        }
++            }
 +        });
 +
 +        parseTable(exportOffset, static_cast<size_t>(exportCount) * 24, [&](Reader& tableReader) {
@@ -1576,7 +1816,20 @@ index 2291142..e58d80f 100644
 +                    entry.offset = tableReader.index();
 +                }
 +                exportTable.push_back(entry);
-+            }
+             }
+-            exportTable.push_back(entry);
+-        }
+-
+-        reader.seek(importOffset);
+-        importTable.reserve(importCount);
+-        for (uint32_t i = 0; i < importCount; i++) {
+-            ImportEntry entry;
+-            entry.classPackage = reader.index();
+-            entry.className = reader.index();
+-            entry.outer = reader.i32();
+-            entry.name = reader.index();
+-            importTable.push_back(entry);
+-        }
 +        });
 +
 +        parseTable(importOffset, static_cast<size_t>(importCount) * 16, [&](Reader& tableReader) {
@@ -1641,10 +1894,10 @@ index d3b089c..211bf5a 100644
          if (isPawn(a)) {
              switch (physics) {
 diff --git a/src/engine/reader.cc b/src/engine/reader.cc
-index 3ff5cf2..b5420c4 100644
+index 3ff5cf2..d44cdd8 100644
 --- a/src/engine/reader.cc
 +++ b/src/engine/reader.cc
-@@ -12,9 +12,16 @@ namespace dx {
+@@ -12,9 +12,24 @@ namespace dx {
      {
      }
  
@@ -1655,18 +1908,29 @@ index 3ff5cf2..b5420c4 100644
 +    {
 +    }
 +
++    void Reader::setFill(std::shared_ptr<ReaderFill> fill)
++    {
++        filler = std::move(fill);
++    }
++
      void Reader::require(size_t count) const
      {
 -        if (position > buffer.size() || buffer.size() - position < count) {
++        if (filler && count > 0 && !(position >= readyFrom && position + count <= readyTo) && position >= base && position - base <= buffer.size() && buffer.size() - (position - base) >= count) {
++            filler->ensure(position, count, readyFrom, readyTo);
++        }
 +        if (position < base || position - base > buffer.size() || buffer.size() - (position - base) < count) {
              throw std::runtime_error("read past end of package data");
          }
      }
-@@ -22,14 +29,14 @@ namespace dx {
+@@ -22,14 +37,17 @@ namespace dx {
      void Reader::bytes(void* out, size_t count)
      {
          require(count);
 -        std::memcpy(out, buffer.data() + position, count);
++        if (count == 0) {
++            return;
++        }
 +        std::memcpy(out, buffer.data() + (position - base), count);
          position += count;
      }
@@ -1679,7 +1943,16 @@ index 3ff5cf2..b5420c4 100644
      }
  
      int16_t Reader::i16()
-@@ -135,7 +142,7 @@ namespace dx {
+@@ -129,13 +147,15 @@ namespace dx {
+ 
+     void Reader::skip(size_t count)
+     {
+-        require(count);
++        if (position < base || position - base > buffer.size() || buffer.size() - (position - base) < count) {
++            throw std::runtime_error("read past end of package data");
++        }
+         position += count;
+     }
  
      void Reader::seek(size_t offset)
      {
@@ -1689,10 +1962,28 @@ index 3ff5cf2..b5420c4 100644
          }
          position = offset;
 diff --git a/src/engine/reader.h b/src/engine/reader.h
-index 41cb909..7ae8228 100644
+index 41cb909..f475404 100644
 --- a/src/engine/reader.h
 +++ b/src/engine/reader.h
-@@ -9,6 +9,9 @@ namespace dx {
+@@ -2,13 +2,27 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <memory>
+ #include <span>
+ #include <string>
+ 
+ namespace dx {
++    // Fills a reader's buffer on demand (file position, byte count), so
++    // that data the parser skips over is never read from disk.
++    class ReaderFill {
++    public:
++        virtual ~ReaderFill() = default;
++        // Makes [position, position + count) valid; returns a file range
++        // around it that is valid too, so later reads inside it skip the call.
++        virtual void ensure(size_t position, size_t count, size_t& readyFrom, size_t& readyTo) = 0;
++    };
++
      class Reader {
      public:
          Reader(std::span<const uint8_t> data, size_t offset);
@@ -1702,11 +1993,21 @@ index 41cb909..7ae8228 100644
  
          uint8_t u8();
          int16_t i16();
-@@ -28,5 +31,6 @@ namespace dx {
+@@ -22,11 +36,16 @@ namespace dx {
+         void skip(size_t count);
+         void seek(size_t offset);
+         size_t tell() const;
++        void setFill(std::shared_ptr<ReaderFill> fill);
+ 
+     private:
+         void require(size_t count) const;
  
          std::span<const uint8_t> buffer;
          size_t position;
 +        size_t base = 0;
++        std::shared_ptr<ReaderFill> filler;
++        mutable size_t readyFrom = 0;
++        mutable size_t readyTo = 0;
      };
  }
 diff --git a/src/engine/resources.cc b/src/engine/resources.cc
@@ -2075,7 +2376,7 @@ index 590d1aa..bbaa55c 100644
          s.time += static_cast<double>(deltaSeconds);
          if (s.root && !s.root->destroyed) {
 diff --git a/src/game/main.cc b/src/game/main.cc
-index f4ca511..f0100a0 100644
+index f4ca511..10fddcd 100644
 --- a/src/game/main.cc
 +++ b/src/game/main.cc
 @@ -1,6 +1,8 @@
@@ -2123,7 +2424,41 @@ index f4ca511..f0100a0 100644
  #ifndef _WIN32
  #include <sys/select.h>
  #include <unistd.h>
-@@ -1066,13 +1090,16 @@ namespace {
+@@ -837,8 +861,11 @@ namespace {
+ 
+         bool start()
+         {
++            dx::prof::startupMark("starting engine");
+             dx::engine::initialize(dx::config::findGameRoot(DEUSEX_GAME_DATA).string());
++            dx::prof::startupMark("engine ready");
+             dx::audio::initialize();
++            dx::prof::startupMark("sound ready");
+             dx::audio::setLightRandom(dx::lightRandomBase);
+             renderer = std::make_unique<dx::SceneRenderer>();
+             renderer->iteratorHook = [this](dx::UObject* actor, const std::function<void(dx::UObject*)>& emit) {
+@@ -926,7 +953,9 @@ namespace {
+                 int height = static_cast<int>(std::lround(request.height));
+                 renderer->drawSceneRect(world->level, world->actors, request.location, request.rotation, request.fov, hidden, x, y, width, height);
+             });
++            dx::prof::startupMark("loading Deus Ex classes");
+             loadDeusExClasses();
++            dx::prof::startupMark("Deus Ex classes loaded");
+             addFieldOfViewChoice();
+             addExtraOptions();
+             addBotsChoice();
+@@ -940,7 +969,10 @@ namespace {
+                 auto local = dx::config::system().get("URL", "LocalMap");
+                 map = local ? *local : "DX.dx";
+             }
+-            return openMap(map);
++            dx::prof::startupMark(("opening map " + map).c_str());
++            bool opened = openMap(map);
++            dx::prof::startupMark("map opened");
++            return opened;
+         }
+ 
+         bool project(const dx::Vector& location, float& pixelX, float& pixelY)
+@@ -1066,13 +1098,16 @@ namespace {
              if (world && world->level) {
                  previousTravelInfo = world->level->travelInfo;
              }
@@ -2140,7 +2475,7 @@ index f4ca511..f0100a0 100644
              canvasObject = nullptr;
              world = std::make_unique<dx::World>();
              world->netMode = netMode;
-@@ -1174,8 +1201,123 @@ namespace {
+@@ -1174,8 +1209,123 @@ namespace {
              dx::console::key(key, action, 0);
          }
  
@@ -2264,7 +2599,7 @@ index f4ca511..f0100a0 100644
              SDL_Event event;
              while (SDL_PollEvent(&event)) {
                  switch (event.type) {
-@@ -1287,6 +1429,7 @@ namespace {
+@@ -1287,6 +1437,7 @@ namespace {
                  }
                  renderer->drawScene(world->level, world->actors, viewLocation, viewRotation, viewFov, viewActor);
                  dx::UObject* canvasActor = canvas(width, height);
@@ -2272,7 +2607,7 @@ index f4ca511..f0100a0 100644
                  if (player && !player->destroyed) {
                      dx::vm::Call(player, dx::Name("PreRender")).obj(canvasActor).run();
                      if (viewActor) {
-@@ -1432,6 +1575,9 @@ namespace {
+@@ -1432,6 +1583,9 @@ namespace {
  
          void step()
          {
@@ -2282,7 +2617,7 @@ index f4ca511..f0100a0 100644
              processEvents();
              bool gui = dx::extension::wantsMouse();
              if (gui != guiMode) {
-@@ -1439,7 +1585,15 @@ namespace {
+@@ -1439,7 +1593,15 @@ namespace {
                  SDL_SetRelativeMouseMode(gui ? SDL_FALSE : SDL_TRUE);
                  float cursorX = 0;
                  float cursorY = 0;
@@ -2298,7 +2633,7 @@ index f4ca511..f0100a0 100644
                      int windowWidth = 0;
                      int windowHeight = 0;
                      SDL_GetWindowSize(window, &windowWidth, &windowHeight);
-@@ -1462,6 +1616,7 @@ namespace {
+@@ -1462,6 +1624,7 @@ namespace {
              dx::deusex::applyVanillaFixes();
              applyRenderOptions();
              if (world) {
@@ -2306,7 +2641,7 @@ index f4ca511..f0100a0 100644
                  world->tick(delta);
              }
              pollNetwork(delta);
-@@ -1477,7 +1632,13 @@ namespace {
+@@ -1477,7 +1640,13 @@ namespace {
              int width = 0;
              int height = 0;
              SDL_GL_GetDrawableSize(window, &width, &height);
@@ -2321,7 +2656,7 @@ index f4ca511..f0100a0 100644
              renderer->applyBrightness(static_cast<float>(std::atof(dx::config::system().get(videoSection(), "Brightness").value_or("0.5").c_str())));
              dx::audio::update(viewLocation, viewRotation, delta);
              if (!pendingShot.empty()) {
-@@ -1511,7 +1672,26 @@ namespace {
+@@ -1511,7 +1680,32 @@ namespace {
                  }
                  running = false;
              }
@@ -2332,6 +2667,12 @@ index f4ca511..f0100a0 100644
 +#ifdef __vita__
 +            vita::mark(vita::Mark::SwapDone);
 +#endif
++            {
++                static int drawnFrames = 0;
++                if (++drawnFrames == 3) {
++                    dx::prof::startupDone();
++                }
++            }
 +#ifndef __vita__
 +            static const bool drawReport = std::getenv("DX_DRAW_STATS") != nullptr;
 +            static uint32_t reportFrames = 0;
@@ -2348,13 +2689,15 @@ index f4ca511..f0100a0 100644
              limitFrameRate();
              if (options.fps > 0) {
                  SDL_Delay(static_cast<uint32_t>(1000 / options.fps));
-@@ -1665,6 +1845,38 @@ int main(int argc, char** argv)
+@@ -1665,6 +1859,41 @@ int main(int argc, char** argv)
      if (options.dedicated || options.headless) {
          return runHeadless(options);
      }
-+    dx::jobs::start();
 +#ifdef __vita__
 +    vita::initialize();
++    // After the platform start-up: its log and opende_env.txt (DX_JOBS=0
++    // turns the helpers off) are in place by then.
++    dx::jobs::start();
 +    if (SDL_Init(SDL_INIT_EVENTS | SDL_INIT_TIMER) != 0) {
 +        std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
 +        return 1;
@@ -2384,10 +2727,11 @@ index f4ca511..f0100a0 100644
 +    SDL_Quit();
 +    return result;
 +#else
++    dx::jobs::start();
      if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
          std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
          return 1;
-@@ -1756,4 +1968,5 @@ int main(int argc, char** argv)
+@@ -1756,4 +1985,5 @@ int main(int argc, char** argv)
      SDL_Quit();
      return result;
  #endif
@@ -2412,10 +2756,10 @@ index 0000000..d3ed127
 +#endif
 diff --git a/src/game/vita_platform.cc b/src/game/vita_platform.cc
 new file mode 100644
-index 0000000..9e081c8
+index 0000000..5e6f1e5
 --- /dev/null
 +++ b/src/game/vita_platform.cc
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,220 @@
 +#ifdef __vita__
 +
 +#include "game/vita_platform.h"
@@ -2424,6 +2768,7 @@ index 0000000..9e081c8
 +
 +#include <psp2/ctrl.h>
 +#include <psp2/kernel/processmgr.h>
++#include <psp2/kernel/threadmgr.h>
 +#include <psp2/kernel/sysmem.h>
 +#include <psp2/power.h>
 +#include <psp2/touch.h>
@@ -2543,6 +2888,22 @@ index 0000000..9e081c8
 +        vglSwapBuffers(GL_FALSE);
 +        std::printf("GPU ready: VRAM %u KiB free, GPU RAM %u KiB free\n", static_cast<unsigned>(vglMemFree(VGL_MEM_VRAM) / 1024), static_cast<unsigned>(vglMemFree(VGL_MEM_RAM) / 1024));
 +        std::printf("profiler: %s, timer read %.2f us\n", dx::prof::enabled() ? "on" : "off", dx::prof::timerCostMicros());
++        // Start-up heartbeat: every 10 s until the first frame, say what the
++        // game is busy with (a long black screen otherwise tells nothing).
++        SceUID heartbeat = sceKernelCreateThread("dx_startup_watch", [](SceSize, void*) -> int {
++            for (int seconds = 10; dx::prof::startupLogging(); seconds += 10) {
++                sceKernelDelayThread(10 * 1000 * 1000);
++                if (!dx::prof::startupLogging()) {
++                    break;
++                }
++                std::printf("start-up still busy after %d s; last step: %s; files: %u opens, %u reads, %.1f MiB\n", seconds, dx::prof::lastStartupStep(), static_cast<unsigned>(dx::prof::fileOpens.load()), static_cast<unsigned>(dx::prof::fileReads.load()), static_cast<double>(dx::prof::fileBytes.load()) / 1048576.0);
++                std::fflush(stdout);
++            }
++            return sceKernelExitDeleteThread(0);
++        }, 0x10000100, 0x4000, 0, 0, nullptr);
++        if (heartbeat >= 0) {
++            sceKernelStartThread(heartbeat, 0, nullptr);
++        }
 +    }
 +
 +    void readPad(Pad& pad)
@@ -2976,6 +3337,261 @@ index 66508ac..eee4a26 100644
      };
  
      class GammaPass {
+diff --git a/src/render/lightmap.cc b/src/render/lightmap.cc
+index 3215092..7a3f192 100644
+--- a/src/render/lightmap.cc
++++ b/src/render/lightmap.cc
+@@ -4,6 +4,7 @@
+ #include "engine/props_engine.h"
+ #include "render/lighting.h"
+ #include "render/render_device.h"
++#include "core/jobs.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -45,38 +46,62 @@ namespace dx {
+         constexpr uint8_t LE_WateryShimmer = 3;
+         constexpr uint8_t LE_CloudCast = 7;
+ 
++        // Unpacks a 1-bit shadow map and softens it with a 3x3 filter (edge
++        // texels repeat). Each filter row only depends on its three bits, so
++        // the per-row sums (rounded down as before) come from small tables.
+         void loadShadow(UModel* model, const LightMapIndex& index, int32_t light, std::vector<uint8_t>& shadow)
+         {
+             int32_t width = index.uClamp;
+             int32_t height = index.vClamp;
++            if (width <= 0 || height <= 0) {
++                shadow.clear();
++                return;
++            }
+             int32_t pitch = (width + 7) / 8;
+             size_t offset = static_cast<size_t>(index.dataOffset) + static_cast<size_t>(light) * static_cast<size_t>(pitch * height);
+-            std::vector<uint8_t> bits(static_cast<size_t>(width * height), 0);
+-            if (offset + static_cast<size_t>(pitch * height) <= model->lightBits.size()) {
+-                const uint8_t* source = model->lightBits.data() + offset;
+-                for (int32_t y = 0; y < height; y++) {
+-                    for (int32_t x = 0; x < width; x++) {
+-                        bits[static_cast<size_t>(y * width + x)] = (source[y * pitch + (x >> 3)] & (1 << (x & 7))) ? 1 : 0;
++            shadow.assign(static_cast<size_t>(width * height), 0);
++            if (offset + static_cast<size_t>(pitch * height) > model->lightBits.size()) {
++                return;
++            }
++            static const struct Tables {
++                uint8_t outer[8];
++                uint8_t middle[8];
++                Tables()
++                {
++                    for (int32_t bits = 0; bits < 8; bits++) {
++                        int32_t a = (bits & 1) ? 1 : 0;
++                        int32_t b = (bits & 2) ? 1 : 0;
++                        int32_t c = (bits & 4) ? 1 : 0;
++                        outer[bits] = static_cast<uint8_t>((24 * a + 40 * b + 24 * c) * 255 / 320);
++                        middle[bits] = static_cast<uint8_t>((40 * a + 64 * b + 40 * c) * 255 / 320);
+                     }
+                 }
++            } tables;
++            const uint8_t* source = model->lightBits.data() + offset;
++            // Per row: the 3-bit neighbourhood (left, self, right) of every texel.
++            std::vector<uint8_t> rows(static_cast<size_t>(width * height));
++            for (int32_t y = 0; y < height; y++) {
++                const uint8_t* line = source + y * pitch;
++                uint8_t* out = rows.data() + static_cast<size_t>(y * width);
++                auto bit = [&](int32_t x) {
++                    return (line[x >> 3] >> (x & 7)) & 1;
++                };
++                int32_t previous = bit(0);
++                int32_t current = previous;
++                for (int32_t x = 0; x < width; x++) {
++                    int32_t next = x + 1 < width ? bit(x + 1) : current;
++                    out[x] = static_cast<uint8_t>(previous | (current << 1) | (next << 2));
++                    previous = current;
++                    current = next;
++                }
+             }
+-            static const int32_t weights[3][3] = { { 24, 40, 24 }, { 40, 64, 40 }, { 24, 40, 24 } };
+-            shadow.assign(bits.size(), 0);
+             for (int32_t y = 0; y < height; y++) {
++                const uint8_t* above = rows.data() + static_cast<size_t>(std::max(y - 1, 0) * width);
++                const uint8_t* self = rows.data() + static_cast<size_t>(y * width);
++                const uint8_t* below = rows.data() + static_cast<size_t>(std::min(y + 1, height - 1) * width);
++                uint8_t* out = shadow.data() + static_cast<size_t>(y * width);
+                 for (int32_t x = 0; x < width; x++) {
+-                    int32_t value = 0;
+-                    for (int32_t dy = -1; dy <= 1; dy++) {
+-                        int32_t sy = std::clamp(y + dy, 0, height - 1);
+-                        int32_t row = 0;
+-                        for (int32_t dx = -1; dx <= 1; dx++) {
+-                            int32_t sx = std::clamp(x + dx, 0, width - 1);
+-                            if (bits[static_cast<size_t>(sy * width + sx)] > 0) {
+-                                row += weights[dy + 1][dx + 1];
+-                            }
+-                        }
+-                        value += row * 255 / 320;
+-                    }
+-                    shadow[static_cast<size_t>(y * width + x)] = static_cast<uint8_t>(value);
++                    out[x] = static_cast<uint8_t>(tables.outer[above[x]] + tables.middle[self[x]] + tables.outer[below[x]]);
+                 }
+             }
+         }
+@@ -220,9 +245,18 @@ namespace dx {
+             lighting.base[i * 3 + 2] = ambientBytes[2];
+         }
+         lighting.points.resize(count);
+-        for (int32_t y = 0; y < lighting.height; y++) {
+-            for (int32_t x = 0; x < lighting.width; x++) {
+-                lighting.points[static_cast<size_t>(y * lighting.width + x)] = transform.point(lightmapTexelPoint(model, surf, x, y));
++        {
++            // Same sums as lightmapTexelPoint, with the frame looked up once.
++            SurfaceFrame frame = frameOf(model, surf);
++            float baseU = frame.axisU.dot(frame.base) + index.pan.x;
++            float baseV = frame.axisV.dot(frame.base) + index.pan.y;
++            float d = frame.normal.dot(frame.base);
++            for (int32_t y = 0; y < lighting.height; y++) {
++                float v = baseV + static_cast<float>(y) * index.vScale;
++                for (int32_t x = 0; x < lighting.width; x++) {
++                    float u = baseU + static_cast<float>(x) * index.uScale;
++                    lighting.points[static_cast<size_t>(y * lighting.width + x)] = transform.point(solvePlanePoint(frame, u, v, d));
++                }
+             }
+         }
+         lighting.normal = transform.direction(model->vectors.at(static_cast<size_t>(surf.vNormal)).normal());
+@@ -374,35 +408,40 @@ namespace dx {
+         return false;
+     }
+ 
+-    void LightmapAtlas::store(UModel* model, size_t surfIndex, const Vector& ambient, float time, const LightmapTransform& transform, const std::vector<UObject*>* lights, LightmapPlacement& placement, int32_t variant, std::vector<int32_t>* surfAnimated)
++    void LightmapAtlas::compute(UModel* model, size_t surfIndex, const Vector& ambient, float time, const LightmapTransform& transform, const std::vector<UObject*>* lights, Computed& out)
+     {
+         const BspSurf& surf = model->surfs[surfIndex];
+-        SurfaceLighting lighting = prepareSurfaceLighting(model, surf, ambient, transform, lights);
++        out.surf = surfIndex;
++        out.lighting = prepareSurfaceLighting(model, surf, ambient, transform, lights);
++        evaluateSurfaceLighting(out.lighting, model, surf, time, out.bytes);
++        padPixels(out.bytes, out.lighting.width, out.lighting.height, out.pixels);
++    }
++
++    bool LightmapAtlas::commit(UModel* model, Computed& computed, LightmapPlacement& placement, int32_t variant, std::vector<int32_t>* surfAnimated)
++    {
++        SurfaceLighting& lighting = computed.lighting;
+         if (!place(lighting.width, lighting.height, placement)) {
+-            return;
++            return false;
+         }
+-        std::vector<uint8_t> bytes;
+-        std::vector<uint8_t> pixels;
+-        evaluateSurfaceLighting(lighting, model, surf, time, bytes);
+-        padPixels(bytes, lighting.width, lighting.height, pixels);
+         Page& page = pages[static_cast<size_t>(placement.page)];
+         size_t rowBytes = static_cast<size_t>(lighting.width + 2 * Padding) * 4;
+         for (int32_t y = 0; y < lighting.height + 2 * Padding; y++) {
+             size_t at = static_cast<size_t>(((placement.y - Padding + y) * PageSize + placement.x - Padding) * 4);
+-            std::copy_n(pixels.data() + static_cast<size_t>(y) * rowBytes, rowBytes, page.pixels.data() + at);
++            std::copy_n(computed.pixels.data() + static_cast<size_t>(y) * rowBytes, rowBytes, page.pixels.data() + at);
+         }
+         if (!lighting.lights.empty()) {
+             if (surfAnimated) {
+-                (*surfAnimated)[surfIndex] = static_cast<int32_t>(animated.size());
++                (*surfAnimated)[computed.surf] = static_cast<int32_t>(animated.size());
+             }
+             Animated entry;
+-            entry.surf = surfIndex;
+-            entry.lightMap = static_cast<size_t>(surf.lightMap);
++            entry.surf = computed.surf;
++            entry.lightMap = static_cast<size_t>(model->surfs[computed.surf].lightMap);
+             entry.variant = variant;
+             entry.lighting = std::move(lighting);
+-            entry.bytes = bytes;
++            entry.bytes = std::move(computed.bytes);
+             animated.push_back(std::move(entry));
+         }
++        return true;
+     }
+ 
+     const LightmapPlacement* LightmapAtlas::placementFor(int32_t lightMap, int32_t zone) const
+@@ -425,17 +464,30 @@ namespace dx {
+         isBuilt = true;
+         placements.assign(model->lightMaps.size(), LightmapPlacement {});
+         std::vector<int32_t> surfAnimated(model->surfs.size(), -1);
++        // Lighting for each surface is worked out on all cores, in batches
++        // (to bound memory); placing it in the atlas stays in surface order.
++        // Lights are loaded first, because loading is not thread-safe.
++        for (UObject* light : model->lights) {
++            if (light) {
++                objects::ensureLoaded(light);
++            }
++        }
++        struct Task {
++            size_t surf;
++            Vector ambient;
++            bool isVariant;
++            int32_t variant;
++        };
++        std::vector<Task> tasks;
++        std::vector<uint8_t> claimed(model->lightMaps.size(), 0);
+         for (size_t surfIndex = 0; surfIndex < model->surfs.size(); surfIndex++) {
+             const BspSurf& surf = model->surfs[surfIndex];
+-            if (surf.lightMap < 0 || static_cast<size_t>(surf.lightMap) >= model->lightMaps.size()) {
+-                continue;
+-            }
+-            LightmapPlacement& placement = placements[static_cast<size_t>(surf.lightMap)];
+-            if (placement.page >= 0) {
++            if (surf.lightMap < 0 || static_cast<size_t>(surf.lightMap) >= model->lightMaps.size() || claimed[static_cast<size_t>(surf.lightMap)]) {
+                 continue;
+             }
++            claimed[static_cast<size_t>(surf.lightMap)] = 1;
+             Vector ambient = surfIndex < surfAmbient.size() ? surfAmbient[surfIndex] : Vector {};
+-            store(model, surfIndex, ambient, time, transform, lights, placement, -1, &surfAnimated);
++            tasks.push_back({ surfIndex, ambient, false, -1 });
+         }
+         if (variants) {
+             variantPlacements.reserve(variants->size());
+@@ -447,7 +499,25 @@ namespace dx {
+                 uint64_t key = (static_cast<uint64_t>(surf.lightMap) << 8) | variant.zone;
+                 variantIndex[key] = variantPlacements.size();
+                 variantPlacements.emplace_back(key, LightmapPlacement {});
+-                store(model, static_cast<size_t>(variant.surf), variant.ambient, time, transform, lights, variantPlacements.back().second, static_cast<int32_t>(variantPlacements.size() - 1), nullptr);
++                tasks.push_back({ static_cast<size_t>(variant.surf), variant.ambient, true, static_cast<int32_t>(variantPlacements.size() - 1) });
++            }
++        }
++        constexpr size_t Batch = 96;
++        std::vector<Computed> computed(std::min(Batch, tasks.size()));
++        for (size_t first = 0; first < tasks.size(); first += Batch) {
++            size_t count = std::min(Batch, tasks.size() - first);
++            jobs::parallelFor(static_cast<int32_t>(count), [&](int32_t i) {
++                const Task& task = tasks[first + static_cast<size_t>(i)];
++                compute(model, task.surf, task.ambient, time, transform, lights, computed[static_cast<size_t>(i)]);
++            });
++            for (size_t i = 0; i < count; i++) {
++                const Task& task = tasks[first + i];
++                if (task.isVariant) {
++                    commit(model, computed[i], variantPlacements[static_cast<size_t>(task.variant)].second, task.variant, nullptr);
++                } else {
++                    commit(model, computed[i], placements[static_cast<size_t>(model->surfs[task.surf].lightMap)], -1, &surfAnimated);
++                }
++                computed[i] = Computed {};
+             }
+         }
+         for (const BspNode& node : model->nodes) {
+diff --git a/src/render/lightmap.h b/src/render/lightmap.h
+index c5a94f4..b4a7f3e 100644
+--- a/src/render/lightmap.h
++++ b/src/render/lightmap.h
+@@ -110,7 +110,14 @@ namespace dx {
+         };
+ 
+         bool place(int32_t width, int32_t height, LightmapPlacement& placement);
+-        void store(UModel* model, size_t surfIndex, const Vector& ambient, float time, const LightmapTransform& transform, const std::vector<UObject*>* lights, LightmapPlacement& placement, int32_t variant, std::vector<int32_t>* surfAnimated);
++        struct Computed {
++            size_t surf = 0;
++            SurfaceLighting lighting;
++            std::vector<uint8_t> bytes;
++            std::vector<uint8_t> pixels;
++        };
++        void compute(UModel* model, size_t surfIndex, const Vector& ambient, float time, const LightmapTransform& transform, const std::vector<UObject*>* lights, Computed& out);
++        bool commit(UModel* model, Computed& computed, LightmapPlacement& placement, int32_t variant, std::vector<int32_t>* surfAnimated);
+         const LightmapPlacement* placementFor(int32_t lightMap, int32_t zone) const;
+ 
+         RenderDevice& device;
 diff --git a/src/render/procedural.cc b/src/render/procedural.cc
 index 60247eb..9f025b1 100644
 --- a/src/render/procedural.cc
