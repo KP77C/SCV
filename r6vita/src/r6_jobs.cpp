@@ -24,7 +24,7 @@ struct Part { uint32_t b = 0, e = 0; };
 const std::function<void(uint32_t, uint32_t)>* g_fn = nullptr;
 Part g_part[kHelpers];
 int g_running = 0;            // helpers started
-std::mutex g_call_mx;         // one par_rows at a time (others run inline)
+std::atomic_flag g_busy = ATOMIC_FLAG_INIT;   // one par_rows at a time (others run inline); no pthread on the Vita threads
 
 #ifdef __vita__
 SceUID g_go[kHelpers], g_done;
@@ -87,8 +87,7 @@ int jobs_helpers() { return g_running; }
 
 void par_rows(uint32_t n, const std::function<void(uint32_t, uint32_t)>& fn, uint32_t min_split) {
     if (n < min_split || !ready()) { fn(0, n); return; }
-    std::unique_lock<std::mutex> lk(g_call_mx, std::try_to_lock);
-    if (!lk.owns_lock()) { fn(0, n); return; }
+    if (g_busy.test_and_set(std::memory_order_acquire)) { fn(0, n); return; }
     // Caller takes a slightly bigger first share (it starts at once).
     const int parts = g_running + 1;
     const uint32_t step = (n + parts - 1) / parts;
@@ -102,6 +101,7 @@ void par_rows(uint32_t n, const std::function<void(uint32_t, uint32_t)>& fn, uin
     fn(0, std::min(n, step));
     wait_all(used);
     g_fn = nullptr;
+    g_busy.clear(std::memory_order_release);
 }
 
 }  // namespace sc
