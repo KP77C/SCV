@@ -506,10 +506,12 @@ void apply_state(Cpu& c) {
 }
 
 // ---- render-target sync ------------------------------------------------------------
+void rt_dirty_all();
 void rt_to_mem(Cpu& c) {
     if (!g_rt || !g_gl_dirty || !g_gl_ok) return;
     g_gl_dirty = false;
     ++g_readbacks;
+    rt_dirty_all();
     static std::vector<uint8_t> px;
     px.resize((size_t)g_ow * g_oh * 4);
     glReadPixels(g_ox, g_oy, g_ow, g_oh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
@@ -559,13 +561,68 @@ void draw_surface_quad(Cpu& c, Surf* src, const int sr[4], const int dr[4], bool
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);
 }
 
+// 2D mode: when a frame drew no 3D, the next frame's blits to the render target go to
+// guest memory, which is uploaded once at present (only the changed rectangle). The menu
+// cursor saves the area under it from the back buffer every frame; with the GL frame as
+// the master copy that was a full glReadPixels per frame (5 fps on the Vita).
+bool g_2d = false;
+// In a mission: the last frames drew 3D (the input layer switches to FPS controls).
+bool fps_active_impl() {
+    static const bool off = std::getenv("R6_NOFPS") && std::getenv("R6_NOFPS")[0] == '1';
+    return !off && !g_2d && g_draw_calls > 0;
+}
+int g_rt_dirty[4] = { 0, 0, 0, 0 };     // changed rectangle of the RT's memory since its last upload
+Surf* g_rt_tex_for = nullptr;           // the RT whose GL texture matches its memory outside g_rt_dirty
+void rt_dirty_add(const int r[4]) {
+    if (!g_rt) return;
+    int x0 = std::max(0, r[0]), y0 = std::max(0, r[1]), x1 = std::min((int)g_rt->w, r[2]), y1 = std::min((int)g_rt->h, r[3]);
+    if (x1 <= x0 || y1 <= y0) return;
+    if (g_rt_dirty[2] <= g_rt_dirty[0]) { g_rt_dirty[0] = x0; g_rt_dirty[1] = y0; g_rt_dirty[2] = x1; g_rt_dirty[3] = y1; return; }
+    g_rt_dirty[0] = std::min(g_rt_dirty[0], x0); g_rt_dirty[1] = std::min(g_rt_dirty[1], y0);
+    g_rt_dirty[2] = std::max(g_rt_dirty[2], x1); g_rt_dirty[3] = std::max(g_rt_dirty[3], y1);
+}
+void rt_dirty_all() { g_rt_tex_for = nullptr; }
+
+// The flip chain in 2D mode. The menu cursor keeps one save-under per buffer and expects
+// Flip to hand back the buffer shown two flips ago (real page flipping); with one buffer
+// it left cursor ghosts. Each entry: guest pixels, GL texture, and that texture's state.
+struct ChainBuf { uint32_t px = 0; GLuint tex = 0; bool tex_ok = false; int dirty[4] = { 0, 0, 0, 0 }; };
+std::vector<ChainBuf> g_chain;          // [0] is the back buffer's current memory
+Surf* g_chain_rt = nullptr;
+void chain_rotate() {
+    if (!g_rt || g_rt != g_chain_rt || g_chain.size() < 2) return;
+    ChainBuf& cur = g_chain[0];
+    cur.px = g_rt->pixels; cur.tex = g_rt->tex;
+    cur.tex_ok = g_rt_tex_for == g_rt && !g_rt->tex_dirty;
+    std::memcpy(cur.dirty, g_rt_dirty, sizeof cur.dirty);
+    std::rotate(g_chain.begin(), g_chain.begin() + 1, g_chain.end());
+    const ChainBuf& nx = g_chain[0];
+    g_rt->pixels = nx.px; g_rt->tex = nx.tex;
+    g_rt->tex_dirty = !nx.tex_ok; g_rt->tex_params = 0xFFFFFFFFu; ++g_rt->uniq;
+    g_rt_tex_for = nx.tex_ok ? g_rt : nullptr;
+    std::memcpy(g_rt_dirty, nx.dirty, sizeof g_rt_dirty);
+    g_mem_dirty = true;   // the next present shows this buffer's memory
+}
+
 void mem_to_gl(Cpu& c) {
     if (!g_rt || !g_mem_dirty) return;
     g_mem_dirty = false;
     ++g_uploads;
-    mark_dirty(g_rt);
+    const int* d = g_rt_dirty;
+    if (g_rt_tex_for == g_rt && g_rt->tex && !g_rt->tex_dirty && d[2] > d[0] && d[3] > d[1]) {
+        // Only the changed rectangle.
+        Surf v = *g_rt;
+        const uint32_t bytes = (g_rt->fmt.bpp + 7) / 8;
+        v.pixels += (uint32_t)d[1] * g_rt->pitch + (uint32_t)d[0] * bytes;
+        v.w = (uint32_t)(d[2] - d[0]); v.h = (uint32_t)(d[3] - d[1]); v.mip = nullptr;
+        static std::vector<uint8_t> buf;
+        to_rgba(c, v, buf);
+        glBindTexture(GL_TEXTURE_2D, g_rt->tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, d[0], d[1], (GLsizei)v.w, (GLsizei)v.h, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+    } else mark_dirty(g_rt);
     const int r[4] = { 0, 0, (int)g_rt->w, (int)g_rt->h };
     draw_surface_quad(c, g_rt, r, r, false);
+    g_rt_tex_for = g_rt; g_rt_dirty[0] = g_rt_dirty[1] = g_rt_dirty[2] = g_rt_dirty[3] = 0;
     g_gl_dirty = false;
 }
 
@@ -573,6 +630,12 @@ void present_frame(Cpu& c) {
     ensure_gl();
     mem_to_gl(c);
     ++g_flips;
+    {   // a frame with no 3D draws puts the next one in 2D mode (R6_NO2D=1 turns it off)
+        static const bool off = std::getenv("R6_NO2D") && std::getenv("R6_NO2D")[0] == '1';
+        static uint64_t draws_then = 0;
+        g_2d = !off && g_draw_calls == draws_then;
+        draws_then = g_draw_calls;
+    }
     static uint64_t t0 = 0, last_flips = 0, last_draws = 0, last_tris = 0, last_rb = 0, last_up = 0, last_tex = 0;
     const uint64_t now = wx86_now_us(); if (!t0) t0 = now;
     if (now - t0 >= 5000000) {
@@ -787,6 +850,27 @@ void blit_mem(Cpu& c, Surf& dst, const int dr[4], Surf& src, const int sr[4], bo
     const uint32_t db = (dst.fmt.bpp + 7) / 8, sb = (src.fmt.bpp + 7) / 8;
     const bool same = dst.fmt.bpp == src.fmt.bpp && dst.fmt.r == src.fmt.r && dst.fmt.g == src.fmt.g;
     const Ch r = ch_of(src.fmt.r), g = ch_of(src.fmt.g), b = ch_of(src.fmt.b);
+    if (same && dw == sw && dh == sh && !src.fmt.pal8()) {   // unscaled, same format: row copies
+        int x0 = 0, x1 = dw, y0 = 0, y1 = dh;
+        x0 = std::max({ x0, -dr[0], -sr[0] }); x1 = std::min({ x1, (int)dst.w - dr[0], (int)src.w - sr[0] });
+        y0 = std::max({ y0, -dr[1], -sr[1] }); y1 = std::min({ y1, (int)dst.h - dr[1], (int)src.h - sr[1] });
+        if (x1 <= x0 || y1 <= y0) return;
+        for (int y = y0; y < y1; ++y) {
+            uint8_t* d = dp + (dr[1] + y) * dst.pitch + (dr[0] + x0) * db;
+            const uint8_t* s = sp + (sr[1] + y) * src.pitch + (sr[0] + x0) * sb;
+            if (!key) { std::memmove(d, s, (size_t)(x1 - x0) * db); continue; }
+            if (db == 2) {
+                const uint16_t* s16 = (const uint16_t*)s; uint16_t* d16 = (uint16_t*)d;
+                for (int x = 0; x < x1 - x0; ++x) { const uint32_t v = s16[x]; if (v < src.ck_lo || v > src.ck_hi) d16[x] = (uint16_t)v; }
+            } else {
+                for (int x = 0; x < x1 - x0; ++x) {
+                    const uint32_t v = read_px(s + x * sb, src.fmt.bpp);
+                    if (v < src.ck_lo || v > src.ck_hi) write_px(d + x * db, dst.fmt.bpp, v);
+                }
+            }
+        }
+        return;
+    }
     for (int y = 0; y < dh; ++y) {
         const int dy = dr[1] + y; if (dy < 0 || dy >= (int)dst.h) continue;
         const int sy = sr[1] + (int)((int64_t)y * sh / dh); if (sy < 0 || sy >= (int)src.h) continue;
@@ -830,7 +914,7 @@ uint32_t do_blt(Cpu& c, Surf* dst, const int dr_in[4], Surf* src, const int sr_i
             if (dst == (g_rt ? g_rt->zbuf : nullptr) && ensure_gl()) clear_rt(c, 0, 0, 2, 0, 1.0f);
             return DD_OK;
         }
-        if (to_rt && !g_mem_dirty) {
+        if (to_rt && !g_mem_dirty && !g_2d) {
             const uint32_t r8 = expand(col, ch_of(dst->fmt.r)), g8 = expand(col, ch_of(dst->fmt.g)), b8 = expand(col, ch_of(dst->fmt.b));
             uint32_t rect = wx86_scratch_alloc(16);
             c.write_u32(rect, dr[0]); c.write_u32(rect + 4, dr[1]); c.write_u32(rect + 8, dr[2]); c.write_u32(rect + 12, dr[3]);
@@ -839,15 +923,15 @@ uint32_t do_blt(Cpu& c, Surf* dst, const int dr_in[4], Surf* src, const int sr_i
             return DD_OK;
         }
         if (to_rt) rt_to_mem(c);
-        fill_mem(c, *dst, dr, col); mark_dirty(dst);
-        if (to_rt) g_mem_dirty = true;
+        fill_mem(c, *dst, dr, col); if (!to_rt) mark_dirty(dst);
+        if (to_rt) { g_mem_dirty = true; rt_dirty_add(dr); }
         ++g_blt_mem;
         return DD_OK;
     }
     if (!src) return DDERR_INVALIDPARAMS;
     int sr[4] = { sr_in[0], sr_in[1], sr_in[2], sr_in[3] };
     if (src == g_rt) rt_to_mem(c);
-    if (to_rt && !g_mem_dirty && src != g_rt) {
+    if (to_rt && !g_mem_dirty && src != g_rt && !g_2d) {
         draw_surface_quad(c, src, sr, dr, key && src->ck);
         g_gl_dirty = true; ++g_blt_gl;
         return DD_OK;
@@ -855,8 +939,8 @@ uint32_t do_blt(Cpu& c, Surf* dst, const int dr_in[4], Surf* src, const int sr_i
     if (to_rt) rt_to_mem(c);
     const bool k = key && src->ck;
     blit_mem(c, *dst, dr, *src, sr, k);
-    mark_dirty(dst);
-    if (to_rt) g_mem_dirty = true;
+    if (!to_rt) mark_dirty(dst);
+    if (to_rt) { g_mem_dirty = true; rt_dirty_add(dr); }
     ++g_blt_mem;
     return DD_OK;
 }
@@ -928,6 +1012,15 @@ uint32_t create_surface(Cpu& c, uint32_t d, uint32_t out, bool v4) {
         if (nb) {
             Surf* b = new_surf(c, w, h, f, (caps & ~0x200u & ~0x10u) | 0x4 | 0x4000 | 0x2000 /* BACKBUFFER VIDEOMEMORY 3DDEVICE */);
             b->is_back = true; s->back = b;
+            // 2D-mode flip chain: the back buffer's memory, the front's, then any extra backs.
+            g_chain.assign(1, ChainBuf{}); g_chain[0].px = b->pixels;
+            ChainBuf f0; f0.px = s->pixels; g_chain.push_back(f0);
+            for (uint32_t i = 1; i < nb && i < 3; ++i) {
+                Surf* x = new_surf(c, w, h, f, 0x4 | 0x4000);
+                ChainBuf e; e.px = x->pixels; g_chain.push_back(e);
+            }
+            g_chain_rt = b;
+            log("[not-bound] d3d: flip chain of %u buffers", (unsigned)g_chain.size());
         }
         g_rt = s->back ? s->back : s;
         g_gl_dirty = true; g_mem_dirty = false;
@@ -1104,7 +1197,10 @@ void install_d3d(d2rt::Bridge& br) {
             { "Flip", 3, [](Cpu& c) -> uint32_t {
                 static const long bt = std::getenv("R6_FLIP_BT") ? std::atol(std::getenv("R6_FLIP_BT")) : 0;
                 if (bt && (long)g_flips == bt) log("[not-bound] flip %ld stack:%s", bt, guest_stack(c).c_str());
-                present_frame(c); return DD_OK; } },
+                const bool was_2d = g_2d;
+                present_frame(c);
+                if (was_2d && g_2d) chain_rotate();
+                return DD_OK; } },
             { "GetAttachedSurface", 3, [v4](Cpu& c) -> uint32_t {
                 Surf* s = S(c, c.arg(0)); if (!s) return DDERR_INVALIDPARAMS;
                 const uint32_t caps = c.read_u32(c.arg(1));
@@ -1169,7 +1265,7 @@ void install_d3d(d2rt::Bridge& br) {
             { "Unlock", 2, [](Cpu& c) -> uint32_t {
                 Surf* s = S(c, c.arg(0)); if (!s) return DDERR_INVALIDPARAMS;
                 mark_dirty(s);
-                if (s == g_rt) g_mem_dirty = true;
+                if (s == g_rt) { g_mem_dirty = true; rt_dirty_all(); }
                 if (s->primary && !s->back) present_frame(c);
                 return DD_OK; } },
             { "UpdateOverlay", 6, nullptr },
@@ -1589,5 +1685,7 @@ void install_d3d(d2rt::Bridge& br) {
         br.register_shim("DDRAW.dll", "DirectDrawEnumerateA", s);
     }
 }
+
+bool r6_fps_active() { return fps_active_impl(); }
 
 }  // namespace sc

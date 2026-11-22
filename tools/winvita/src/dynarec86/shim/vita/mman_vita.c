@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>   /* getenv : knob D2_VMBRACKET */
 #include <string.h>
+#include <stdint.h>
 
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/processmgr.h>
@@ -35,7 +36,7 @@ void wx86_vita_progress_c(const char* msg);
  * sync (dyn86_vita_clear_cache) needs it, and a placeholder uid there makes
  * the sync fail silently: emitted code never becomes executable and boot
  * dies right after the pool is reserved. */
-typedef struct { void* base; size_t size; SceUID uid; int vm; int pool; } Blk;
+typedef struct { void* base; size_t size; SceUID uid; int vm; int pool; int ku; } Blk;
 static Blk g_blk[DYN86_MAXBLK];
 /* Registry lock: mmap() is reached under TWO different upstream locks --
  * customMalloc holds mutex_blocks (RW blocks), AllocDynarecMap holds
@@ -179,12 +180,13 @@ unsigned int dyn86_rw_cur  = 0;   /* bytes in plain RW blocks */
  * segment count (default 2, so 32 MiB of total pool). A segment is opened
  * LAZILY, only once the previous one is full -- never all at once at boot. */
 #define JITPOOL_MAX_SEGS 8
-typedef struct { void* base; size_t size, used; SceUID uid; } JitSeg;
+typedef struct { void* base; size_t size, used; SceUID uid; int ku; } JitSeg;
 static JitSeg    g_jitseg[JITPOOL_MAX_SEGS];
 static int       g_jitseg_n = 0;          /* segments actually opened */
 static unsigned  g_jitseg_cap_mb = 0;     /* target size per segment, 0 = not read yet */
 static unsigned  g_jitseg_max = 0;        /* target segment count */
 static int       g_jitseg_refused = 0;    /* a request failed: stop asking */
+static int       g_ku_tried = 0;          /* the kubridge segment was asked for (once) */
 
 /* ANTICIPATED growth (D2Vita 0.1.8) -- why this function grew a mode.
  *
@@ -244,6 +246,100 @@ static unsigned  g_jitthresh_pct = 0;     /* fill % that arms an eager grow */
 static unsigned  g_jiteager_mark = 0;     /* pool bytes used at the last eager try */
 static int       g_jiteager_full = 0;     /* eager side done: target reached */
 
+/* ===================== kubridge segment (optional) ==========================
+ * The VM-domain route caps translated code at ONE 16 MiB block: a second
+ * sceKernelAllocMemBlockForVM is refused (0x80024B0B) even at 1 MiB, at 13 s
+ * and at exhaustion alike, while ~24 MiB of user RAM stay free all session.
+ * kubridge.skprx (the kernel plugin the Android so_loader ports install)
+ * can make an ORDINARY user memblock read+write+execute (kuKernelMemProtect),
+ * and flushes caches for it (kuKernelFlushCaches). DSVita's JIT uses exactly
+ * this: kuKernelAllocMemBlock(USER_RW, fixed vbase 0x98000000) + MemProtect
+ * RWX + FlushCaches. Only tried when the VM ladder failed on DEMAND (the pool
+ * is full), so a console without kubridge behaves exactly as before; the
+ * plugin is detected first (_vshKernelSearchModuleByName) and the imports are
+ * weak, so the app also starts without it. Knobs: WX86_KUJIT=0 off,
+ * WX86_KUJIT_MB segment size (default 16, halves down to 4),
+ * WX86_KUJIT_FLOOR_KB user RAM left free (default 6144). */
+typedef struct {
+    SceSize size; SceUInt32 field_4, attr, field_C, paddr; SceSize alignment;
+    SceUInt32 extraLow, extraHigh, mirror_blockid; SceUID pid; void* paddr_list;
+    SceUInt32 field_2C, field_30, field_34, field_38, field_3C, field_40, field_44, field_48, field_4C, field_50, field_54;
+} KuAllocOpt;
+extern SceUID kuKernelAllocMemBlock(const char* name, SceKernelMemBlockType type, SceSize size, KuAllocOpt* opt);
+extern void   kuKernelFlushCaches(const void* ptr, SceSize len);
+extern int    kuKernelMemProtect(void* addr, SceSize len, SceUInt32 prot);
+extern SceUID _vshKernelSearchModuleByName(const char* name, const void* buf);
+#define KU_PROT_RWX (0x40u | 0x20u | 0x10u)
+static int g_ku_state = -1;   /* -1 unknown, 0 absent/off, 1 present */
+static int ku_present(void) {
+    if (g_ku_state >= 0) return g_ku_state;
+    const char* e = getenv("WX86_KUJIT");
+    if (e && *e == '0') { g_ku_state = 0; wx86_vita_progress_c("kubridge: JIT segment off (WX86_KUJIT=0)"); return 0; }
+    int buf[4] = {0};
+    const SceUID r = _vshKernelSearchModuleByName("kubridge", buf);
+    g_ku_state = r >= 0 ? 1 : 0;
+    { char m[160]; snprintf(m, sizeof m, g_ku_state ? "kubridge: plugin present (0x%08x), JIT can grow past the 16 MiB VM block"
+                                                     : "kubridge: plugin not found (0x%08x), JIT stays at the VM block", (unsigned)r);
+      wx86_vita_progress_c(m); }
+    return g_ku_state;
+}
+/* One RWX segment from kubridge. Returns its base (0 = none) and size. */
+static void* ku_segment(size_t* out_size, SceUID* out_uid) {
+    if (!ku_present()) return 0;
+    const char* e = getenv("WX86_KUJIT_MB");
+    unsigned mb = e ? (unsigned)atoi(e) : 16u; if (mb < 1u) mb = 1u; if (mb > 64u) mb = 64u;
+    const char* ef = getenv("WX86_KUJIT_FLOOR_KB");
+    const long floor_kb = ef ? atol(ef) : 6144L;
+    SceKernelFreeMemorySizeInfo fi; fi.size = sizeof fi;
+    long free_kb = sceKernelGetFreeMemorySize(&fi) >= 0 ? (long)(fi.size_user >> 10) : -1L;
+    char m[200];
+    for (; mb >= 4u; mb >>= 1) {
+        const size_t want = (size_t)mb << 20;
+        if (free_kb >= 0 && free_kb - (long)(want >> 10) < floor_kb) continue;
+        KuAllocOpt opt; memset(&opt, 0, sizeof opt);
+        opt.size = sizeof opt; opt.attr = 0x1u; opt.field_C = 0x98000000u;   /* HAS_VBASE, DSVita's code base */
+        SceUID u = kuKernelAllocMemBlock("dyn86_jitku", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, (SceSize)want, &opt);
+        if (u < 0) {   /* the fixed base may be taken: let the kernel place it */
+            memset(&opt, 0, sizeof opt); opt.size = sizeof opt;
+            u = kuKernelAllocMemBlock("dyn86_jitku", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, (SceSize)want, &opt);
+        }
+        void* pb = 0;
+        if (u < 0 || sceKernelGetMemBlockBase(u, &pb) < 0 || !pb) {
+            snprintf(m, sizeof m, "kubridge: %u MiB block refused (0x%08x)", mb, (unsigned)u); wx86_vita_progress_c(m);
+            if (u >= 0) sceKernelFreeMemBlock(u);
+            continue;
+        }
+        const int pr = kuKernelMemProtect(pb, (SceSize)want, KU_PROT_RWX);
+        if (pr < 0) {
+            snprintf(m, sizeof m, "kubridge: MemProtect RWX refused (0x%08x) on %u MiB at %p, not used", (unsigned)pr, mb, pb);
+            wx86_vita_progress_c(m);
+            sceKernelFreeMemBlock(u);
+            g_ku_state = 0;   /* the plugin can't do it: stop asking */
+            return 0;
+        }
+        /* Self-test before the JIT trusts it: write a `bx lr`, flush, run it. */
+        {
+            volatile uint32_t* w = (volatile uint32_t*)pb;
+            w[0] = 0xe3a00000u | 42u;   /* mov r0, #42 */
+            w[1] = 0xe12fff1eu;         /* bx lr */
+            kuKernelFlushCaches(pb, 8);
+            int (*fn)(void) = (int (*)(void))pb;
+            const int got = fn();
+            if (got != 42) {
+                snprintf(m, sizeof m, "kubridge: RWX self-test FAILED (%d), not used", got); wx86_vita_progress_c(m);
+                sceKernelFreeMemBlock(u); g_ku_state = 0; return 0;
+            }
+        }
+        snprintf(m, sizeof m, "kubridge: JIT segment %u MiB RWX at %p (user RAM free before %ld KiB)", mb, pb, free_kb);
+        wx86_vita_progress_c(m);
+        *out_size = want; *out_uid = u;
+        return pb;
+    }
+    snprintf(m, sizeof m, "kubridge: no segment (user RAM free %ld KiB, floor %ld KiB)", free_kb, floor_kb);
+    wx86_vita_progress_c(m);
+    return 0;
+}
+
 /* Tries to open ONE more segment. Returns 0 without touching the kernel if
  * the configured cap is already reached OR a previous attempt already
  * failed (no hammering the kernel on every new PROT_EXEC block request). */
@@ -298,6 +394,12 @@ static int jitpool_grow(int eager) {
         if (u >= 0) sceKernelFreeMemBlock(u);
         u = -1; pb = 0;
     }
+    int is_ku = 0;
+    if (!pb && !eager && !g_ku_tried) {
+        g_ku_tried = 1;
+        pb = ku_segment(&want, &u);
+        if (pb) is_ku = 1; else u = -1;
+    }
     if (!pb) {
         /* A KERNEL refusal all the way down to 1 MiB is a real wall -- but
          * WHOSE wall depends on who asked, and conflating the two would be a
@@ -332,6 +434,7 @@ static int jitpool_grow(int eager) {
     }
     g_jitseg[g_jitseg_n].base = pb; g_jitseg[g_jitseg_n].size = want; g_jitseg[g_jitseg_n].used = 0;
     g_jitseg[g_jitseg_n].uid = u;
+    g_jitseg[g_jitseg_n].ku = is_ku;
     ++g_jitseg_n;
     dyn86_jitpool_size += (unsigned int)want;
     /* Say what the pool IS, what it was asked to be, WHO asked, and what is
@@ -611,6 +714,7 @@ void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
                 dyn86_jit_cur += (unsigned int)size;
                 g_blk[slot].base = p;   g_blk[slot].size = size;
                 g_blk[slot].uid  = s->uid;   /* the SEGMENT's uid: required by the VM sync */
+                g_blk[slot].ku   = s->ku;    /* kubridge segment: flushed with kuKernelFlushCaches */
                 g_blk[slot].vm   = 1;
                 g_blk[slot].pool = 1;              /* do NOT return to the kernel on munmap */
                 /* Anticipated growth. Placed HERE and not earlier because it
@@ -743,6 +847,11 @@ void dyn86_vita_clear_cache(void* beg, void* end) {
     uintptr_t hi = ((uintptr_t)end + 0xFFF) & ~(uintptr_t)0xFFF;
     if (lo < base) lo = base;
     if (hi > top)  hi = top;
+    if (b->ku) {
+        if (hi > lo) kuKernelFlushCaches((void*)lo, (SceSize)(hi - lo));
+        dyn86_sync_us += sceKernelGetProcessTimeWide() - t0;
+        return;
+    }
     if (hi <= lo || sceKernelSyncVMDomain(b->uid, (void*)lo, (SceSize)(hi - lo)) < 0)
         sceKernelSyncVMDomain(b->uid, b->base, b->size);
     dyn86_sync_us += sceKernelGetProcessTimeWide() - t0;

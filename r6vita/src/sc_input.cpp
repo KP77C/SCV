@@ -29,6 +29,9 @@
 
 namespace sc {
 
+bool r6_fps_active();                    // r6_d3d.cpp
+void dinput_mouse_move(int dx, int dy);  // r6_shims.cpp
+
 namespace {
 constexpr uint32_t WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_CHAR = 0x0102, WM_MOUSEMOVE = 0x0200,
                    WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205;
@@ -148,6 +151,57 @@ void card_step(const Pad& p) {
     row = row < 0 ? 0 : row >= kCardRows ? kCardRows - 1 : row;
     g_cell = row * kCardCols + col;
 }
+
+// ---- In-mission FPS controls (K, 2026-11-22) -------------------------------------
+// The game's default keys (Options > Remap Keys): WASD move, Shift run, Alt crouch,
+// Q/E peek, Space use, Mouse1 fire, Mouse2 sniper mode, R reload, 5 next weapon,
+// Y map, N night vision.
+//   Left stick   move (W A S D)          Right stick  aim (mouse look)
+//   R            fire                    L            (free; no map key for now, K)
+//   Cross        use (Space)             Square       reload (R)
+//   Circle       crouch (Alt)            Triangle     next weapon (5)
+//   D-pad down   run on/off (Shift)      D-pad up     sniper zoom (Mouse2)
+//   D-pad left/right  peek left/right (Q/E, held)
+//   Start        Escape                  Select       night vision (N)
+bool g_fps = false, g_run = false, g_fire = false, g_aim = false;
+double g_look_fx = 0, g_look_fy = 0;
+void fps_btn(int b, bool down) {   // straight button messages: no double-click logic
+    if (b == 0) { if (g_fire == down) return; g_fire = down; g_lbtn = down; g_down[1] = down; post_input(down ? WM_LBUTTONDOWN : WM_LBUTTONUP, mk(), xy()); }
+    else { if (g_aim == down) return; g_aim = down; g_rbtn = down; g_down[2] = down; post_input(down ? WM_RBUTTONDOWN : WM_RBUTTONUP, mk(), xy()); }
+}
+void fps_release_all() {
+    for (int vk = 3; vk < 256; ++vk) if (g_down[vk]) key((uint32_t)vk, false);
+    if (g_lbtn) { g_lbtn = false; g_down[1] = 0; mouse(WM_LBUTTONUP); }
+    if (g_rbtn) { g_rbtn = false; g_down[2] = 0; mouse(WM_RBUTTONUP); }
+    g_fire = g_aim = false; g_run = false; g_touch_btn = false; g_grid = false;
+}
+void fps_tick(const Pad& p, uint32_t pressed, uint32_t released, double dt) {
+    const uint32_t b = p.buttons;
+    // Move: WASD from the left stick.
+    const double lx = axis(p.lx), ly = axis(p.ly);
+    key('A', lx < -0.35); key('D', lx > 0.35); key('W', ly < -0.35); key('S', ly > 0.35);
+    // Aim: right stick as mouse motion (squared response, sub-count carry).
+    const double rx = axis(p.rx), ry = axis(p.ry);
+    static const double sens = std::getenv("R6_LOOK") ? std::atof(std::getenv("R6_LOOK")) : 900.0;   // counts/s at full tilt
+    g_look_fx += rx * std::fabs(rx) * sens * dt; g_look_fy += ry * std::fabs(ry) * sens * dt;
+    const int dx = (int)g_look_fx, dy = (int)g_look_fy;
+    if (dx || dy) { dinput_mouse_move(dx, dy); g_look_fx -= dx; g_look_fy -= dy; }
+    // Fire and zoom.
+    fps_btn(0, b & PAD_R);
+    fps_btn(1, b & PAD_UP);
+    // Held keys.
+    key(VK_SPACE, b & PAD_CROSS);
+    key('R', b & PAD_SQUARE);
+    key(0x12 /*VK_MENU: Alt*/, b & PAD_CIRCLE);
+    key('5', b & PAD_TRIANGLE);
+    key('Q', b & PAD_LEFT); key('E', b & PAD_RIGHT);
+    key('N', b & PAD_SELECT);
+    key(VK_ESCAPE, b & PAD_START);
+    // Run toggles.
+    if (pressed & PAD_DOWN) g_run = !g_run;
+    key(0x10 /*VK_SHIFT*/, g_run);
+    (void)released;
+}
 }  // namespace
 
 uint32_t key_state(uint32_t vk) { return g_down[vk & 0xFF] ? 0x8000u : 0u; }
@@ -172,6 +226,11 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     const bool L = b & PAD_L;
     const double dt = dt_us / 1e6;
     g_clock_us += dt_us;
+
+    // In a mission: FPS controls; back in the menus: the cursor scheme below.
+    const bool fps = r6_fps_active();
+    if (fps != g_fps) { fps_release_all(); g_fps = fps; g_look_fx = g_look_fy = 0; }
+    if (fps) { fps_tick(p, pressed, released, dt); g_prev = b; return; }
 
     // Command grid: hold D-pad up, pick with the right stick, press R to
     // click the cell (K, 2026-11-20). The grid stays up while D-pad up is

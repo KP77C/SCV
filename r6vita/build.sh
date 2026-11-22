@@ -20,13 +20,20 @@ if [ "${TARGET:-}" = vita ]; then
     # vitaGL draws the game's OpenGL (tools/build_vitagl.sh builds it into build-vita/vgl).
     VGL="$OUT/vgl/prefix"
     [ -f "$VGL/lib/libvitaGL.a" ] || "$ROOT/tools/build_vitagl.sh"
+    # kubridge (kernel plugin, required for the big JIT cache, K 2026-11-22): weak import
+    # stubs generated from tools/winvita/third_party/kubridge/kubridge.yml.
+    KUB="$OUT/kubridge"
+    if [ ! -f "$KUB/libkubridge_stub_weak.a" ]; then
+        rm -rf "$KUB" && mkdir -p "$KUB"
+        ( cd "$KUB" && vita-libs-gen-2 -yml="$WX/third_party/kubridge/kubridge.yml" -output=. && make >/dev/null )
+    fi
     arm-vita-eabi-g++ -O2 -g -std=gnu++17 -marm -march=armv7-a+simd -mfpu=neon -mfloat-abi=hard -D__vita__ ${WXTAG:+-DPROF_COUNTERS} \
       -I"$WX/src" -I"$WX/src/dynarec86/shim/vita" -I"$VGL/include" -Wall -Wno-unused-parameter $SRCS \
       -Wl,--whole-archive "$WXLIB" -Wl,--no-whole-archive \
       -L"$VGL/lib" -lvitaGL -lvitashark -lmathneon \
       -lSceShaccCg_stub_weak -lSceGxm_stub -lSceDisplay_stub -lSceCtrl_stub -lSceTouch_stub -lSceCommonDialog_stub -lSceAppUtil_stub \
       -lSceAppMgr_stub -lSceAudio_stub -lScePower_stub -lSceSysmodule_stub -lSceKernelDmacMgr_stub -lSceIme_stub \
-      -lSceNet_stub -lSceNetCtl_stub -lSceRtc_stub -lpthread -lm -Wl,-q -Wl,--defsym,__sce_headroom=0x4000 \
+      -lSceNet_stub -lSceNetCtl_stub -lSceRtc_stub -L"$KUB" -lkubridge_stub_weak -lSceVshBridge_stub -lpthread -lm -Wl,-q -Wl,--defsym,__sce_headroom=0x4000 \
       -o "$OUT/r6vita.elf"
     # __sce_headroom leaves room after the code for the SCE module tables that
     # vita-elf-create appends (it fails when the code ends just below 64 KiB).

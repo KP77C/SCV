@@ -1,0 +1,13 @@
+version: 2
+firmware: 3.60
+modules:
+  kubridge:
+    nid: 0x00000000
+    libraries:
+      kubridge:
+        kernel: false
+        nid: 0x6DB9389B
+        functions:
+          kuKernelAllocMemBlock: 0x2EF7C290
+          kuKernelFlushCaches: 0x38B70744
+          kuKernelMemProtect: 0x566D2AF1
