@@ -103,6 +103,8 @@ void install_net(d2rt::Bridge& br);      // offline Winsock (w3_net.cpp)
 void install_gl(d2rt::Bridge& br);       // OPENGL32 + pixel formats (w3_gl.cpp)
 bool gl_ensure_context();                // create the GL context once (w3_gl.cpp)
 void gl_swap(d2rt::Cpu& c);              // show the finished GL frame (w3_gl.cpp)
+void gl_swap_gpu();                        // GL half of gl_swap (GL thread)
+void gl_swap_host(d2rt::Cpu& c);         // game-thread half of gl_swap
 void install_d3d(d2rt::Bridge& br);      // DirectDraw 1/2/4 + Direct3D 3 over GL (r6_d3d.cpp)
 void install_r6(d2rt::Bridge& br);       // DirectInput, CD audio, misc (r6_shims.cpp)
 extern std::map<std::string, uint64_t> g_call_counts;   // R6_COUNT=1 (boot.cpp)

@@ -20,6 +20,8 @@
 // scaled to the GL frame (Vita 960x544: 725x544, pillarboxed).
 #include "sc_host.h"
 #include "r6_jobs.h"
+#include "r6_glthread.h"
+#include <memory>
 
 #include "runtime/guest_scratch.h"
 #include "runtime/host_clock.h"
@@ -244,7 +246,7 @@ Surf* new_surf(Cpu& c, uint32_t w, uint32_t h, const Fmt& f, uint32_t caps) {
 void release_surf(Surf* s) {
     if (!s || s->dead) return;
     s->dead = true;
-    if (s->tex) { glDeleteTextures(1, &s->tex); s->tex = 0; }
+    if (s->tex) { const uint32_t id = s->tex; gl_async([id] { gl_tex_delete(id); }); s->tex = 0; }
     surf_free(s->pixels); s->pixels = 0;
     if (s == g_rt) g_rt = nullptr;
     if (s == g_primary) g_primary = nullptr;
@@ -274,35 +276,43 @@ void layout() {
     g_sx = ((int)g_fbw - g_sw) / 2; g_sy = ((int)g_fbh - g_sh) / 2;
     g_ox = 0; g_oy = 0; g_ow = (int)rw; g_oh = (int)rh;
 }
+// GL thread: the offscreen frame (re)created at w x h, and which framebuffer is bound.
+GLuint g_bound_fb = 0xFFFFFFFFu;
+void gl_make_fbo(uint32_t rw, uint32_t rh) {
+    if (g_fbo) { glDeleteFramebuffers(1, &g_fbo); glDeleteTextures(1, &g_fbo_tex); glDeleteRenderbuffers(1, &g_fbo_depth); }
+    glGenTextures(1, &g_fbo_tex); glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rw, rh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenRenderbuffers(1, &g_fbo_depth); glBindRenderbuffer(GL_RENDERBUFFER, g_fbo_depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, rw, rh);
+    glGenFramebuffers(1, &g_fbo); glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_fbo_tex, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_fbo_depth);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g_fbo_depth);
+    g_bound_fb = g_fbo;
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0, 0, 0, 1); glClearDepth(1.0); glDepthMask(GL_TRUE);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+}
+void gl_bind_off() { if (g_bound_fb != g_fbo) { glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); g_bound_fb = g_fbo; } }
+// Caller side: queue a new offscreen frame when the render target's size changed.
 void bind_fbo() {
     const uint32_t rw = g_rt ? g_rt->w : g_mode_w, rh = g_rt ? g_rt->h : g_mode_h;
-    if (!g_fbo || g_fbo_w != rw || g_fbo_h != rh) {
-        if (g_fbo) { glDeleteFramebuffers(1, &g_fbo); glDeleteTextures(1, &g_fbo_tex); glDeleteRenderbuffers(1, &g_fbo_depth); }
-        glGenTextures(1, &g_fbo_tex); glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rw, rh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glGenRenderbuffers(1, &g_fbo_depth); glBindRenderbuffer(GL_RENDERBUFFER, g_fbo_depth);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, rw, rh);
-        glGenFramebuffers(1, &g_fbo); glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_fbo_tex, 0);
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_fbo_depth);
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g_fbo_depth);
+    if (g_fbo_w != rw || g_fbo_h != rh) {
         g_fbo_w = rw; g_fbo_h = rh;
-        glDisable(GL_SCISSOR_TEST);
-        glClearColor(0, 0, 0, 1); glClearDepth(1.0); glDepthMask(GL_TRUE);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        log("[not-bound] d3d: offscreen frame %ux%u (fbo %u)", rw, rh, g_fbo);
+        gl_async([rw, rh] { gl_make_fbo(rw, rh); });
+        log("[not-bound] d3d: offscreen frame %ux%u", rw, rh);
         layout();
-        return;
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
 }
 bool ensure_gl() {
     if (!g_gl_ok) {
-        if (!gl_ensure_context()) return false;
+        bool ok = false;
+        gl_sync([&ok] { ok = gl_ensure_context(); });
+        if (!ok) return false;
         g_gl_ok = true; layout();
         log("[not-bound] d3d: GL window %ux%u, game picture %dx%d at %d,%d", g_fbw, g_fbh, g_sw, g_sh, g_sx, g_sy);
     }
@@ -350,32 +360,44 @@ Surf* stage_surf(int st) { uint32_t id = g_stage_tex[st]; return id && id < g_su
 
 // Upload a texture (its whole mip chain) if guest memory changed.
 void upload_tex(Cpu& c, Surf* t) {
-    if (!t->tex) { glGenTextures(1, &t->tex); t->tex_dirty = true; t->tex_params = 0xFFFFFFFFu; }
-    glBindTexture(GL_TEXTURE_2D, t->tex);
+    if (!t->tex) { t->tex = gl_tex_new(); t->tex_dirty = true; }
     if (!t->tex_dirty) return;
-    static std::vector<uint8_t> buf;
+    struct Lv { uint32_t w, h; std::vector<uint8_t> px; };
+    auto lvs = std::make_shared<std::vector<Lv>>();
     int lv = 0;
     for (Surf* m = t; m && lv < 12; m = m->mip, ++lv) {
         if (!m->pixels) break;
-        to_rgba(c, *m, buf);
-        glTexImage2D(GL_TEXTURE_2D, lv, GL_RGBA, m->w, m->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+        lvs->push_back({ m->w, m->h, {} });
+        to_rgba(c, *m, lvs->back().px);
     }
     t->mips = lv;
+    const uint32_t id = t->tex;
+    gl_async([id, lvs] {
+        glBindTexture(GL_TEXTURE_2D, gl_tex_real(id));
+        for (size_t i = 0; i < lvs->size(); ++i)
+            glTexImage2D(GL_TEXTURE_2D, (GLint)i, GL_RGBA, (*lvs)[i].w, (*lvs)[i].h, 0, GL_RGBA, GL_UNSIGNED_BYTE, (*lvs)[i].px.data());
 #ifndef __vita__
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, lv - 1);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, (GLint)lvs->size() - 1);
 #endif
-    t->tex_dirty = false; t->tex_params = 0xFFFFFFFFu;
+        gl_tex_params(id) = 0xFFFFFFFFu;
+    });
+    t->tex_dirty = false;
     ++g_tex_uploads;
 }
 
 GLenum gl_wrap(uint32_t a) { return a == 3 ? GL_CLAMP_TO_EDGE : a == 2 ? GL_MIRRORED_REPEAT : a == 4 ? GL_CLAMP_TO_EDGE : GL_REPEAT; }
 
-void set_tex_params(Surf* t, int st) {
+// Sampler key of a stage: mag | min << 4 | mip << 8 | addrU << 12 | addrV << 16.
+uint32_t tex_key(const Surf* t, int st) {
     const uint32_t mag = g_tss[st][16], min = g_tss[st][17], mip = t->mips > 1 ? g_tss[st][18] : 1;
-    const uint32_t au = g_tss[st][13], av = g_tss[st][14];
-    const uint32_t key = mag | min << 4 | mip << 8 | au << 12 | av << 16;
-    if (key == t->tex_params) return;
-    t->tex_params = key;
+    return mag | min << 4 | mip << 8 | g_tss[st][13] << 12 | g_tss[st][14] << 16;
+}
+// GL thread, texture bound.
+void gl_tex_params_set(uint32_t id, uint32_t key) {
+    uint32_t& cur = gl_tex_params(id);
+    if (key == cur) return;
+    cur = key;
+    const uint32_t mag = key & 15, min = (key >> 4) & 15, mip = (key >> 8) & 15, au = (key >> 12) & 15, av = (key >> 16) & 15;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag == 1 ? GL_NEAREST : GL_LINEAR);
     GLenum mf;
     const bool lin = min != 1;
@@ -448,27 +470,21 @@ GLenum gl_blend(uint32_t b, bool src) {
 GLenum gl_cmp(uint32_t f) { return f >= 1 && f <= 8 ? (GLenum)(GL_NEVER + (f - 1)) : GL_ALWAYS; }
 
 // Fixed-function state for the next draw, from the render and stage states.
-void apply_state(Cpu& c) {
-    // Depth.
-    if (g_rs[7]) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    glDepthFunc(gl_cmp(g_rs[23]));
-    glDepthMask(g_rs[14] ? GL_TRUE : GL_FALSE);
-    if (g_rs[47]) { glEnable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(-1.0f, -(float)g_rs[47]); }
-    else glDisable(GL_POLYGON_OFFSET_FILL);
-    // Blending.
-    if (g_rs[27]) { glEnable(GL_BLEND); glBlendFunc(gl_blend(g_rs[19], true), gl_blend(g_rs[20], false)); }
-    else glDisable(GL_BLEND);
-    // Culling. D3DCULL_CCW (3) keeps the faces that are clockwise on screen; checked
-    // against the game (the tutorial range draws whole with CULL_CCW -> GL_FRONT here).
-    if (g_rs[22] == 1) glDisable(GL_CULL_FACE);
-    else { glEnable(GL_CULL_FACE); glFrontFace(GL_CCW); glCullFace(g_rs[22] == 3 ? GL_FRONT : GL_BACK); }
-    glShadeModel(g_rs[9] == 1 ? GL_FLAT : GL_SMOOTH);
-    // Textures, stages 0 and 1.
-    Surf* t0 = stage_surf(0);
-    bool ck_test = false;
+// Fixed-function state for the next draw, from the render and stage states:
+// worked out on the game thread (prep_state, which also uploads textures),
+// applied on the GL thread (gl_apply).
+struct StageCmd { bool on = false; uint32_t tex = 0, key = 0, cop = 0, c1 = 0, c2 = 0, aop = 0, a1 = 0, a2 = 0; bool envc = false; uint32_t envcol = 0; };
+struct StateCmd {
+    uint32_t zen, zfn, zw, zbias, ab, bsrc, bdst, cull, shade, atest, afn, aref;
+    bool ck = false; unsigned dbg = 0; StageCmd st[2];
+};
+StateCmd prep_state(Cpu& c) {
+    StateCmd k;
+    k.zen = g_rs[7]; k.zfn = g_rs[23]; k.zw = g_rs[14]; k.zbias = g_rs[47];
+    k.ab = g_rs[27]; k.bsrc = g_rs[19]; k.bdst = g_rs[20]; k.cull = g_rs[22]; k.shade = g_rs[9];
+    k.atest = g_rs[15]; k.afn = g_rs[25]; k.aref = g_rs[24];
     int active = 0;
     for (int st = 0; st < 2; ++st) {
-        glActiveTexture(GL_TEXTURE0 + st);
         Surf* t = stage_surf(st);
         uint32_t cop = g_tss[st][1], aop = g_tss[st][4];
         if (st == 0 && g_legacy_blend) {
@@ -483,35 +499,64 @@ void apply_state(Cpu& c) {
             }
             g_tss[0][2] = 2; g_tss[0][3] = 0; g_tss[0][5] = 2; g_tss[0][6] = 0;
         }
-        const bool on = active == st && cop != 1 && t;
-        if (!on) { glDisable(GL_TEXTURE_2D); continue; }
+        StageCmd& sc = k.st[st];
+        sc.on = active == st && cop != 1 && t;
+        if (!sc.on) continue;
         upload_tex(c, t);
-        set_tex_params(t, st);
+        sc.tex = t->tex; sc.key = tex_key(t, st);
+        sc.cop = cop; sc.c1 = g_tss[st][2]; sc.c2 = g_tss[st][3];
+        sc.aop = aop == 1 ? 3 : aop; sc.a1 = g_tss[st][5]; sc.a2 = g_tss[st][6];
+        sc.envc = g_rs[60] != 0xFFFFFFFFu || st == 0; sc.envcol = g_rs[60];
+        if (st == 0 && t->ck && g_rs[41]) k.ck = true;
+        ++active;
+    }
+    static const unsigned dbg = std::getenv("R6_DBG") ? (unsigned)std::strtoul(std::getenv("R6_DBG"), nullptr, 0) : 0;
+    k.dbg = dbg;
+    return k;
+}
+void gl_apply(const StateCmd& k) {
+    // Depth.
+    if (k.zen) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    glDepthFunc(gl_cmp(k.zfn));
+    glDepthMask(k.zw ? GL_TRUE : GL_FALSE);
+    if (k.zbias) { glEnable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(-1.0f, -(float)k.zbias); }
+    else glDisable(GL_POLYGON_OFFSET_FILL);
+    // Blending.
+    if (k.ab) { glEnable(GL_BLEND); glBlendFunc(gl_blend(k.bsrc, true), gl_blend(k.bdst, false)); }
+    else glDisable(GL_BLEND);
+    // Culling. D3DCULL_CCW (3) keeps the faces that are clockwise on screen; checked
+    // against the game (the tutorial range draws whole with CULL_CCW -> GL_FRONT here).
+    if (k.cull == 1) glDisable(GL_CULL_FACE);
+    else { glEnable(GL_CULL_FACE); glFrontFace(GL_CCW); glCullFace(k.cull == 3 ? GL_FRONT : GL_BACK); }
+    glShadeModel(k.shade == 1 ? GL_FLAT : GL_SMOOTH);
+    // Textures, stages 0 and 1.
+    for (int st = 0; st < 2; ++st) {
+        glActiveTexture(GL_TEXTURE0 + st);
+        const StageCmd& sc = k.st[st];
+        if (!sc.on) { glDisable(GL_TEXTURE_2D); continue; }
+        glBindTexture(GL_TEXTURE_2D, gl_tex_real(sc.tex));
+        gl_tex_params_set(sc.tex, sc.key);
         glEnable(GL_TEXTURE_2D);
         glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
-        combine(st, false, cop, g_tss[st][2], g_tss[st][3]);
-        combine(st, true, aop == 1 ? 3 : aop, g_tss[st][5], g_tss[st][6]);
-        if (g_rs[60] != 0xFFFFFFFFu || st == 0) {
-            const uint32_t f = g_rs[60];
+        combine(st, false, sc.cop, sc.c1, sc.c2);
+        combine(st, true, sc.aop, sc.a1, sc.a2);
+        if (sc.envc) {
+            const uint32_t f = sc.envcol;
             GLfloat col[4] = { ((f >> 16) & 255) / 255.f, ((f >> 8) & 255) / 255.f, (f & 255) / 255.f, (f >> 24) / 255.f };
             glTexEnvfv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, col);
         }
-        if (st == 0 && t->ck && g_rs[41]) ck_test = true;
-        ++active;
     }
-    (void)t0;
     glActiveTexture(GL_TEXTURE0);
     // Alpha test (and the colour key: keyed texels have alpha 0).
-    if (g_rs[15]) { glEnable(GL_ALPHA_TEST); glAlphaFunc(gl_cmp(g_rs[25]), (g_rs[24] & 255) / 255.f); }
-    else if (ck_test) { glEnable(GL_ALPHA_TEST); glAlphaFunc(GL_GREATER, 0.5f); }
+    if (k.atest) { glEnable(GL_ALPHA_TEST); glAlphaFunc(gl_cmp(k.afn), (k.aref & 255) / 255.f); }
+    else if (k.ck) { glEnable(GL_ALPHA_TEST); glAlphaFunc(GL_GREATER, 0.5f); }
     else glDisable(GL_ALPHA_TEST);
     glDisable(GL_LIGHTING);
     glDisable(GL_FOG);
     // R6_DBG bits, to find what hides geometry: 1 no depth test, 2 no culling, 4 no texture.
-    static const unsigned dbg = std::getenv("R6_DBG") ? (unsigned)std::strtoul(std::getenv("R6_DBG"), nullptr, 0) : 0;
-    if (dbg & 1) glDisable(GL_DEPTH_TEST);
-    if (dbg & 2) glDisable(GL_CULL_FACE);
-    if (dbg & 4) { glActiveTexture(GL_TEXTURE1); glDisable(GL_TEXTURE_2D); glActiveTexture(GL_TEXTURE0); glDisable(GL_TEXTURE_2D); }
+    if (k.dbg & 1) glDisable(GL_DEPTH_TEST);
+    if (k.dbg & 2) glDisable(GL_CULL_FACE);
+    if (k.dbg & 4) { glActiveTexture(GL_TEXTURE1); glDisable(GL_TEXTURE_2D); glActiveTexture(GL_TEXTURE0); glDisable(GL_TEXTURE_2D); }
 }
 
 // ---- render-target sync ------------------------------------------------------------
@@ -534,7 +579,8 @@ void rt_to_mem(Cpu& c, const char* why = "?") {
     rt_dirty_all();
     static std::vector<uint8_t> px;
     px.resize((size_t)g_ow * g_oh * 4);
-    glReadPixels(g_ox, g_oy, g_ow, g_oh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    { const int ox = g_ox, oy = g_oy, ow = g_ow, oh = g_oh; uint8_t* out = px.data();
+      gl_sync([=] { gl_bind_off(); glReadPixels(ox, oy, ow, oh, GL_RGBA, GL_UNSIGNED_BYTE, out); }); }
     Surf& s = *g_rt;
     uint8_t* dst = (uint8_t*)c.hostptr(s.pixels, s.pitch * s.h);
     if (!dst) return;
@@ -564,7 +610,8 @@ void rt_rect_to(Cpu& c, Surf& dst, const int dr[4], const int sr[4], bool key) {
     const int fy0 = (int)((int64_t)(s.h - y1) * g_oh / s.h), fy1 = std::max(fy0 + 1, (int)(((int64_t)(s.h - y0) * g_oh + s.h - 1) / s.h));
     const int fw = fx1 - fx0, fh = fy1 - fy0;
     static std::vector<uint8_t> px; px.resize((size_t)fw * fh * 4);
-    glReadPixels(g_ox + fx0, g_oy + fy0, fw, fh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    { const int rx = g_ox + fx0, ry = g_oy + fy0; uint8_t* out = px.data();
+      gl_sync([=] { gl_bind_off(); glReadPixels(rx, ry, fw, fh, GL_RGBA, GL_UNSIGNED_BYTE, out); }); }
     uint8_t* dp = (uint8_t*)c.hostptr(dst.pixels, dst.pitch * dst.h);
     if (!dp) return;
     const uint32_t db = (dst.fmt.bpp + 7) / 8;
@@ -592,31 +639,37 @@ void rt_rect_to(Cpu& c, Surf& dst, const int dr[4], const int sr[4], bool key) {
 void draw_surface_quad(Cpu& c, Surf* src, const int sr[4], const int dr[4], bool keyed) {
     ensure_gl();
     upload_tex(c, src);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    src->tex_params = 0xFFFFFFFFu;
-    glActiveTexture(GL_TEXTURE1); glDisable(GL_TEXTURE_2D);
-    glActiveTexture(GL_TEXTURE0); glEnable(GL_TEXTURE_2D);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-    glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); glDisable(GL_BLEND); glDisable(GL_CULL_FACE);
-    glDisable(GL_LIGHTING); glDisable(GL_FOG); glDisable(GL_POLYGON_OFFSET_FILL);
-    if (keyed) { glEnable(GL_ALPHA_TEST); glAlphaFunc(GL_GREATER, 0.5f); } else glDisable(GL_ALPHA_TEST);
-    glViewport(g_ox, g_oy, g_ow, g_oh);
     const float rw = (float)(g_rt ? g_rt->w : g_mode_w), rh = (float)(g_rt ? g_rt->h : g_mode_h);
-    glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
     const float x0 = 2.f * dr[0] / rw - 1, x1 = 2.f * dr[2] / rw - 1, y0 = 1 - 2.f * dr[1] / rh, y1 = 1 - 2.f * dr[3] / rh;
     const float u0 = (float)sr[0] / src->w, u1 = (float)sr[2] / src->w, v0 = (float)sr[1] / src->h, v1 = (float)sr[3] / src->h;
-    const GLfloat pos[] = { x0, y0, x1, y0, x0, y1, x1, y1 };
-    const GLfloat uv[] = { u0, v0, u1, v0, u0, v1, u1, v1 };
-    glEnableClientState(GL_VERTEX_ARRAY); glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-    glDisableClientState(GL_COLOR_ARRAY);
-    glColor4f(1, 1, 1, 1);
-    glVertexPointer(2, GL_FLOAT, 0, pos); glTexCoordPointer(2, GL_FLOAT, 0, uv);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    const uint32_t id = src->tex;
+    const int ox = g_ox, oy = g_oy, ow = g_ow, oh = g_oh;
+    gl_async([=] {
+        gl_bind_off();
+        glActiveTexture(GL_TEXTURE1); glDisable(GL_TEXTURE_2D);
+        glActiveTexture(GL_TEXTURE0); glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, gl_tex_real(id));
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl_tex_params(id) = 0xFFFFFFFFu;
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+        glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); glDisable(GL_BLEND); glDisable(GL_CULL_FACE);
+        glDisable(GL_LIGHTING); glDisable(GL_FOG); glDisable(GL_POLYGON_OFFSET_FILL);
+        if (keyed) { glEnable(GL_ALPHA_TEST); glAlphaFunc(GL_GREATER, 0.5f); } else glDisable(GL_ALPHA_TEST);
+        glViewport(ox, oy, ow, oh);
+        glMatrixMode(GL_PROJECTION); glLoadIdentity();
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+        const GLfloat pos[] = { x0, y0, x1, y0, x0, y1, x1, y1 };
+        const GLfloat uv[] = { u0, v0, u1, v0, u0, v1, u1, v1 };
+        glEnableClientState(GL_VERTEX_ARRAY); glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+        glDisableClientState(GL_COLOR_ARRAY);
+        glColor4f(1, 1, 1, 1);
+        glVertexPointer(2, GL_FLOAT, 0, pos); glTexCoordPointer(2, GL_FLOAT, 0, uv);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    });
 }
 
 // 2D mode: when a frame drew no 3D, the next frame's blits to the render target go to
@@ -673,10 +726,13 @@ void mem_to_gl(Cpu& c) {
         const uint32_t bytes = (g_rt->fmt.bpp + 7) / 8;
         v.pixels += (uint32_t)d[1] * g_rt->pitch + (uint32_t)d[0] * bytes;
         v.w = (uint32_t)(d[2] - d[0]); v.h = (uint32_t)(d[3] - d[1]); v.mip = nullptr;
-        static std::vector<uint8_t> buf;
-        to_rgba(c, v, buf);
-        glBindTexture(GL_TEXTURE_2D, g_rt->tex);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, d[0], d[1], (GLsizei)v.w, (GLsizei)v.h, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+        auto buf = std::make_shared<std::vector<uint8_t>>();
+        to_rgba(c, v, *buf);
+        const uint32_t id = g_rt->tex; const int x = d[0], y = d[1]; const GLsizei w = (GLsizei)v.w, h = (GLsizei)v.h;
+        gl_async([=] {
+            glBindTexture(GL_TEXTURE_2D, gl_tex_real(id));
+            glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf->data());
+        });
     } else mark_dirty(g_rt);
     const int r[4] = { 0, 0, (int)g_rt->w, (int)g_rt->h };
     draw_surface_quad(c, g_rt, r, r, false);
@@ -703,28 +759,24 @@ void present_frame(Cpu& c) {
             (unsigned long long)g_blt_gl, (unsigned long long)g_blt_mem, (unsigned long long)g_part_rb, rb_report().c_str());
         t0 = now; last_flips = g_flips; last_draws = g_draw_calls; last_tris = g_tris; last_rb = g_readbacks; last_up = g_uploads; last_tex = g_tex_uploads;
     }
-    {
-        static const long at = std::getenv("R6_DUMP_AT") ? std::atol(std::getenv("R6_DUMP_AT")) : -1;
-        if (at > 0 && g_flips >= 1000 && (long)((g_flips - 1) % at) == 0) {
-            uint8_t px[4] = {}; glReadPixels(320, 300, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-            log("[dump] present: px(320,300 gl) %02x%02x%02x", px[0], px[1], px[2]);
-        }
-    }
-    // The offscreen frame, scaled into the window.
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glDisable(GL_SCISSOR_TEST);
-    glViewport(0, 0, g_fbw, g_fbh);
-    glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glViewport(g_sx, g_sy, g_sw, g_sh);
-    glActiveTexture(GL_TEXTURE1); glDisable(GL_TEXTURE_2D);
-    glActiveTexture(GL_TEXTURE0); glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-    glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glDisable(GL_ALPHA_TEST);
-    glDisable(GL_LIGHTING); glDisable(GL_FOG); glDisable(GL_POLYGON_OFFSET_FILL);
-    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-    {
+    // The offscreen frame, scaled into the window, then the swap: on the GL
+    // thread. One frame may be in flight while the game builds the next.
+    gl_frame_begin(1);
+    const uint32_t fbw = g_fbw, fbh = g_fbh; const int sx = g_sx, sy = g_sy, sw = g_sw, sh = g_sh;
+    gl_async([=] {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0); g_bound_fb = 0;
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(0, 0, fbw, fbh);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glViewport(sx, sy, sw, sh);
+        glActiveTexture(GL_TEXTURE1); glDisable(GL_TEXTURE_2D);
+        glActiveTexture(GL_TEXTURE0); glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+        glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glDisable(GL_ALPHA_TEST);
+        glDisable(GL_LIGHTING); glDisable(GL_FOG); glDisable(GL_POLYGON_OFFSET_FILL);
+        glMatrixMode(GL_PROJECTION); glLoadIdentity(); glMatrixMode(GL_MODELVIEW); glLoadIdentity();
         const GLfloat pos[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
         const GLfloat uv[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
         glEnableClientState(GL_VERTEX_ARRAY); glEnableClientState(GL_TEXTURE_COORD_ARRAY); glDisableClientState(GL_COLOR_ARRAY);
@@ -732,9 +784,10 @@ void present_frame(Cpu& c) {
         glVertexPointer(2, GL_FLOAT, 0, pos); glTexCoordPointer(2, GL_FLOAT, 0, uv);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-    }
-    gl_swap(c);
-    bind_fbo();   // the game keeps drawing over its last picture, as after a DirectDraw flip
+        gl_swap_gpu();
+        gl_frame_done();
+    });
+    gl_swap_host(c);   // input, sound pump, frame stats (host: waits, then saves the frame)
 }
 
 // ---- drawing -------------------------------------------------------------------------
@@ -792,8 +845,13 @@ void draw(Cpu& c, uint32_t prim, const VDecl& d, uint32_t nverts, const uint16_t
     if (!ensure_gl()) return;
     if (g_fvf_seen[d.fvf]++ == 0) log("[not-bound] d3d: first draw with vertex format 0x%x (prim %u, %u verts)", d.fvf, prim, nverts);
     mem_to_gl(c);
-    apply_state(c);
-    static std::vector<float> pos, tc0, tc1; static std::vector<uint8_t> col;
+    struct Job {
+        StateCmd st; std::vector<float> pos, tc0, tc1; std::vector<uint8_t> col; std::vector<uint16_t> idx;
+        GLenum mode; uint32_t nverts; bool rhw; int vp[4]; float m0[16], m1[16], m2[16], m3[16];
+    };
+    auto j = std::make_shared<Job>();
+    j->st = prep_state(c);
+    std::vector<float>& pos = j->pos; std::vector<float>& tc0 = j->tc0; std::vector<float>& tc1 = j->tc1; std::vector<uint8_t>& col = j->col;
     pos.resize(nverts * 4); col.resize(nverts * 4); tc0.resize(nverts * 2); tc1.resize(nverts * 2);
     for (uint32_t i = 0; i < nverts; ++i) {
         const float* p = (const float*)(d.pos.p + i * d.pos.stride);
@@ -827,69 +885,71 @@ void draw(Cpu& c, uint32_t prim, const VDecl& d, uint32_t nverts, const uint16_t
         }
     }
     const float rw = (float)g_rt->w, rh = (float)g_rt->h;
+    j->rhw = d.rhw; j->nverts = nverts;
     if (d.rhw) {
         // Screen pixels (D3D pixel centres on integers) -> clip space; the
         // vertex carries w = 1/rhw so textures are perspective-correct.
-        glViewport(g_ox, g_oy, g_ow, g_oh);
+        j->vp[0] = g_ox; j->vp[1] = g_oy; j->vp[2] = g_ow; j->vp[3] = g_oh;
         const float m[16] = { 2.f / rw, 0, 0, 0,   0, -2.f / rh, 0, 0,   0, 0, 2, 0,
                               -1.f + 1.f / rw, 1.f - 1.f / rh, -1, 1 };
-        glMatrixMode(GL_PROJECTION); glLoadIdentity();
-        glMatrixMode(GL_MODELVIEW); glLoadMatrixf(m);
+        std::memcpy(j->m0, m, sizeof m);
     } else {
         const Viewport& vp = g_vps[g_cur_vp < g_vps.size() ? g_cur_vp : 0];
-        int gx, gy, gw, gh; rt_rect_to_gl((int)vp.x, (int)vp.y, (int)vp.w, (int)vp.h, &gx, &gy, &gw, &gh);
-        glViewport(gx, gy, gw, gh);
+        rt_rect_to_gl((int)vp.x, (int)vp.y, (int)vp.w, (int)vp.h, &j->vp[0], &j->vp[1], &j->vp[2], &j->vp[3]);
         // D3D clip z is 0..w, GL's -w..w.
         const float zfix[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 2, 0,  0, 0, -1, 1 };
-        glMatrixMode(GL_PROJECTION); glLoadMatrixf(zfix); glMultMatrixf(g_proj);
-        glMatrixMode(GL_MODELVIEW); glLoadMatrixf(g_view); glMultMatrixf(g_world);
+        std::memcpy(j->m0, zfix, 64); std::memcpy(j->m1, g_proj, 64); std::memcpy(j->m2, g_view, 64); std::memcpy(j->m3, g_world, 64);
     }
-    glEnableClientState(GL_VERTEX_ARRAY); glVertexPointer(4, GL_FLOAT, 0, pos.data());
-    glEnableClientState(GL_COLOR_ARRAY); glColorPointer(4, GL_UNSIGNED_BYTE, 0, col.data());
-    glClientActiveTexture(GL_TEXTURE1); glEnableClientState(GL_TEXTURE_COORD_ARRAY); glTexCoordPointer(2, GL_FLOAT, 0, tc1.data());
-    glClientActiveTexture(GL_TEXTURE0); glEnableClientState(GL_TEXTURE_COORD_ARRAY); glTexCoordPointer(2, GL_FLOAT, 0, tc0.data());
     uint32_t tris = 0;
-    const GLenum mode = gl_prim(prim, idx ? nidx : nverts, &tris);
-    if (idx) glDrawElements(mode, (GLsizei)nidx, GL_UNSIGNED_SHORT, idx);
-    else glDrawArrays(mode, 0, (GLsizei)nverts);
-    glDisableClientState(GL_COLOR_ARRAY);
+    j->mode = gl_prim(prim, idx ? nidx : nverts, &tris);
+    if (idx) j->idx.assign(idx, idx + nidx);
+    gl_async([j] {
+        gl_bind_off();
+        gl_apply(j->st);
+        glViewport(j->vp[0], j->vp[1], j->vp[2], j->vp[3]);
+        if (j->rhw) {
+            glMatrixMode(GL_PROJECTION); glLoadIdentity();
+            glMatrixMode(GL_MODELVIEW); glLoadMatrixf(j->m0);
+        } else {
+            glMatrixMode(GL_PROJECTION); glLoadMatrixf(j->m0); glMultMatrixf(j->m1);
+            glMatrixMode(GL_MODELVIEW); glLoadMatrixf(j->m2); glMultMatrixf(j->m3);
+        }
+        glEnableClientState(GL_VERTEX_ARRAY); glVertexPointer(4, GL_FLOAT, 0, j->pos.data());
+        glEnableClientState(GL_COLOR_ARRAY); glColorPointer(4, GL_UNSIGNED_BYTE, 0, j->col.data());
+        glClientActiveTexture(GL_TEXTURE1); glEnableClientState(GL_TEXTURE_COORD_ARRAY); glTexCoordPointer(2, GL_FLOAT, 0, j->tc1.data());
+        glClientActiveTexture(GL_TEXTURE0); glEnableClientState(GL_TEXTURE_COORD_ARRAY); glTexCoordPointer(2, GL_FLOAT, 0, j->tc0.data());
+        if (!j->idx.empty()) glDrawElements(j->mode, (GLsizei)j->idx.size(), GL_UNSIGNED_SHORT, j->idx.data());
+        else glDrawArrays(j->mode, 0, (GLsizei)j->nverts);
+        glDisableClientState(GL_COLOR_ARRAY);
+    });
     ++g_draw_calls; g_tris += tris;
     g_gl_dirty = true;
-    {
-        static const long at = std::getenv("R6_DUMP_AT") ? std::atol(std::getenv("R6_DUMP_AT")) : -1;
-        if (at > 0 && g_flips >= 1000 && (long)(g_flips % at) == 0) {
-            uint8_t px[4] = {}; GLint fb = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
-            glReadPixels(320, 300, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-            log("[dump]   after: px(320,300 gl) %02x%02x%02x fb %d err %x", px[0], px[1], px[2], fb, glGetError());
-            GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp); GLboolean cm[4]; glGetBooleanv(GL_COLOR_WRITEMASK, cm);
-            GLfloat mv[16], pj[16], dr[2]; glGetFloatv(GL_MODELVIEW_MATRIX, mv); glGetFloatv(GL_PROJECTION_MATRIX, pj); glGetFloatv(GL_DEPTH_RANGE, dr);
-            const float* v = pos.data(); float cl[4];
-            for (int r = 0; r < 4; ++r) cl[r] = mv[r] * v[0] + mv[4 + r] * v[1] + mv[8 + r] * v[2] + mv[12 + r] * v[3];
-            log("[dump]   vp %d %d %d %d mask %d%d%d%d scis %d sten %d alpha %d blend %d tex0 %d dr %.2f-%.2f clip(v0) %.2f %.2f %.2f %.2f pj00 %.2f",
-                vp[0], vp[1], vp[2], vp[3], cm[0], cm[1], cm[2], cm[3], glIsEnabled(GL_SCISSOR_TEST), glIsEnabled(GL_STENCIL_TEST), glIsEnabled(GL_ALPHA_TEST),
-                glIsEnabled(GL_BLEND), glIsEnabled(GL_TEXTURE_2D), dr[0], dr[1], cl[0], cl[1], cl[2], cl[3], pj[0]);
-        }
-    }
 }
 
 // Clear the render target's GL frame (rects in render-target pixels).
 void clear_rt(Cpu& c, uint32_t n, uint32_t rects, uint32_t flags, uint32_t color, float z) {
     if (!ensure_gl() || !g_rt) return;
     mem_to_gl(c);
-    GLbitfield bits = 0;
-    if (flags & 1) { bits |= GL_COLOR_BUFFER_BIT; glClearColor(((color >> 16) & 255) / 255.f, ((color >> 8) & 255) / 255.f, (color & 255) / 255.f, 1); }
-    if (flags & 2) { bits |= GL_DEPTH_BUFFER_BIT; glDepthMask(GL_TRUE); glClearDepth(z); }
-    if (!bits) return;
-    glEnable(GL_SCISSOR_TEST);
-    if (!n || !rects) { glScissor(g_ox, g_oy, g_ow, g_oh); glClear(bits); }
+    if (!(flags & 3)) return;
+    std::vector<int> sc;   // scissor rects (GL coordinates)
+    if (!n || !rects) sc = { g_ox, g_oy, g_ow, g_oh };
     for (uint32_t i = 0; i < n && rects; ++i) {
         int x1 = (int)c.read_u32(rects + 16 * i), y1 = (int)c.read_u32(rects + 16 * i + 4);
         int x2 = (int)c.read_u32(rects + 16 * i + 8), y2 = (int)c.read_u32(rects + 16 * i + 12);
         int gx, gy, gw, gh; rt_rect_to_gl(x1, y1, x2 - x1, y2 - y1, &gx, &gy, &gw, &gh);
-        glScissor(gx, gy, gw, gh); glClear(bits);
+        sc.insert(sc.end(), { gx, gy, gw, gh });
     }
-    glDisable(GL_SCISSOR_TEST);
-    glDepthMask(g_rs[14] ? GL_TRUE : GL_FALSE);
+    const bool zw = g_rs[14] != 0;
+    gl_async([=] {
+        gl_bind_off();
+        GLbitfield bits = 0;
+        if (flags & 1) { bits |= GL_COLOR_BUFFER_BIT; glClearColor(((color >> 16) & 255) / 255.f, ((color >> 8) & 255) / 255.f, (color & 255) / 255.f, 1); }
+        if (flags & 2) { bits |= GL_DEPTH_BUFFER_BIT; glDepthMask(GL_TRUE); glClearDepth(z); }
+        glEnable(GL_SCISSOR_TEST);
+        for (size_t i = 0; i + 3 < sc.size(); i += 4) { glScissor(sc[i], sc[i + 1], sc[i + 2], sc[i + 3]); glClear(bits); }
+        glDisable(GL_SCISSOR_TEST);
+        glDepthMask(zw ? GL_TRUE : GL_FALSE);
+    });
     g_gl_dirty = true;
 }
 

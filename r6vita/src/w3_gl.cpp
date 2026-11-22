@@ -16,6 +16,7 @@
 // the screen for free, so a lower setting saves GPU fill and costs nothing.
 #include "sc_host.h"
 #include "sc_input.h"
+#include "r6_glthread.h"
 
 #include "runtime/guest_scratch.h"
 #include "runtime/win32_shims_gdi32.h"
@@ -249,7 +250,8 @@ void draw_card_overlay() {
     glActiveTexture(active);
 }
 
-void swap(Cpu& c) {
+// The GL half of a swap (GL thread in r6vita) and the game-thread half.
+void swap_gpu() {
     draw_card_overlay();
     ++g_swaps;
     static uint64_t frames = 0, t0 = 0, last_calls = 0, last_draws = 0, last_tris = 0;
@@ -270,12 +272,19 @@ void swap(Cpu& c) {
     }
 #ifdef __vita__
     vglSwapBuffers(present_ime_open() ? GL_TRUE : GL_FALSE);   // GL_TRUE also draws the keyboard dialog
-    present(c, 0, 0, 0, 0, nullptr);                          // controller, sound pump, frame stats
 #else
     glFinish();
+#endif
+}
+void swap_host(Cpu& c) {
+#ifdef __vita__
+    present(c, 0, 0, 0, 0, nullptr);                          // controller, sound pump, frame stats
+#else
+    gl_finish();                                              // the frame is in g_fb once the GL thread is done
     present_rgba(c, g_fb.data(), g_w, g_h);
 #endif
 }
+void swap(Cpu& c) { swap_gpu(); swap_host(c); }
 
 uint32_t guest_string(Cpu& c, const std::string& s) {
     static std::map<std::string, uint32_t>* cache = new std::map<std::string, uint32_t>();
@@ -288,6 +297,8 @@ uint32_t guest_string(Cpu& c, const std::string& s) {
 
 bool gl_ensure_context() { uint32_t w, h; gl_render_size(&w, &h); return make_current(); }
 void gl_swap(Cpu& c) { swap(c); }
+void gl_swap_gpu() { swap_gpu(); }
+void gl_swap_host(Cpu& c) { swap_host(c); }
 
 void gl_render_size(uint32_t* w, uint32_t* h) {
     static bool read = false;
