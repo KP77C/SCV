@@ -128,7 +128,7 @@ index 827f6f3..ed0896d 100644
    target_link_options(deusex PRIVATE -static-libstdc++ -static-libgcc)
  endif()
 diff --git a/src/audio/audio.cc b/src/audio/audio.cc
-index 4e79963..3d006af 100644
+index 4e79963..c12e35d 100644
 --- a/src/audio/audio.cc
 +++ b/src/audio/audio.cc
 @@ -1,4 +1,5 @@
@@ -151,7 +151,32 @@ index 4e79963..3d006af 100644
  #include <algorithm>
  #include <array>
  #include <cmath>
-@@ -131,9 +139,16 @@ namespace dx::audio {
+@@ -45,8 +53,19 @@ namespace dx::audio {
+ 
+         float (*lightRandomSource)(int32_t) = nullptr;
+ 
++#ifdef __vita__
++        constexpr float AmbientScanInterval = 0.25f;
++        constexpr float ObstructionInterval = 0.2f;
++#else
++        constexpr float AmbientScanInterval = 0.0f;
++        constexpr float ObstructionInterval = 0.0f;
++#endif
++
+         struct Voice {
+             int32_t id = 0;
++            // Seconds until the next line-of-sight (obstruction) check.
++            float obstructionCheck = 0;
++            bool lastObstructed = false;
+             std::shared_ptr<const DecodedSound> pcm;
+             const USound* sound = nullptr;
+             size_t position = 0;
+@@ -128,12 +147,21 @@ namespace dx::audio {
+         }
+ 
+         struct State {
++            // Seconds until the world is next scanned for ambient sounds.
++            float ambientScan = 0;
              bool active = false;
              bool offline = false;
              bool hasContext = false;
@@ -168,7 +193,7 @@ index 4e79963..3d006af 100644
              size_t channels = 16;
              float ambientFactor = 0.7f;
              float dopplerSpeed = 6500;
-@@ -493,12 +508,39 @@ namespace dx::audio {
+@@ -493,12 +521,39 @@ namespace dx::audio {
              }
          }
  
@@ -208,7 +233,19 @@ index 4e79963..3d006af 100644
  
          Voice makeVoice(State& s, std::shared_ptr<const DecodedSound> pcm, USound* sound, UObject* actor, int32_t slot, const Vector& location, float volume, float radius, float pitch, bool attenuate)
          {
-@@ -687,12 +729,20 @@ namespace dx::audio {
+@@ -593,9 +648,9 @@ namespace dx::audio {
+             return false;
+         }
+ 
+-        void updateAmbient(State& s, World* world, bool realtime)
++        void updateAmbient(State& s, World* world, bool realtime, bool scan)
+         {
+-            if (realtime) {
++            if (realtime && scan) {
+                 for (UObject* actor : world->actors) {
+                     if (!actor || actor->destroyed || !actor->data) {
+                         continue;
+@@ -687,12 +742,20 @@ namespace dx::audio {
              if (latency) {
                  s.latency = static_cast<float>(std::atof(latency->c_str()));
              }
@@ -230,7 +267,7 @@ index 4e79963..3d006af 100644
      }
  
      float DecodedSound::duration() const
-@@ -706,8 +756,7 @@ namespace dx::audio {
+@@ -706,8 +769,7 @@ namespace dx::audio {
          std::array<float, 1024> im {};
          size_t frames = pcm.frames();
          for (size_t i = 0; i < 1024; i++) {
@@ -240,7 +277,7 @@ index 4e79963..3d006af 100644
              re[i] = clamped * (1.0f / 32768.0f) * (static_cast<float>(i) / 1024.0f);
          }
          fft(re, im);
-@@ -779,6 +828,9 @@ namespace dx::audio {
+@@ -779,6 +841,9 @@ namespace dx::audio {
          for (size_t i = 0; i < result->samples.size(); i++) {
              result->fixed[i] = static_cast<int16_t>(std::clamp(std::nearbyint(result->samples[i] * 32768.0f), -32768.0f, 32767.0f));
          }
@@ -250,7 +287,7 @@ index 4e79963..3d006af 100644
          return result;
      }
  
-@@ -792,7 +844,34 @@ namespace dx::audio {
+@@ -792,7 +857,34 @@ namespace dx::audio {
          if (it != s.sounds.end()) {
              return it->second;
          }
@@ -285,7 +322,7 @@ index 4e79963..3d006af 100644
          s.sounds.emplace(sound, result);
          if (result) {
              sound->duration = result->duration();
-@@ -971,6 +1050,22 @@ namespace dx::audio {
+@@ -971,6 +1063,22 @@ namespace dx::audio {
              return true;
          }
          readSettings(s);
@@ -308,7 +345,7 @@ index 4e79963..3d006af 100644
          ma_device_config config = ma_device_config_init(ma_device_type_playback);
          config.playback.format = ma_format_f32;
          config.playback.channels = 2;
-@@ -1001,6 +1096,7 @@ namespace dx::audio {
+@@ -1001,6 +1109,7 @@ namespace dx::audio {
          s.active = true;
          s.offline = false;
          return true;
@@ -316,7 +353,7 @@ index 4e79963..3d006af 100644
      }
  
      bool initializeOffline(uint32_t sampleRate)
-@@ -1011,6 +1107,7 @@ namespace dx::audio {
+@@ -1011,6 +1120,7 @@ namespace dx::audio {
          }
          readSettings(s);
          s.sounds.clear();
@@ -324,7 +361,7 @@ index 4e79963..3d006af 100644
          s.modules.clear();
          s.rate = sampleRate;
          s.active = true;
-@@ -1025,11 +1122,18 @@ namespace dx::audio {
+@@ -1025,11 +1135,18 @@ namespace dx::audio {
              return;
          }
          if (!s.offline) {
@@ -343,7 +380,7 @@ index 4e79963..3d006af 100644
          }
          s.active = false;
          s.offline = false;
-@@ -1051,6 +1155,7 @@ namespace dx::audio {
+@@ -1051,6 +1168,7 @@ namespace dx::audio {
          s.viewer = {};
          s.ear = {};
          s.sounds.clear();
@@ -351,7 +388,7 @@ index 4e79963..3d006af 100644
          s.modules.clear();
      }
  
-@@ -1063,6 +1168,7 @@ namespace dx::audio {
+@@ -1063,6 +1181,7 @@ namespace dx::audio {
  
      void update(const Vector& listenerLocation, const Rotator& listenerRotation, float deltaSeconds)
      {
@@ -359,6 +396,53 @@ index 4e79963..3d006af 100644
          State& s = state();
          if (!s.active) {
              return;
+@@ -1090,9 +1209,18 @@ namespace dx::audio {
+                 }
+                 zone = region(view).zone;
+             }
++#ifndef __vita__
+             present.insert(world->actors.begin(), world->actors.end());
++#endif
+             bool realtime = !world->levelInfo || !world->levelInfo->data || levelinfo::Pauser(world->levelInfo).empty();
+-            updateAmbient(s, world, realtime);
++            // Starting new ambient sounds needs a walk over every actor; a
++            // few times a second is enough to hear them start in time.
++            s.ambientScan -= delta;
++            bool scan = s.ambientScan <= 0;
++            if (scan) {
++                s.ambientScan = AmbientScanInterval;
++            }
++            updateAmbient(s, world, realtime, scan);
+         } else {
+             std::lock_guard<std::mutex> lock(s.mutex);
+             for (Voice& voice : s.voices) {
+@@ -1107,12 +1235,25 @@ namespace dx::audio {
+             if (!alive(voice)) {
+                 continue;
+             }
++#ifdef __vita__
++            // Actors are never freed and actorDestroyed() clears voice.actor,
++            // so the per-frame set of all actors is not needed here.
++            bool live = voice.actor && !voice.actor->destroyed && voice.actor->data;
++#else
+             bool live = voice.actor && present.count(voice.actor) && !voice.actor->destroyed && voice.actor->data;
++#endif
+             if (live) {
+                 voice.location = actor::Location(voice.actor);
+             }
+             voice.elapsed += delta;
+-            bool obstructed = live && voice.slot != SlotTalk && !world->fastLineCheck(s.ear, voice.location);
++            // Line of sight to each sound is traced a few times a second
++            // rather than every frame.
++            voice.obstructionCheck -= delta;
++            if (voice.obstructionCheck <= 0) {
++                voice.obstructionCheck = ObstructionInterval;
++                voice.lastObstructed = live && voice.slot != SlotTalk && !world->fastLineCheck(s.ear, voice.location);
++            }
++            bool obstructed = live && voice.lastObstructed;
+             voice.obstruction = obstructed ? std::min(voice.obstruction + delta, 0.5f) : std::max(voice.obstruction - delta, 0.0f);
+             voice.doppler = live && voice.ambient ? dopplerShift(actor::Velocity(voice.actor), voice.location, s.viewer, s.dopplerSpeed) : 1.0f;
+             refreshGains(s, voice);
 diff --git a/src/core/objects.cc b/src/core/objects.cc
 index d5f4d4a..948f3a8 100644
 --- a/src/core/objects.cc
@@ -437,7 +521,7 @@ index 8c72219..705595c 100644
          UClass* objectClass();
 diff --git a/src/core/prof.cc b/src/core/prof.cc
 new file mode 100644
-index 0000000..7412e2c
+index 0000000..52e27f3
 --- /dev/null
 +++ b/src/core/prof.cc
 @@ -0,0 +1,80 @@
@@ -457,7 +541,7 @@ index 0000000..7412e2c
 +    namespace {
 +        const char* const names[Count] = {
 +            "other", "game (rest)", "drawing (rest)", "actor ticks", "physics", "movement", "scripts", "AI", "audio", "menus/UI",
-+            "visibility", "sky", "level", "meshes", "mesh lights", "sprites", "translucent", "HUD/canvas", "GL calls",
++            "visibility", "sky", "level", "meshes", "mesh lights", "sprites", "translucent", "HUD/canvas", "GL calls", "water/fire textures",
 +        };
 +    }
 +
@@ -523,10 +607,10 @@ index 0000000..7412e2c
 +}
 diff --git a/src/core/prof.h b/src/core/prof.h
 new file mode 100644
-index 0000000..f8f3c0b
+index 0000000..4b7dba3
 --- /dev/null
 +++ b/src/core/prof.h
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,83 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -556,6 +640,7 @@ index 0000000..f8f3c0b
 +        Translucent,
 +        Canvas,
 +        GLCalls,
++        Procedural,
 +        Count
 +    };
 +
@@ -610,7 +695,7 @@ index 0000000..f8f3c0b
 +    std::string report(uint32_t frames);
 +}
 diff --git a/src/core/vm.cc b/src/core/vm.cc
-index e2ea8de..6c2fbb3 100644
+index e2ea8de..59330bd 100644
 --- a/src/core/vm.cc
 +++ b/src/core/vm.cc
 @@ -1,4 +1,5 @@
@@ -619,7 +704,57 @@ index e2ea8de..6c2fbb3 100644
  
  #include "core/objects.h"
  
-@@ -977,6 +978,7 @@ namespace dx {
+@@ -960,6 +961,49 @@ namespace dx {
+ 
+         RemoteHook remoteHook = nullptr;
+ 
++        // Function locals come from a stack-like arena instead of the heap:
++        // calls nest strictly, and this is the hottest allocation in scripts.
++        class ScratchLocals {
++        public:
++            explicit ScratchLocals(size_t size)
++            {
++                size_t rounded = (size + 15) & ~static_cast<size_t>(15);
++                Arena& arena = arenaState();
++                if (arena.used + rounded <= ArenaSize) {
++                    data = arena.memory + arena.used;
++                    mark = arena.used;
++                    arena.used += rounded;
++                } else {
++                    heap.reset(new uint8_t[rounded]);
++                    data = heap.get();
++                }
++            }
++            ~ScratchLocals()
++            {
++                if (!heap) {
++                    arenaState().used = mark;
++                }
++            }
++            ScratchLocals(const ScratchLocals&) = delete;
++            ScratchLocals& operator=(const ScratchLocals&) = delete;
++            uint8_t* get() const { return data; }
++
++        private:
++            static constexpr size_t ArenaSize = 1u << 20;
++            struct Arena {
++                alignas(16) uint8_t memory[ArenaSize];
++                size_t used = 0;
++            };
++            static Arena& arenaState()
++            {
++                static Arena* arena = new Arena();
++                return *arena;
++            }
++            uint8_t* data = nullptr;
++            size_t mark = 0;
++            std::unique_ptr<uint8_t[]> heap;
++        };
++
+         void callFunction(Frame& stack, UObject* context, UFunction* function, void* result)
+         {
+             if (!function) {
+@@ -977,6 +1021,7 @@ namespace dx {
                  callNative(stack, context, function, function->native, result);
                  return;
              }
@@ -627,6 +762,15 @@ index e2ea8de..6c2fbb3 100644
              objects::ensureLoaded(function);
              function->link();
  
+@@ -990,7 +1035,7 @@ namespace dx {
+                 return;
+             }
+ 
+-            std::unique_ptr<uint8_t[]> locals(new uint8_t[function->size + 16]);
++            ScratchLocals locals(function->size + 16);
+             function->initValue(locals.get());
+ 
+             struct OutParm {
 diff --git a/src/deusex/menus.cc b/src/deusex/menus.cc
 index adc3df3..6116255 100644
 --- a/src/deusex/menus.cc
@@ -2123,7 +2267,7 @@ index 66508ac..eee4a26 100644
  
      class GammaPass {
 diff --git a/src/render/procedural.cc b/src/render/procedural.cc
-index 60247eb..6f234b1 100644
+index 60247eb..53c0595 100644
 --- a/src/render/procedural.cc
 +++ b/src/render/procedural.cc
 @@ -228,6 +228,9 @@ namespace dx {
@@ -2136,8 +2280,33 @@ index 60247eb..6f234b1 100644
              if (!texture || texture->mips.empty() || texture->format() != 0) {
                  return nullptr;
              }
+@@ -1509,9 +1512,23 @@ namespace dx {
+ 
+         width = static_cast<uint32_t>(state.usize);
+         height = static_cast<uint32_t>(state.vsize);
+-        rgba.resize(state.pixels.size() * 4);
+         UPalette* palette = state.palette;
+         const uint32_t* colors = palette && palette->colors.size() >= 256 ? palette->colors.data() : nullptr;
++#ifdef __vita__
++        // PS Vita: the GPU takes 8-bit pixels plus a palette directly
++        // (GL_PALETTE8_RGBA8_OES layout: 256 RGBA entries, then the pixels).
++        rgba.resize(1024 + state.pixels.size());
++        for (uint32_t i = 0; i < 256; i++) {
++            uint32_t color = colors ? colors[i] : (0xff000000u | i * 0x010101u);
++            rgba[i * 4 + 0] = static_cast<uint8_t>(color & 0xff);
++            rgba[i * 4 + 1] = static_cast<uint8_t>((color >> 8) & 0xff);
++            rgba[i * 4 + 2] = static_cast<uint8_t>((color >> 16) & 0xff);
++            rgba[i * 4 + 3] = i == 0 ? 0 : 255;
++        }
++        std::copy(state.pixels.begin(), state.pixels.end(), rgba.begin() + 1024);
++        return true;
++#endif
++        rgba.resize(state.pixels.size() * 4);
+         for (size_t i = 0; i < state.pixels.size(); i++) {
+             uint8_t index = state.pixels[i];
+             uint32_t color = colors ? colors[index] : (0xff000000u | index * 0x010101u);
 diff --git a/src/render/scene_renderer.cc b/src/render/scene_renderer.cc
-index 259a101..c8d6e9e 100644
+index 259a101..e8a8897 100644
 --- a/src/render/scene_renderer.cc
 +++ b/src/render/scene_renderer.cc
 @@ -1,4 +1,5 @@
@@ -2154,10 +2323,37 @@ index 259a101..c8d6e9e 100644
  #include <bit>
  #include <chrono>
  #include <cmath>
-@@ -43,6 +45,19 @@ namespace dx {
+@@ -43,6 +45,46 @@ namespace dx {
          constexpr uint32_t PF_Unlit = 0x00400000;
          constexpr uint32_t PF_Portal = 0x04000000;
          constexpr uint32_t PF_Mirrored = 0x08000000;
++
++        // Mesh lighting has a small view-dependent (specular) term, so a
++        // cached lit mesh is rebuilt when the camera moves. The Vita keeps
++        // it until the camera has moved 32 units, so walking does not relight
++        // every mesh every frame.
++        bool meshEyeClose(const Vector& cached, const Vector& eye)
++        {
++#ifdef __vita__
++            return (cached - eye).sizeSquared() < 32.0f * 32.0f;
++#else
++            return cached.x == eye.x && cached.y == eye.y && cached.z == eye.z;
++#endif
++        }
++
++        int32_t occlusionScale()
++        {
++            static const int32_t scale = [] {
++                const char* value = std::getenv("DX_OCCLUSION_SCALE");
++#ifdef __vita__
++                int32_t fallback = 2;
++#else
++                int32_t fallback = 1;
++#endif
++                return std::clamp(value ? std::atoi(value) : fallback, 1, 4);
++            }();
++            return scale;
++        }
 +
 +        // Mirror reflections draw the whole scene again for each mirror. The
 +        // Vita draws mirrors as plain surfaces unless DX_MIRRORS=1.
@@ -2174,7 +2370,7 @@ index 259a101..c8d6e9e 100644
          constexpr int32_t MaxFrameRecursion = 4;
  
          constexpr uint8_t DT_Sprite = 1;
-@@ -508,6 +523,7 @@ namespace dx {
+@@ -508,6 +550,7 @@ namespace dx {
  
      void SceneRenderer::occludeView(View& view, const std::vector<ScreenSpan>* open)
      {
@@ -2182,8 +2378,53 @@ index 259a101..c8d6e9e 100644
          std::shared_ptr<ViewVisibility> visibility = std::make_shared<ViewVisibility>();
          view.visibility = visibility;
          visibility->mirrorSpans.resize(levelData.mirrors.size());
-@@ -586,7 +602,7 @@ namespace dx {
-             bottom = std::clamp(bottom, -1.0f, static_cast<float>(viewportHeight) + 1.0f);
+@@ -515,15 +558,21 @@ namespace dx {
+         if (!model || model->nodes.empty()) {
+             return;
+         }
++        // The occlusion buffer can run below screen resolution (Vita: half):
++        // the span work scales with its rows, and its results only feed
++        // back into later occlusion passes.
++        int32_t occScale = occlusionScale();
++        int32_t occWidth = (viewportWidth + occScale - 1) / occScale;
++        int32_t occHeight = (viewportHeight + occScale - 1) / occScale;
+         if (open) {
+-            spans.reset(viewportWidth, viewportHeight, *open);
++            spans.reset(occWidth, occHeight, *open);
+         } else {
+-            spans.reset(viewportWidth, viewportHeight);
++            spans.reset(occWidth, occHeight);
+         }
+         const Vector& eye = view.location;
+         const Coords& axes = view.axes;
+-        float halfWidth = static_cast<float>(viewportWidth) * 0.5f;
+-        float halfHeight = static_cast<float>(viewportHeight) * 0.5f;
++        float halfWidth = static_cast<float>(viewportWidth) * 0.5f / static_cast<float>(occScale);
++        float halfHeight = static_cast<float>(viewportHeight) * 0.5f / static_cast<float>(occScale);
+         float scaleX = halfWidth / view.tanHalfWidth;
+         float scaleY = halfHeight / view.tanHalfHeight;
+         float guardWidth = view.tanHalfWidth * 1.02f;
+@@ -572,7 +621,7 @@ namespace dx {
+             float bottom = std::numeric_limits<float>::lowest();
+             for (const Vector& corner : corners) {
+                 if ((corner - eye).dot(axes.xAxis) < sceneNearPlane) {
+-                    return spans.rectVisible(0, 0, viewportWidth, viewportHeight);
++                    return spans.rectVisible(0, 0, occWidth, occHeight);
+                 }
+                 ScreenPoint point = project(corner);
+                 left = std::min(left, point.x);
+@@ -580,13 +629,13 @@ namespace dx {
+                 top = std::min(top, point.y);
+                 bottom = std::max(bottom, point.y);
+             }
+-            left = std::clamp(left, -1.0f, static_cast<float>(viewportWidth) + 1.0f);
+-            right = std::clamp(right, -1.0f, static_cast<float>(viewportWidth) + 1.0f);
+-            top = std::clamp(top, -1.0f, static_cast<float>(viewportHeight) + 1.0f);
+-            bottom = std::clamp(bottom, -1.0f, static_cast<float>(viewportHeight) + 1.0f);
++            left = std::clamp(left, -1.0f, static_cast<float>(occWidth) + 1.0f);
++            right = std::clamp(right, -1.0f, static_cast<float>(occWidth) + 1.0f);
++            top = std::clamp(top, -1.0f, static_cast<float>(occHeight) + 1.0f);
++            bottom = std::clamp(bottom, -1.0f, static_cast<float>(occHeight) + 1.0f);
              return spans.rectVisible(static_cast<int32_t>(std::floor(left)) - 1, static_cast<int32_t>(std::floor(top)) - 1, static_cast<int32_t>(std::ceil(right)) + 1, static_cast<int32_t>(std::ceil(bottom)) + 1);
          };
 -        bool mirrorsActive = view.recursion < MaxFrameRecursion - 1;
@@ -2191,7 +2432,7 @@ index 259a101..c8d6e9e 100644
          const std::vector<BspNode>& nodes = model->nodes;
          int32_t sequence = 0;
          Vector clipA[64];
-@@ -1241,6 +1257,7 @@ namespace dx {
+@@ -1241,6 +1290,7 @@ namespace dx {
  
      void SceneRenderer::drawLevelGeometry(const View& view, bool translucentPass)
      {
@@ -2199,7 +2440,7 @@ index 259a101..c8d6e9e 100644
          if (!levelData.vao) {
              return;
          }
-@@ -1259,7 +1276,7 @@ namespace dx {
+@@ -1259,7 +1309,7 @@ namespace dx {
              });
          }
          bool skyActive = levelData.hasBackdrop;
@@ -2208,7 +2449,7 @@ index 259a101..c8d6e9e 100644
          if (translucentPass) {
              std::vector<TranslucentSurface>& surfaces = scratchTranslucentSurfaces;
              surfaces.clear();
-@@ -1440,6 +1457,7 @@ namespace dx {
+@@ -1440,6 +1490,7 @@ namespace dx {
  
      void SceneRenderer::drawSky(const View& frame, const std::vector<UObject*>& actors, UObject* viewActor)
      {
@@ -2216,7 +2457,7 @@ index 259a101..c8d6e9e 100644
          UObject* skyZone = frameSkyZone(zoneActor(pointZone(frame.location)));
          if (!skyZone) {
              levelData.hasBackdrop = false;
-@@ -1887,6 +1905,7 @@ namespace dx {
+@@ -1887,6 +1938,7 @@ namespace dx {
  
      void SceneRenderer::selectActorLights(UObject* actor)
      {
@@ -2224,7 +2465,7 @@ index 259a101..c8d6e9e 100644
          actorLights.clear();
          actorLightPrepared.clear();
          actorLightColors.clear();
-@@ -2297,6 +2316,7 @@ namespace dx {
+@@ -2297,6 +2349,7 @@ namespace dx {
  
      void SceneRenderer::flushTranslucent(const View& view)
      {
@@ -2232,7 +2473,7 @@ index 259a101..c8d6e9e 100644
          applyView(view);
          std::vector<size_t> order(translucentCount);
          for (size_t i = 0; i < translucentCount; i++) {
-@@ -2510,6 +2530,7 @@ namespace dx {
+@@ -2510,6 +2563,7 @@ namespace dx {
  
      void SceneRenderer::drawMeshWith(UObject* actor, UObject* lightActor, UMesh* mesh, UObject* animSource, const MeshTransform& transform, const View& view, std::vector<Vector>* worldOut)
      {
@@ -2240,7 +2481,16 @@ index 259a101..c8d6e9e 100644
          MeshAnimState animState;
          animState.sequence = actor::AnimSequence(animSource);
          animState.frame = actor::AnimFrame(animSource);
-@@ -2795,6 +2816,7 @@ namespace dx {
+@@ -2670,7 +2724,7 @@ namespace dx {
+             }
+         }
+ 
+-        bool cacheHit = sameGeometry && cache.cacheable && sameVector(cache.eye, view.location) && cache.slotInfo == slotInfo && cache.slotFlags == slotFlags && cache.actorFlags == actorFlags && cache.unlitActor == unlitActor && cache.scaleGlow == scaleGlow && cache.glowScale == clampedGlow && sameVector(cache.ambient, ambient) && sameLights(cache.lights);
++        bool cacheHit = sameGeometry && cache.cacheable && meshEyeClose(cache.eye, view.location) && cache.slotInfo == slotInfo && cache.slotFlags == slotFlags && cache.actorFlags == actorFlags && cache.unlitActor == unlitActor && cache.scaleGlow == scaleGlow && cache.glowScale == clampedGlow && sameVector(cache.ambient, ambient) && sameLights(cache.lights);
+         if (cacheHit) {
+             if (worldOut) {
+                 *worldOut = meshWorld;
+@@ -2795,6 +2849,7 @@ namespace dx {
  
      void SceneRenderer::drawSprite(UObject* actor, const View& view)
      {
@@ -2248,7 +2498,7 @@ index 259a101..c8d6e9e 100644
          UTexture* texture = asTexture(actor::Texture(actor));
          if (!texture) {
              return;
-@@ -3326,6 +3348,12 @@ namespace dx {
+@@ -3326,6 +3381,12 @@ namespace dx {
          occlusionBoxes.clear();
          occlusionIssued.clear();
          occlusionUnconfirmed.clear();
@@ -2261,7 +2511,7 @@ index 259a101..c8d6e9e 100644
          size_t kept = 0;
          for (UObject* actor : candidates) {
              bool keep = true;
-@@ -3541,7 +3569,7 @@ namespace dx {
+@@ -3541,7 +3602,7 @@ namespace dx {
              device->setDepthWrite(true);
              device->clear(false, true, 1.0f);
          }
@@ -2271,10 +2521,16 @@ index 259a101..c8d6e9e 100644
              device->setDepthWrite(true);
              device->clear(false, true, 1.0f);
 diff --git a/src/render/texture_cache.cc b/src/render/texture_cache.cc
-index 4640c7c..60c2510 100644
+index 4640c7c..e885b31 100644
 --- a/src/render/texture_cache.cc
 +++ b/src/render/texture_cache.cc
-@@ -7,6 +7,8 @@
+@@ -1,4 +1,5 @@
+ #include "render/texture_cache.h"
++#include "core/prof.h"
+ 
+ #include "core/objects.h"
+ #include "engine/props_engine.h"
+@@ -7,6 +8,8 @@
  
  #include <algorithm>
  #include <bit>
@@ -2283,7 +2539,7 @@ index 4640c7c..60c2510 100644
  #include <exception>
  #include <vector>
  
-@@ -14,7 +16,9 @@ namespace dx {
+@@ -14,7 +17,9 @@ namespace dx {
      namespace {
          void setParameters(bool smooth, int32_t levels, bool trilinear, float anisotropy)
          {
@@ -2293,7 +2549,27 @@ index 4640c7c..60c2510 100644
              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
              if (smooth) {
-@@ -209,6 +213,25 @@ namespace dx {
+@@ -152,6 +157,7 @@ namespace dx {
+             std::vector<uint8_t> rgba;
+             uint32_t width = 0;
+             uint32_t height = 0;
++            prof::Scope profScope(prof::Procedural);
+             bool changed = procedural.update(texture, time, rgba, width, height);
+             if (it != textures.end() && !changed) {
+                 return &it->second;
+@@ -168,7 +174,11 @@ namespace dx {
+             info.height = height;
+             info.masked = texture->masked();
+             glBindTexture(GL_TEXTURE_2D, info.id);
++#ifdef __vita__
++            glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_PALETTE8_RGBA8_OES, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, static_cast<GLsizei>(rgba.size()), rgba.data());
++#else
+             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
++#endif
+             info.smooth = true;
+             info.levels = 1;
+             setParameters(true, 1, trilinear, anisotropy);
+@@ -209,6 +219,25 @@ namespace dx {
          }
          glGenTextures(1, &info.id);
          glBindTexture(GL_TEXTURE_2D, info.id);
@@ -2319,7 +2595,7 @@ index 4640c7c..60c2510 100644
          int32_t levels = 0;
          for (size_t mip = 0; mip < texture->mips.size(); mip++) {
              const TextureMip& level = texture->mips[mip];
-@@ -252,6 +275,107 @@ namespace dx {
+@@ -252,6 +281,107 @@ namespace dx {
          return true;
      }
  
