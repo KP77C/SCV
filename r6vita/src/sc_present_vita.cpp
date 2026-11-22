@@ -259,8 +259,25 @@ void ring_push(uint32_t v) { const uint32_t i = g_ring_n.load(std::memory_order_
 void dx_sample_eip();
 int sampler_main(SceSize, void*) {
     wx86_vita_pin_self(SCE_KERNEL_CPU_MASK_USER_2, nullptr);
+    uint64_t wd_last = 0; uint64_t wd_presents = ~0ull; int wd_dumps = 0;
     while (!g_quit.load()) {
         sceKernelDelayThread(1000);
+        {   // Watchdog: no frame for 10 s (also before the first one) -> where every guest thread is.
+            const uint64_t now = sceKernelGetProcessTimeWide();
+            if (!wd_last) wd_last = now;
+            if (now - wd_last >= 10000000) {
+                wd_last = now;
+                const uint64_t p = g_guest_presents.load();
+                if (p == wd_presents && wd_dumps < 30) {
+                    ++wd_dumps;
+                    SceKernelFreeMemorySizeInfo fm; std::memset(&fm, 0, sizeof fm); fm.size = sizeof fm; sceKernelGetFreeMemorySize(&fm);
+                    log("[not-bound] [cause: guest stall] watchdog: no frame for 10 s (%llu frames so far), RAM free %u KiB; guest threads:",
+                        (unsigned long long)p, (unsigned)(fm.size_user >> 10));
+                    if (d2rt::ThreadScheduler* sc = wx86_sched()) sc->dump_threads_to([](const char* m) { log("[not-bound]   %s", m); });
+                }
+                wd_presents = p;
+            }
+        }
         if (g_main_thread < 0) continue;
         SceKernelThreadInfo ti; std::memset(&ti, 0, sizeof ti); ti.size = sizeof ti;
         if (sceKernelGetThreadInfo(g_main_thread, &ti) < 0) continue;
@@ -301,7 +318,7 @@ std::atomic<uint32_t> g_msamp[kMaxMods + 3];   // modules, then: shims, other me
 void build_module_ranges() {
     // WarCraft III's modules (Game.dll, MSVCP120 and the Miles plug-ins
     // arrive by LoadLibraryA: window_report calls this again every 10 s).
-    static const char* names[] = { "War3.exe", "Game.dll", "Storm.dll", "MSVCR120.dll", "MSVCP120.dll", "mss32.dll",
+    static const char* names[] = { "R6BOLegacy.exe", "FFC11.dll", "War3.exe", "Game.dll", "Storm.dll", "MSVCR120.dll", "MSVCP120.dll", "mss32.dll",
                                    "ijl15.dll", "Mp3dec.asi", "Mssdolby.m3d", "Msseax2.m3d", "Mssfast.m3d", "Reverb3.flt" };
     int n = 0;
     for (const char* nm : names) {

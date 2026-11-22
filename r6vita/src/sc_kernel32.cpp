@@ -913,6 +913,7 @@ void install_kernel32(d2rt::Bridge& br) {
         std::string gdir = k == std::string::npos ? "" : g.substr(0, k), pat = k == std::string::npos ? g : g.substr(k + 1);
         FindState fs; fs.dir = resolve_path(gdir.empty() ? "." : gdir); fs.pat = pat;
         fs.d = opendir(fs.dir.c_str());
+        { static int n = 0; if (n++ < 40) log("[not-bound] FindFirstFile %s -> dir %s (%s)", g.c_str(), fs.dir.c_str(), fs.d ? "open" : "missing"); }
         if (!fs.d || !find_next(c, fs, c.arg(1))) {
             if (fs.d) closedir(fs.d);
             wx86_set_lasterr(c, ERROR_FILE_NOT_FOUND); return INVALID_HANDLE;
