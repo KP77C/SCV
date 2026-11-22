@@ -257,6 +257,7 @@ constexpr uint32_t kRing = 4096, kSampReady = 0xFFFFFFF1u, kSampWait = 0xFFFFFFF
 uint32_t g_ring[kRing]; std::atomic<uint32_t> g_ring_n{0};
 void ring_push(uint32_t v) { const uint32_t i = g_ring_n.load(std::memory_order_relaxed); g_ring[i & (kRing - 1)] = v; g_ring_n.store(i + 1, std::memory_order_release); }
 void dx_sample_eip();
+void window_report(uint64_t now);
 int sampler_main(SceSize, void*) {
     wx86_vita_pin_self(SCE_KERNEL_CPU_MASK_USER_2, nullptr);
     uint64_t wd_last = 0; uint64_t wd_presents = ~0ull; int wd_dumps = 0;
@@ -274,6 +275,7 @@ int sampler_main(SceSize, void*) {
                     log("[not-bound] [cause: guest stall] watchdog: no frame for 10 s (%llu frames so far), RAM free %u KiB; guest threads:",
                         (unsigned long long)p, (unsigned)(fm.size_user >> 10));
                     if (d2rt::ThreadScheduler* sc = wx86_sched()) sc->dump_threads_to([](const char* m) { log("[not-bound]   %s", m); });
+                    window_report(wx86_now_us());   // module/hot-spot/JIT/shim timings for the stalled window (no present calls it now)
                 }
                 wd_presents = p;
             }
