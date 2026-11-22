@@ -30,6 +30,7 @@
 #pragma once
 #include <cstdint>
 #include <map>
+#include <set>
 
 namespace wx86 {
 
@@ -72,6 +73,16 @@ public:
         if (n > (limit_ - base_)) { record_fail(n); return 0; }
         uint32_t sz = (n + align_ - 1) & ~(align_ - 1);
         if (!sz) sz = align_;
+        if (fast_) {   // best fit through the size index: O(log n) instead of a walk over every free block
+            auto bs = bysize_.lower_bound({ sz, 0u });
+            if (bs == bysize_.end()) { record_fail(n); return 0; }
+            const uint32_t a = bs->second, have = bs->first;
+            bysize_.erase(bs); freeb_.erase(a);
+            if (have > sz) add_free(a + sz, have - sz);
+            used_[a] = sz;
+            cur_ += sz; if (cur_ > peak_) peak_ = cur_;
+            return a;
+        }
         for (auto it = freeb_.begin(); it != freeb_.end(); ++it)
             if (it->second >= sz) {
                 uint32_t a = it->first, rem = it->second - sz;
@@ -93,12 +104,26 @@ public:
         auto it = used_.find(a); if (it == used_.end()) return false;
         uint32_t sz = it->second; used_.erase(it); cur_ -= sz;
         auto nx = freeb_.lower_bound(a);
-        if (nx != freeb_.end() && a + sz == nx->first) { sz += nx->second; nx = freeb_.erase(nx); }
+        if (nx != freeb_.end() && a + sz == nx->first) {
+            if (fast_) bysize_.erase({ nx->second, nx->first });
+            sz += nx->second; nx = freeb_.erase(nx);
+        }
         if (nx != freeb_.begin()) {
             auto pv = std::prev(nx);
-            if (pv->first + pv->second == a) { pv->second += sz; return true; }
+            if (pv->first + pv->second == a) {
+                if (fast_) { bysize_.erase({ pv->second, pv->first }); bysize_.insert({ pv->second + sz, pv->first }); }
+                pv->second += sz; return true;
+            }
         }
-        freeb_[a] = sz; return true;
+        add_free(a, sz); return true;
+    }
+
+    // Opt-in best-fit mode with a size index (call right after init). Programs
+    // that keep tens of thousands of small blocks live (Rainbow Six's file
+    // index) made the first-fit walk cost ~1 ms per call on the Vita.
+    void set_fast(bool on) {
+        fast_ = on; bysize_.clear();
+        if (on) for (auto& p : freeb_) bysize_.insert({ p.second, p.first });
     }
 
     // Base of the block that CONTAINS a, or 0. VirtualFree uses it to tell
@@ -125,11 +150,14 @@ public:
 
 private:
     void record_fail(uint32_t n);
+    void add_free(uint32_t a, uint32_t sz) { freeb_[a] = sz; if (fast_) bysize_.insert({ sz, a }); }
 
     const char* name_ = "region";
     uint32_t base_ = 0, limit_ = 0, align_ = 16;
     uint32_t cur_ = 0, peak_ = 0;
     std::map<uint32_t, uint32_t> used_, freeb_;   // address -> size
+    bool fast_ = false;
+    std::set<std::pair<uint32_t, uint32_t>> bysize_;   // (size, address) of every free block, fast_ mode only
 };
 
 } // namespace wx86

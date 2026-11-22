@@ -402,14 +402,27 @@ void unix_to_filetime(time_t t, uint32_t& lo, uint32_t& hi) {
 }
 
 // WIN32_FIND_DATAA, 320 bytes.
-void fill_find_data(Cpu& c, uint32_t out, const std::string& host, const std::string& name) {
-    struct stat st{}; stat(host.c_str(), &st);
+void fill_find_data(Cpu& c, uint32_t out, const std::string& host, const std::string& name, const dirent* de = nullptr) {
+    bool dir; uint32_t sz; time_t mt;
+#ifdef __vita__
+    if (de) {   // readdir already carries the entry's status; a stat() per entry rescans the directory on the memory card
+        const SceIoStat& vs = de->d_stat;
+        dir = SCE_S_ISDIR(vs.st_mode); sz = dir ? 0 : (uint32_t)vs.st_size;
+        struct tm tm{}; tm.tm_year = vs.st_mtime.year - 1900; tm.tm_mon = vs.st_mtime.month - 1; tm.tm_mday = vs.st_mtime.day;
+        tm.tm_hour = vs.st_mtime.hour; tm.tm_min = vs.st_mtime.minute; tm.tm_sec = vs.st_mtime.second;
+        mt = mktime(&tm);
+    } else
+#endif
+    {
+        (void)de;
+        struct stat st{}; stat(host.c_str(), &st);
+        dir = S_ISDIR(st.st_mode); sz = dir ? 0 : (uint32_t)st.st_size; mt = st.st_mtime;
+    }
     uint8_t buf[320] = {};
-    uint32_t attr = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    uint32_t attr = dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
     std::memcpy(buf, &attr, 4);
-    uint32_t lo, hi; unix_to_filetime(st.st_mtime, lo, hi);
+    uint32_t lo, hi; unix_to_filetime(mt, lo, hi);
     for (int k = 0; k < 3; ++k) { std::memcpy(buf + 4 + 8 * k, &lo, 4); std::memcpy(buf + 8 + 8 * k, &hi, 4); }
-    uint32_t sz = S_ISDIR(st.st_mode) ? 0 : (uint32_t)st.st_size;
     std::memcpy(buf + 32, &sz, 4);
     std::strncpy((char*)buf + 44, name.c_str(), 259);
     c.write(out, buf, sizeof buf);
@@ -418,7 +431,7 @@ void fill_find_data(Cpu& c, uint32_t out, const std::string& host, const std::st
 bool find_next(Cpu& c, FindState& fs, uint32_t out) {
     while (dirent* e = readdir(fs.d)) {
         if (wild_match(fs.pat.c_str(), e->d_name)) {
-            fill_find_data(c, out, fs.dir + "/" + e->d_name, e->d_name);
+            fill_find_data(c, out, fs.dir + "/" + e->d_name, e->d_name, e);
             return true;
         }
     }
@@ -913,7 +926,9 @@ void install_kernel32(d2rt::Bridge& br) {
         std::string gdir = k == std::string::npos ? "" : g.substr(0, k), pat = k == std::string::npos ? g : g.substr(k + 1);
         FindState fs; fs.dir = resolve_path(gdir.empty() ? "." : gdir); fs.pat = pat;
         fs.d = opendir(fs.dir.c_str());
-        { static int n = 0; if (n++ < 40) log("[not-bound] FindFirstFile %s -> dir %s (%s)", g.c_str(), fs.dir.c_str(), fs.d ? "open" : "missing"); }
+        { static int n = 0; if (n++ < 40) {
+            std::string cc; for (auto& kv : g_call_counts) cc += " " + kv.first + "=" + std::to_string(kv.second);
+            log("[not-bound] FindFirstFile %s -> dir %s (%s)%s", g.c_str(), fs.dir.c_str(), fs.d ? "open" : "missing", cc.c_str()); } }
         if (!fs.d || !find_next(c, fs, c.arg(1))) {
             if (fs.d) closedir(fs.d);
             wx86_set_lasterr(c, ERROR_FILE_NOT_FOUND); return INVALID_HANDLE;

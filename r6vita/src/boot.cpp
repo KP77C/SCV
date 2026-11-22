@@ -225,6 +225,7 @@ void sc::guest_mem(uint32_t* hc, uint32_t* hp, uint32_t* vc, uint32_t* vp) {
     *hc = g_heap.used_bytes(); *hp = g_heap.peak(); *vc = g_va.used_bytes(); *vp = g_va.peak();
 }
 
+std::map<std::string, uint64_t> sc::g_call_counts;
 uint32_t sc::surf_alloc(uint32_t n) { return g_va.alloc(n); }
 void sc::surf_free(uint32_t va) { if (va) g_va.free(va); }
 
@@ -421,6 +422,7 @@ int main(int argc, char** argv) {
     cpu->map(kScratchBase, kScratchSize, nullptr, d2rt::P_RW);
     g_heap.init(kHeapBase, kHeapSize, 16, "heap");
     g_va.init(kVaBase, kVaSize, 0x10000, "va");
+    g_heap.set_fast(true); g_va.set_fast(true);   // best fit with a size index (the file index keeps ~25k small blocks live)
     wx86_scratch_init(kScratchBase, kScratchSize);
     wx86_set_perf_frequency(1000000);
     wx86_mem_set_total_phys_mb(304);
@@ -509,6 +511,14 @@ int main(int argc, char** argv) {
             log("[mem] %s(0x%08x, 0x%x, 0x%x, 0x%x) -> 0x%08x ra=0x%08x", tag.c_str(), a0, a1, a2, a3, r, ra);
             return r;
         };
+        br.register_shim("KERNEL32.dll", n, s);
+    }
+    // R6_COUNT=1: count calls to some hot KERNEL32 shims (printed with each FindFirstFile log line).
+    if (std::getenv("R6_COUNT")) for (const char* n : { "HeapAlloc", "HeapFree", "HeapReAlloc", "HeapSize", "FindNextFileA", "GetFileAttributesA",
+                                                        "CreateFileA", "ReadFile", "SetFilePointer", "GetTickCount", "QueryPerformanceCounter", "EnterCriticalSection" }) {
+        const d2rt::Shim* s0 = br.find_shim("KERNEL32.dll", n); if (!s0) continue;
+        d2rt::Shim s = *s0; auto inner = s.fn; std::string tag = n;
+        s.fn = [tag, inner](d2rt::Cpu& c) { ++sc::g_call_counts[tag]; return inner(c); };
         br.register_shim("KERNEL32.dll", n, s);
     }
     br.set_version_resource_source([](const std::string& g) { return read_file(resolve_path(g)); });

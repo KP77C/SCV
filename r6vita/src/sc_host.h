@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <map>
 #include <vector>
 #include <initializer_list>
 
@@ -102,6 +103,7 @@ bool gl_ensure_context();                // create the GL context once (w3_gl.cp
 void gl_swap(d2rt::Cpu& c);              // show the finished GL frame (w3_gl.cpp)
 void install_d3d(d2rt::Bridge& br);      // DirectDraw 1/2/4 + Direct3D 3 over GL (r6_d3d.cpp)
 void install_r6(d2rt::Bridge& br);       // DirectInput, CD audio, misc (r6_shims.cpp)
+extern std::map<std::string, uint64_t> g_call_counts;   // R6_COUNT=1 (boot.cpp)
 uint32_t surf_alloc(uint32_t n);         // guest memory for surfaces (boot.cpp, VirtualAlloc region)
 void surf_free(uint32_t va);
 
