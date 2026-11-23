@@ -52,6 +52,7 @@ Each port feature has its own binding and options:
 - The defaults are the same as 0.1a.
 
 ### Other
+- Fixed: after closing the controls menu, its outline stayed visible in the black bars beside the game.
 - The VPK is now named `scv.vpk`.
 - The app version in the bubble info is 0.2.
 - The menu font is Inter (SIL Open Font License).

@@ -577,8 +577,15 @@ int display_main(SceSize, void*) {
     wx86_vita_pin_self(SCE_KERNEL_CPU_MASK_USER_1, nullptr);
     uint64_t seq = 0, last = 0;
     int slot = 0;
+    bool menu_was_open = false;
     while (!g_quit.load()) {
         ime_step();
+        // The controls menu covers the side bars too, and only the game area
+        // is redrawn each frame: wipe the bars once it closes (K saw its
+        // outline left behind the main menu, 0.2).
+        const bool menu_open = menu_is_open();
+        if (menu_was_open && !menu_open) g_wipe_bars.store(true);
+        menu_was_open = menu_open;
         const uint32_t va = g_src_va.load(), pitch = g_src_pitch.load();
         const uint8_t* src = va ? (const uint8_t*)g_cpu->hostptr(va, pitch * kSrcH) : nullptr;
         if (!src) { sceKernelDelayThread(4000); continue; }
