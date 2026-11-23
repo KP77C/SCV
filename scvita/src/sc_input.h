@@ -52,5 +52,9 @@ void input_warp(int x, int y);
 
 // L+Select asks the platform for its on-screen keyboard.
 bool input_take_ime_request();
+// The controls menu asks for the keyboard too (macro text).
+void input_request_ime();
+// A single key press and release, sent straight to the game.
+void input_tap_key(uint32_t vk);
 
 }  // namespace sc

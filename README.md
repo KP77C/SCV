@@ -60,7 +60,7 @@ These are the defaults. Hold **D-pad right** and press **Start** at any time to 
 | L + D-pad up | Space |
 | Start / L+Start | F10 (menu) / Escape |
 | Select / L+Select | Enter / on-screen keyboard |
-| **D-pad right + Start** | **Controls menu**: rebind everything (see below) |
+| **L + D-pad right + Start** | **Controls menu**: rebind everything (see below) |
 
 Double click a unit to select all units of that type on screen.
 
@@ -68,17 +68,18 @@ These are the default controls. Every one of them can be changed in game.
 
 ### Controls menu
 
-Hold **D-pad right** and press **Start**, anywhere (main menu or in a match), to open the controls menu. The game keeps running underneath, so pause it with the game menu first if a match is on. The menu always uses the D-pad, Cross, Circle and Start, whatever you bind, so you can't lock yourself out.
+Hold **L** and **D-pad right** and press **Start**, anywhere (main menu or in a match), to open the controls menu. By default it also opens the game menu (F10), which pauses a single-player game; you can turn that off under Port features > Controls menu > When this menu opens. The menu always uses the D-pad, Cross, Circle and Start, whatever you bind, so you can't lock yourself out.
 
 - **PC controls**: every PC key (letters, numbers, Ctrl + number, Shift + number, F1-F12, Space, Enter, Esc, Tab, Shift, Ctrl, Alt, arrows and more) and the left and right mouse buttons. Select one and press Cross, then hold any button or combination of buttons (for example L + Cross) and let go to record it. Triangle records a second binding, Square clears. A binding used by two controls shows in red.
 - **Port features**: the command grid, fast cursor, edge scrolling and on-screen keyboard, each with its binding and its options (hold or toggle, fast cursor speed, edge scrolling On / Hold / Toggle / Off).
 - **Cursor and sticks**: normal and fast cursor speed, cursor on the right or left stick, smooth or linear response, inverted up/down, dead zone, map-scroll stick push.
 - **Touch screen**: front touch Move and click / Move only / Off, right click by long press and/or two-finger tap, long-press time, back touchpad as a trackpad or to scroll the map, and its speed.
+- **Cheat macros**: 8 slots. Type the text with the on-screen keyboard (for example `power overwhelming`) and bind each slot to any button or combination. Pressing it opens chat, types the text and presses Enter.
 - **Presets**: a touch screen mouse preset (touch clicks, buttons are all keyboard, R = Shift) and Reset to defaults.
 
 When a button is pressed, the binding with the most buttons that are all held wins, so Cross can send A while D-pad down + Cross sends 1. Keys stay held as long as their buttons are held, so Ctrl or Shift on a button work as real modifiers.
 
-Settings are saved to `ux0:data/StarCraft/scvita_controls.txt` when the menu closes and loaded at start. It is plain text (`bind.key_a=Cross, L + Cross`); delete it to go back to the defaults.
+Settings are saved to `ux0:data/StarCraft/scvita_controls.txt` when the menu closes and loaded at start. It is plain text (`bind.key_a=Cross, L + Cross`, `macro.1=power overwhelming`); delete it to go back to the defaults.
 
 ## Acknowledgements
 

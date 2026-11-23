@@ -30,8 +30,9 @@ enum ActKind : uint8_t {
     ACT_EDGE,       // edge scrolling button (hold or toggle by a tap)
     ACT_GRID,       // command grid (hold or toggle)
     ACT_IME,        // on-screen keyboard
+    ACT_MACRO,      // cheat macro: opens chat, types the slot's text, presses Enter (vk = slot)
 };
-enum ActGroup : uint8_t { GRP_PORT, GRP_MOUSE, GRP_LETTERS, GRP_NUMBERS, GRP_OTHER, GRP_COUNT };
+enum ActGroup : uint8_t { GRP_PORT, GRP_MOUSE, GRP_LETTERS, GRP_NUMBERS, GRP_OTHER, GRP_MACRO, GRP_COUNT };
 
 struct Action {
     const char* id;          // file name, e.g. "key_a"
@@ -50,6 +51,7 @@ enum TouchRight : int { TR_OFF, TR_LONG, TR_TWO, TR_BOTH, TR_COUNT };
 enum RearMode : int { REAR_OFF, REAR_CURSOR, REAR_SCROLL, REAR_COUNT };
 
 constexpr int kMaxActions = 128;
+constexpr int kMacros = 8, kMacroLen = 64;
 
 struct Controls {
     uint32_t bind[kMaxActions][2];   // button masks (PAD_* bits), 0 = unbound
@@ -68,6 +70,8 @@ struct Controls {
     int long_ms;                     // long-press time
     int rear;                        // RearMode (back touchpad)
     int rear_speed_pct;              // back touchpad cursor speed
+    char macro[kMacros][kMacroLen];  // cheat macro texts (empty = unused)
+    bool menu_pauses;                // opening the controls menu also opens the game menu (F10), which pauses
 };
 
 Controls& controls();

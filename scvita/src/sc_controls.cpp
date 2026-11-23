@@ -43,6 +43,7 @@ std::vector<ActStore>& store() {
         { "f7", "F7", 0x76 }, { "f8", "F8", 0x77 }, { "f9", "F9", 0x78 }, { "f10", "F10 (game menu)", 0x79 }, { "f11", "F11", 0x7A }, { "f12", "F12", 0x7B },
     };
     for (auto& o : other) add(o.id, o.name, ACT_KEY, GRP_OTHER, o.vk);
+    for (int i = 0; i < kMacros; ++i) add("macro_" + std::to_string(i + 1), "Macro " + std::to_string(i + 1) + " button", ACT_MACRO, GRP_MACRO, (uint16_t)i);
     for (auto& s : v) { s.a.id = s.id.c_str(); s.a.name = s.name.c_str(); }
     return v;
 }
@@ -102,6 +103,8 @@ void controls_defaults(Controls& c) {
     c.edge = EDGE_HOLD; c.grid_toggle = false;
     c.touch = TOUCH_CLICK; c.touch_right = TR_OFF; c.long_ms = 500;
     c.rear = REAR_OFF; c.rear_speed_pct = 100;
+    std::memset(c.macro, 0, sizeof c.macro);
+    c.menu_pauses = true;
 }
 
 // Touch screen mouse (K, 2026-11-23): the finger moves and clicks (tap = left
@@ -109,7 +112,9 @@ void controls_defaults(Controls& c) {
 // and the buttons are all keyboard. R is Shift (queue orders, add to a group),
 // edge scrolling is always on.
 void controls_preset_touch(Controls& c) {
+    char keep[kMacros][kMacroLen]; std::memcpy(keep, c.macro, sizeof keep);
     controls_defaults(c);
+    std::memcpy(c.macro, keep, sizeof keep);
     bind(c, "left_click", 0); bind(c, "right_click", 0); bind(c, "edge_scroll", 0);
     bind(c, "shift", PAD_R);
     bind(c, "key_6", PAD_DOWN | PAD_TRIANGLE | PAD_CIRCLE);   // R is Shift now; 6 moves off D-pad down + R
@@ -188,6 +193,7 @@ std::vector<Opt> opts(Controls& c) {
         { "long_press_ms", &c.long_ms, nullptr, 200, 1500, nullptr, 0 },
         { "rear_touch", &c.rear, nullptr, 0, REAR_COUNT - 1, kRearId, REAR_COUNT },
         { "rear_speed", &c.rear_speed_pct, nullptr, 20, 400, nullptr, 0 },
+        { "menu_opens_game_menu", nullptr, &c.menu_pauses, 0, 1, kNoYes, 2 },
     };
 }
 }  // namespace
@@ -215,6 +221,9 @@ bool controls_load() {
                 ok = parse_chord(v.substr(0, comma), &m0) && (comma == std::string::npos || parse_chord(v.substr(comma + 1), &m1));
                 if (ok) { n.bind[a][0] = m0; n.bind[a][1] = m1; }
             }
+        } else if (k.compare(0, 6, "macro.") == 0) {
+            const int i = std::atoi(k.c_str() + 6) - 1;
+            if (i >= 0 && i < kMacros) { std::snprintf(n.macro[i], kMacroLen, "%s", v.c_str()); ok = true; }
         } else if (k.compare(0, 7, "button.") == 0 || k.compare(0, 4, "key.") == 0) {
             old_format = true; ok = true;          // first menu build's layout: ignored, defaults kept
         } else {
@@ -236,7 +245,7 @@ bool controls_save() {
     Controls& c = controls();
     FILE* f = std::fopen(controls_path(), "w");
     if (!f) { log("[not-bound] [cause: cannot write %s] controls not saved", controls_path()); return false; }
-    std::fprintf(f, "# StarCraft Vita controls. Written by the controls menu (D-pad right + Start).\n"
+    std::fprintf(f, "# StarCraft Vita controls. Written by the controls menu (L + D-pad right + Start).\n"
                     "# bind.<action>=<buttons>[, <buttons>]  e.g. bind.key_a=Cross, L + Cross   (- = unbound)\n"
                     "# Delete this file to go back to the default controls.\n");
     for (int i = 0; i < action_count(); ++i) {
@@ -249,6 +258,7 @@ bool controls_save() {
         if (o.names) std::fprintf(f, "%s=%s\n", o.key, o.names[o.v ? *o.v : (*o.b ? 1 : 0)]);
         else std::fprintf(f, "%s=%d\n", o.key, *o.v);
     }
+    for (int i = 0; i < kMacros; ++i) if (c.macro[i][0]) std::fprintf(f, "macro.%d=%s\n", i + 1, c.macro[i]);
     const bool ok = std::fclose(f) == 0;
     log("[not-bound] controls: saved %s%s", controls_path(), ok ? "" : " (close failed)");
     return ok;

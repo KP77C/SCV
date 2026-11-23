@@ -1,4 +1,4 @@
-// sc_menu.h — the controls menu (D-pad right + Start, anywhere).
+// sc_menu.h — the controls menu (L + D-pad right + Start, anywhere).
 //
 // A full-screen overlay drawn by us, not by the game: the game keeps running
 // underneath (pause it with its own menu first if a match is on) and gets no
@@ -7,6 +7,7 @@
 #pragma once
 #include <cstdint>
 #include "sc_input.h"
+#include <string>
 
 namespace sc {
 
@@ -19,5 +20,9 @@ bool menu_is_open();
 const uint32_t* menu_image(uint32_t* seq);
 
 constexpr int kMenuW = 960, kMenuH = 544;
+
+// Keyboard text for the menu (a macro being edited).
+bool menu_wants_text();
+void menu_take_text(const std::string& s);
 
 }  // namespace sc

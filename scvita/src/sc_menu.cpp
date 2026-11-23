@@ -16,14 +16,14 @@ namespace sc {
 namespace {
 
 constexpr uint32_t kAllButtons = 0xF3F9u;
-constexpr uint32_t kMenuCombo = PAD_RIGHT | PAD_START;
+constexpr uint32_t kMenuCombo = PAD_L | PAD_RIGHT | PAD_START;
 
 // ---- state -------------------------------------------------------------------
 
-enum Page { PG_MAIN, PG_PC, PG_PORT, PG_CURSOR, PG_TOUCH, PG_COUNT };
-const char* kPageTitle[PG_COUNT] = { "Controls", "PC controls", "Port features", "Cursor and sticks", "Touch screen" };
+enum Page { PG_MAIN, PG_PC, PG_PORT, PG_CURSOR, PG_TOUCH, PG_MACRO, PG_COUNT };
+const char* kPageTitle[PG_COUNT] = { "Controls", "PC controls", "Port features", "Cursor and sticks", "Touch screen", "Cheat macros" };
 
-enum Kind { K_HEADER, K_PAGE, K_BIND, K_INT, K_CHOICE, K_PRESET, K_RESET, K_CLOSE, K_BACK };
+enum Kind { K_HEADER, K_PAGE, K_BIND, K_INT, K_CHOICE, K_MACROTEXT, K_PRESET, K_RESET, K_CLOSE, K_BACK };
 struct Row {
     Kind kind; std::string label; std::string help;
     int arg = 0;                       // page / action
@@ -46,6 +46,7 @@ std::vector<uint32_t> g_img;
 uint32_t g_seq = 0;
 bool g_dirty = true;
 bool g_changed = false;
+int g_text_for = -1;                   // macro slot waiting for keyboard text
 
 void say(const std::string& m) { g_msg = m; g_msg_until = g_now + 3500000; g_dirty = true; }
 
@@ -58,7 +59,7 @@ std::string binds_of(int a) {
     return s;
 }
 // A binding is a conflict when another action uses exactly the same buttons,
-// or it is the menu's own D-pad right + Start.
+// or it is the menu's own L + D-pad right + Start.
 bool conflict(int a, int slot) {
     const Controls& c = controls();
     const uint32_t m = c.bind[a][slot];
@@ -93,6 +94,7 @@ std::vector<Row> build(int page) {
         add(K_PAGE, "Port features", "Command grid, fast cursor, edge scrolling and on-screen keyboard: buttons and options.")->arg = PG_PORT;
         add(K_PAGE, "Cursor and sticks", "Cursor speeds, which stick moves the cursor, stick feel, map scroll stick.")->arg = PG_CURSOR;
         add(K_PAGE, "Touch screen", "Front touch clicks and right clicks, back touchpad.")->arg = PG_TOUCH;
+        add(K_PAGE, "Cheat macros", "Buttons that type a cheat code (or any chat text) for you: Enter, the text, Enter.")->arg = PG_MACRO;
         add(K_PRESET, g_confirm == 2 ? "Press Cross again to load the touch preset" : "Load preset: touch screen mouse",
             "Touch moves and clicks (long press or two fingers = right click), the buttons are all keyboard, R = Shift.");
         add(K_RESET, g_confirm == 1 ? "Press Cross again to reset everything" : "Reset everything to defaults",
@@ -100,8 +102,8 @@ std::vector<Row> build(int page) {
         add(K_CLOSE, "Save and close", "Settings are saved to " + std::string(controls_path()) + ".");
         break;
     case PG_PC: {
-        static const char* heads[GRP_COUNT] = { "", "Mouse", "Letter keys", "Number keys and groups", "Other keys" };
-        for (int g = GRP_MOUSE; g < GRP_COUNT; ++g) {
+        static const char* heads[GRP_COUNT] = { "", "Mouse", "Letter keys", "Number keys and groups", "Other keys", "" };
+        for (int g = GRP_MOUSE; g <= GRP_OTHER; ++g) {
             add(K_HEADER, heads[g], "");
             for (int a = 0; a < action_count(); ++a) if (action(a).group == g) add_bind(a, "");
         }
@@ -122,6 +124,9 @@ std::vector<Row> build(int page) {
         r = add(K_CHOICE, "Edge scrolling", "Scroll the map by pushing the cursor against the screen edge. Hold / Toggle use the button below (toggle: a quick tap on its own).");
         r->choice = &c.edge; r->opts = { "On", "Hold button", "Toggle (tap button)", "Off" };
         add_bind(action_find("edge_scroll"), "The button for Hold / Toggle edge scrolling.");
+        add(K_HEADER, "Controls menu", "");
+        r = add(K_CHOICE, "When this menu opens", "Open game menu: also presses F10, so a single-player game pauses behind this menu. Keep playing: the game keeps running.");
+        r->flag = &c.menu_pauses; r->opts = { "Keep playing", "Open game menu (pause)" };
         add(K_HEADER, "On-screen keyboard", "");
         add_bind(action_find("keyboard"), "Opens the Vita keyboard to type (chat, cheats). Enter is not sent: press your Enter binding.");
         break;
@@ -141,6 +146,16 @@ std::vector<Row> build(int page) {
         r->ival = &c.deadzone_pct; r->lo = 0; r->hi = 50; r->step = 1; r->unit = "%";
         r = add(K_INT, "Map scroll stick push", "How far to push the map-scroll stick before the map moves.");
         r->ival = &c.scroll_pct; r->lo = 10; r->hi = 90; r->step = 5; r->unit = "%";
+        break;
+    }
+    case PG_MACRO: {
+        for (int i = 0; i < kMacros; ++i) {
+            const std::string n = std::to_string(i + 1);
+            add(K_HEADER, "Macro " + n, "");
+            add(K_MACROTEXT, "Macro " + n + " text", "Cross: type the text on the Vita keyboard.  Square: clear. Cheats work in single player.")->arg = i;
+            char id[16]; std::snprintf(id, sizeof id, "macro_%d", i + 1);
+            add_bind(action_find(id), "The button that sends macro " + n + ".");
+        }
         break;
     }
     case PG_TOUCH: {
@@ -168,6 +183,7 @@ std::string value_of(const Row& r) {
     case K_INT: std::snprintf(b, sizeof b, "%d%s", *r.ival, r.unit); return b;
     case K_CHOICE: { int i = r.flag ? (*r.flag ? 1 : 0) : *r.choice; return i >= 0 && i < (int)r.opts.size() ? r.opts[i] : "?"; }
     case K_PAGE: return ">";
+    case K_MACROTEXT: { const char* t = controls().macro[r.arg]; return t[0] ? std::string("\"") + t + "\"" : "(empty)"; }
     default: return "";
     }
 }
@@ -314,6 +330,12 @@ int first_selectable(const std::vector<Row>& rows, int from, int dir) {
 }
 
 void activate(const Row& r, uint32_t pressed) {
+    if (r.kind == K_MACROTEXT) {
+        if (pressed & PAD_SQUARE) { controls().macro[r.arg][0] = 0; g_changed = true; say("Macro text cleared."); }
+        else if (pressed & PAD_CROSS) { g_text_for = r.arg; input_request_ime(); }
+        g_dirty = true;
+        return;
+    }
     if (r.kind == K_BIND) {
         if (pressed & PAD_SQUARE) {
             controls().bind[r.arg][0] = controls().bind[r.arg][1] = 0; g_changed = true;
@@ -393,6 +415,17 @@ void menu_tick(uint32_t raw) {
 }  // namespace
 
 bool menu_is_open() { return g_open; }
+bool menu_wants_text() { return g_open && g_text_for >= 0; }
+void menu_take_text(const std::string& s) {
+    if (g_text_for < 0) return;
+    if (s.empty()) say("Nothing typed, text unchanged.");    // keyboard cancelled
+    else {
+        std::snprintf(controls().macro[g_text_for], kMacroLen, "%s", s.c_str());
+        say("Macro " + std::to_string(g_text_for + 1) + " text saved.");
+        g_changed = true;
+    }
+    g_text_for = -1; g_dirty = true;
+}
 
 const uint32_t* menu_image(uint32_t* seq) {
     if (!g_open) return nullptr;
@@ -406,12 +439,13 @@ void input_frame(const Pad& phys, uint64_t dt_us) {
     g_now += dt_us;
     const uint32_t raw = phys.buttons;
     const uint32_t pressed = raw & ~g_prev_raw;
-    if (!g_open && (pressed & PAD_START) && (raw & PAD_RIGHT)) {
-        // D-pad right + Start: physical, whatever the bindings say.
+    if (!g_open && (pressed & PAD_START) && (raw & (PAD_L | PAD_RIGHT)) == (PAD_L | PAD_RIGHT)) {
+        // L + D-pad right + Start: physical, whatever the bindings say.
         g_open = true; g_page = PG_MAIN; g_sel = 0; g_top = 0; g_changed = false; g_confirm = 0; g_rec = -1;
         std::memset(g_sel_of, 0, sizeof g_sel_of);
         g_swallow = raw;                          // Start/Right must not act inside the menu
         g_dirty = true;
+        if (controls().menu_pauses) input_tap_key(0x79);   // F10: the game's own menu, which pauses single player
         log("[not-bound] controls menu opened");
     } else if (g_open) {
         menu_tick(raw);

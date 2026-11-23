@@ -22,11 +22,12 @@
 //   Select        Enter             L+Select on-screen keyboard (no Enter)
 //   Start         F10               L+Start Escape
 //
-// The controls menu (D-pad right + Start, sc_menu.cpp) changes all of it.
+// The controls menu (L + D-pad right + Start, sc_menu.cpp) changes all of it.
 #include <cstdlib>
 #include "sc_input.h"
 #include "sc_host.h"
 #include "sc_controls.h"
+#include "sc_menu.h"
 
 #include "runtime/win32_shims_window.h"
 
@@ -156,6 +157,25 @@ Active g_active[24]; int g_nactive = 0;
 // with no other button pressed meanwhile, so combos using it never flip it.
 bool g_edge_tap = false; uint64_t g_edge_tap_us = 0;
 
+// Cheat macros: Enter (opens chat), the text, Enter, a few frames apart so
+// the chat box is open before the characters arrive.
+std::string g_macro; int g_macro_stage = -1, g_macro_wait = 0;
+void macro_start(int slot) {
+    const char* t = controls().macro[slot];
+    if (!t[0] || g_macro_stage >= 0) return;
+    g_macro = t; g_macro_stage = 0; g_macro_wait = 0;
+    log("[not-bound] controls: macro %d", slot + 1);
+}
+void macro_step() {
+    if (g_macro_stage < 0 || g_macro_wait-- > 0) return;
+    switch (g_macro_stage) {
+    case 0: key(VK_RETURN, true); key(VK_RETURN, false); break;
+    case 1: for (unsigned char ch : g_macro) if (ch >= 0x20 && ch < 0x7F) post_input(WM_CHAR, ch, 1); break;
+    case 2: key(VK_RETURN, true); key(VK_RETURN, false); g_macro_stage = -2; break;
+    }
+    ++g_macro_stage; g_macro_wait = 4;
+}
+
 bool is_active(int a) { for (int i = 0; i < g_nactive; ++i) if (g_active[i].act == a) return true; return false; }
 
 void activate(int a, uint32_t chord) {
@@ -175,6 +195,7 @@ void activate(int a, uint32_t chord) {
         if (g_grid) g_cell = 4;
         break;
     case ACT_IME: g_ime = true; break;
+    case ACT_MACRO: macro_start(ac.vk); break;
     }
     if (g_nactive < 24) g_active[g_nactive++] = st;
 }
@@ -297,7 +318,10 @@ void touch_step(Pad& p, double guard) {
 uint32_t key_state(uint32_t vk) { return g_down[vk & 0xFF] ? 0x8000u : 0u; }
 bool input_grid_active(int* cell) { if (cell) *cell = g_cell; return g_grid; }
 bool input_take_ime_request() { bool r = g_ime; g_ime = false; return r; }
+void input_request_ime() { g_ime = true; }
+void input_tap_key(uint32_t vk) { if (!g_ref[vk & 0xFF]) { key(vk & 0xFF, true); key(vk & 0xFF, false); } }
 void input_text(const std::string& s) {
+    if (menu_wants_text()) { menu_take_text(s); return; }   // the controls menu asked for it (macro text)
     for (unsigned char ch : s) if (ch >= 0x20 && ch < 0x7F) post_input(WM_CHAR, ch, 1);
 }
 
@@ -312,6 +336,7 @@ void input_tick(const Pad& raw, uint64_t dt_us) {
     g_clock_us += dt_us;
 
     bindings_step(b, pressed, released);
+    macro_step();
     if (!cfg.fast_toggle) g_fast_on = false;
     if (cfg.edge != EDGE_TOGGLE) g_edge_on = false;
     const bool fast = g_fast_held || g_fast_on;
