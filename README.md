@@ -29,7 +29,11 @@ cd ../../scvita
 WXTAG=_prof TARGET=vita ./build.sh      # -> scvita/build-vita/scv.vpk
 ```
 
+Art in `scvita/sce_sys/` (icon and LiveArea) is packed in if present; `NOART=1` leaves it out.
+
 Leave out `TARGET=vita` to build for Linux ARM (`qemu-arm`) instead, for testing on a PC.
+
+See [CHANGELOG.md](CHANGELOG.md) for what's new in each version.
 
 ## Installing
 

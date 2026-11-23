@@ -24,12 +24,13 @@ if [ "${TARGET:-}" = vita ]; then
     vita-elf-create "$OUT/scvita.elf" "$OUT/scvita.velf"
     vita-make-fself "$OUT/scvita.velf" "$OUT/eboot.bin"
     # ATTRIBUTE2=12: the extended user memory budget (no DMR), for K's 304 MiB.
-    vita-mksfoex -s TITLE_ID=SCVITA001 -s STITLE="StarCraft Vita" -d ATTRIBUTE2=12 "StarCraft Vita" "$OUT/sce_sys/param.sfo"
+    vita-mksfoex -s APP_VER=00.20 -s TITLE_ID=SCVITA001 -s STITLE="StarCraft Vita" -d ATTRIBUTE2=12 "StarCraft Vita" "$OUT/sce_sys/param.sfo"
     # Optional art (icon0.png, livearea/contents/{bg,startup}.png + template.xml):
     # not in the repository, since it is the owner's local artwork.
+    # NOART=1 leaves it out (the public release build).
     EXTRA_A=()
     for f in icon0.png livearea/contents/bg.png livearea/contents/startup.png livearea/contents/template.xml; do
-        if [ -f "$ROOT/sce_sys/$f" ]; then
+        if [ -z "$NOART" ] && [ -f "$ROOT/sce_sys/$f" ]; then
             mkdir -p "$OUT/sce_sys/$(dirname "$f")"; cp "$ROOT/sce_sys/$f" "$OUT/sce_sys/$f"
             EXTRA_A+=(-a "sce_sys/$f=sce_sys/$f")
         fi
