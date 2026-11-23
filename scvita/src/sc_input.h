@@ -56,5 +56,7 @@ bool input_take_ime_request();
 void input_request_ime();
 // A single key press and release, sent straight to the game.
 void input_tap_key(uint32_t vk);
+// Send cheat macro <slot> after <delay_frames> frames (from the controls menu).
+void input_run_macro(int slot, int delay_frames);
 
 }  // namespace sc

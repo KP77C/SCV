@@ -43,6 +43,7 @@ Each port feature has its own binding and options:
 ### Cheat macros
 - 8 slots. Type the text with the on-screen keyboard (for example `power overwhelming`).
 - Bind each slot to any button or combo. Pressing it opens chat, types the text and presses Enter.
+- Or send one straight from the menu with **Use macro N now**. This closes the controls menu and the game menu first.
 
 ### Settings
 - Saved to `ux0:data/StarCraft/scvita_controls.txt` when the menu closes, and loaded at start.

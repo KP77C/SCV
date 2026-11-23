@@ -319,6 +319,10 @@ uint32_t key_state(uint32_t vk) { return g_down[vk & 0xFF] ? 0x8000u : 0u; }
 bool input_grid_active(int* cell) { if (cell) *cell = g_cell; return g_grid; }
 bool input_take_ime_request() { bool r = g_ime; g_ime = false; return r; }
 void input_request_ime() { g_ime = true; }
+void input_run_macro(int slot, int delay_frames) {
+    macro_start(slot);
+    if (g_macro_stage == 0) g_macro_wait = delay_frames;
+}
 void input_tap_key(uint32_t vk) { if (!g_ref[vk & 0xFF]) { key(vk & 0xFF, true); key(vk & 0xFF, false); } }
 void input_text(const std::string& s) {
     if (menu_wants_text()) { menu_take_text(s); return; }   // the controls menu asked for it (macro text)

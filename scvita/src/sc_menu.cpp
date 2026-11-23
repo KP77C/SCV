@@ -23,7 +23,7 @@ constexpr uint32_t kMenuCombo = PAD_L | PAD_RIGHT | PAD_START;
 enum Page { PG_MAIN, PG_PC, PG_PORT, PG_CURSOR, PG_TOUCH, PG_MACRO, PG_COUNT };
 const char* kPageTitle[PG_COUNT] = { "Controls", "PC controls", "Port features", "Cursor and sticks", "Touch screen", "Cheat macros" };
 
-enum Kind { K_HEADER, K_PAGE, K_BIND, K_INT, K_CHOICE, K_MACROTEXT, K_PRESET, K_RESET, K_CLOSE, K_BACK };
+enum Kind { K_HEADER, K_PAGE, K_BIND, K_INT, K_CHOICE, K_MACROTEXT, K_MACRORUN, K_PRESET, K_RESET, K_CLOSE, K_BACK };
 struct Row {
     Kind kind; std::string label; std::string help;
     int arg = 0;                       // page / action
@@ -155,6 +155,7 @@ std::vector<Row> build(int page) {
             add(K_MACROTEXT, "Macro " + n + " text", "Cross: type the text on the Vita keyboard.  Square: clear. Cheats work in single player.")->arg = i;
             char id[16]; std::snprintf(id, sizeof id, "macro_%d", i + 1);
             add_bind(action_find(id), "The button that sends macro " + n + ".");
+            add(K_MACRORUN, "Use macro " + n + " now", "Cross: close this menu (and the game menu) and send the macro.")->arg = i;
         }
         break;
     }
@@ -183,6 +184,7 @@ std::string value_of(const Row& r) {
     case K_INT: std::snprintf(b, sizeof b, "%d%s", *r.ival, r.unit); return b;
     case K_CHOICE: { int i = r.flag ? (*r.flag ? 1 : 0) : *r.choice; return i >= 0 && i < (int)r.opts.size() ? r.opts[i] : "?"; }
     case K_PAGE: return ">";
+    case K_MACRORUN: return controls().macro[r.arg][0] ? "Cross" : "(no text)";
     case K_MACROTEXT: { const char* t = controls().macro[r.arg]; return t[0] ? std::string("\"") + t + "\"" : "(empty)"; }
     default: return "";
     }
@@ -334,6 +336,15 @@ void activate(const Row& r, uint32_t pressed) {
         if (pressed & PAD_SQUARE) { controls().macro[r.arg][0] = 0; g_changed = true; say("Macro text cleared."); }
         else if (pressed & PAD_CROSS) { g_text_for = r.arg; input_request_ime(); }
         g_dirty = true;
+        return;
+    }
+    if (r.kind == K_MACRORUN) {
+        if (!(pressed & PAD_CROSS)) return;
+        if (!controls().macro[r.arg][0]) { say("Type a text for this macro first."); g_dirty = true; return; }
+        const bool paused = controls().menu_pauses;
+        close_menu();
+        if (paused) input_tap_key(0x1B);          // Esc: close the game menu we opened, so chat can open
+        input_run_macro(r.arg, paused ? 10 : 2);  // a few frames later, once the game menu is gone
         return;
     }
     if (r.kind == K_BIND) {

@@ -78,7 +78,7 @@ Hold **L** and **D-pad right** and press **Start**, anywhere (main menu or in a 
 - **Port features**: the command grid, fast cursor, edge scrolling and on-screen keyboard, each with its binding and its options (hold or toggle, fast cursor speed, edge scrolling On / Hold / Toggle / Off).
 - **Cursor and sticks**: normal and fast cursor speed, cursor on the right or left stick, smooth or linear response, inverted up/down, dead zone, map-scroll stick push.
 - **Touch screen**: front touch Move and click / Move only / Off, right click by long press and/or two-finger tap, long-press time, back touchpad as a trackpad or to scroll the map, and its speed.
-- **Cheat macros**: 8 slots. Type the text with the on-screen keyboard (for example `power overwhelming`) and bind each slot to any button or combination. Pressing it opens chat, types the text and presses Enter.
+- **Cheat macros**: 8 slots. Type the text with the on-screen keyboard (for example `power overwhelming`) and bind each slot to any button or combination. Pressing it opens chat, types the text and presses Enter. You can also send one from the menu with **Use macro N now**.
 - **Presets**: a touch screen mouse preset (touch clicks, buttons are all keyboard, R = Shift) and Reset to defaults.
 
 When a button is pressed, the binding with the most buttons that are all held wins, so Cross can send A while D-pad down + Cross sends 1. Keys stay held as long as their buttons are held, so Ctrl or Shift on a button work as real modifiers.
