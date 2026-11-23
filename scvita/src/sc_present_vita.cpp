@@ -22,6 +22,7 @@
 #ifdef __vita__
 #include "sc_host.h"
 #include "sc_input.h"
+#include "sc_menu.h"
 
 #include "runtime/ds_emul.h"
 #include "runtime/guest_thread.h"
@@ -101,6 +102,9 @@ const char* kVsCol =
     "{ vPosition = float4(aPosition, 0.0, 1.0); vColor = aColor; }\n";
 const char* kFsCol =
     "float4 main(float4 vColor : COLOR0) : COLOR { return vColor; }\n";
+// Controls menu: a 960x544 RGBA image over the whole screen, alpha-blended.
+const char* kFsUi =
+    "float4 main(float2 vTexcoord : TEXCOORD0, uniform sampler2D tex) : COLOR { return tex2D(tex, vTexcoord); }\n";
 
 // ---- GPU memory -------------------------------------------------------------
 
@@ -192,6 +196,9 @@ SceGxmSyncObject* g_sync[kBuffers];
 SceGxmDepthStencilSurface g_depth;
 SceGxmVertexProgram* g_vp_tex = nullptr; SceGxmFragmentProgram* g_fp_tex = nullptr;
 SceGxmVertexProgram* g_vp_col = nullptr; SceGxmFragmentProgram* g_fp_col = nullptr;
+SceGxmVertexProgram* g_vp_ui = nullptr; SceGxmFragmentProgram* g_fp_ui = nullptr;
+Block g_ui_mem; SceGxmTexture g_ui_tex[kSlots]; uint32_t* g_ui_pix[kSlots]; uint32_t g_ui_seq[kSlots];
+float* g_ui_vtx = nullptr;
 SceGxmTexture g_tex[kSlots];
 uint8_t* g_tex_pix[kSlots]; uint32_t* g_tex_pal[kSlots];
 struct ColVtx { float x, y; uint8_t r, g, b, a; };
@@ -290,7 +297,7 @@ void* patcher_alloc(void*, unsigned int n) { return std::malloc(n); }
 void patcher_free(void*, void* p) { std::free(p); }
 
 bool make_program(SceGxmShaderPatcher* sp, const char* vs, const char* fs, bool colour,
-                  SceGxmVertexProgram** vp, SceGxmFragmentProgram** fp) {
+                  SceGxmVertexProgram** vp, SceGxmFragmentProgram** fp, bool blended = false) {
     SceGxmProgram* v = compile(vs, false); SceGxmProgram* f = compile(fs, true);
     if (!v || !f) return false;
     SceGxmShaderPatcherId vid, fid;
@@ -313,7 +320,7 @@ bool make_program(SceGxmShaderPatcher* sp, const char* vs, const char* fs, bool 
     blend.colorSrc = SCE_GXM_BLEND_FACTOR_SRC_ALPHA; blend.colorDst = SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE; blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
     return sceGxmShaderPatcherCreateFragmentProgram(sp, fid, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4, SCE_GXM_MULTISAMPLE_NONE,
-                                                    colour ? &blend : nullptr, v, fp) >= 0;
+                                                    (colour || blended) ? &blend : nullptr, v, fp) >= 0;
 }
 
 bool gpu_init() {
@@ -369,6 +376,7 @@ bool gpu_init() {
     if ((rc = sceGxmShaderPatcherCreate(&pp, &g_patcher)) < 0) { log("[not-bound] [cause: sceGxmShaderPatcherCreate rc=0x%08x]", (unsigned)rc); return false; }
     if (!make_program(g_patcher, kVsTex, kFsTex, false, &g_vp_tex, &g_fp_tex)) { log("[not-bound] [cause: frame shader]"); return false; }
     if (!make_program(g_patcher, kVsCol, kFsCol, true, &g_vp_col, &g_fp_col)) { log("[not-bound] [cause: overlay shader]"); return false; }
+    if (!make_program(g_patcher, kVsTex, kFsUi, false, &g_vp_ui, &g_fp_ui, true)) { log("[not-bound] [cause: menu shader]"); return false; }
 
     // Textures + palettes (CDRAM, CPU-write only), overlay vertices and the
     // static quad (uncached LPDDR, CPU-write only).
@@ -398,6 +406,19 @@ bool gpu_init() {
         std::memcpy(g_ovl_idx + c * 6, t, sizeof t);
     }
     for (int i = 0; i < kSlots; ++i) g_ovl[i] = (ColVtx*)(vp + 4096 + i * ovl_bytes);
+    // Controls menu: one full-screen RGBA texture per slot in VRAM (3 x 2 MiB),
+    // rewritten only when the menu image changes.
+    const uint32_t ui_bytes = kMenuW * kMenuH * 4;
+    if (!alloc_gpu(g_ui_mem, CD, kSlots * ui_bytes, RO, "sc_menu")) return false;
+    for (int i = 0; i < kSlots; ++i) {
+        g_ui_pix[i] = (uint32_t*)((uint8_t*)g_ui_mem.p + i * ui_bytes); g_ui_seq[i] = ~0u;
+        sceGxmTextureInitLinear(&g_ui_tex[i], g_ui_pix[i], SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, kMenuW, kMenuH, 0);
+        sceGxmTextureSetMinFilter(&g_ui_tex[i], SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMagFilter(&g_ui_tex[i], SCE_GXM_TEXTURE_FILTER_POINT);
+    }
+    g_ui_vtx = (float*)(vp + 2048);
+    const float uq[16] = { -1, 1, 0, 0,   1, 1, 1, 0,   -1, -1, 0, 1,   1, -1, 1, 1 };
+    std::memcpy(g_ui_vtx, uq, sizeof uq);
 
     volatile unsigned int* nreg = sceGxmGetNotificationRegion();
     for (int i = 0; i < kSlots; ++i) { g_notif[i].address = nreg + i; g_notif[i].value = 0; *g_notif[i].address = 0; }
@@ -576,6 +597,9 @@ int display_main(SceSize, void*) {
         const uint32_t* pal = g_pal[g_pal_seq.load() & 1];
         for (int i = 0; i < 256; ++i) g_tex_pal[slot][i] = pal[i] | 0xFF000000u;   // 0x00BBGGRR -> ABGR, opaque
         const bool grid = g_grid_on.load();
+        uint32_t ui_seq = 0;
+        const uint32_t* ui = menu_image(&ui_seq);   // read racily; a torn frame is redrawn on the next change
+        if (ui && g_ui_seq[slot] != ui_seq) { std::memcpy(g_ui_pix[slot], ui, kMenuW * kMenuH * 4); g_ui_seq[slot] = ui_seq; }
         if (grid) build_overlay(g_ovl[slot], g_grid_cell.load());
 
         const uint64_t t0 = wx86_now_us();
@@ -590,6 +614,12 @@ int display_main(SceSize, void*) {
             sceGxmSetVertexProgram(g_ctx, g_vp_col); sceGxmSetFragmentProgram(g_ctx, g_fp_col);
             sceGxmSetVertexStream(g_ctx, 0, g_ovl[slot]);
             sceGxmDraw(g_ctx, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, g_ovl_idx, 54);
+        }
+        if (ui) {
+            sceGxmSetVertexProgram(g_ctx, g_vp_ui); sceGxmSetFragmentProgram(g_ctx, g_fp_ui);
+            sceGxmSetFragmentTexture(g_ctx, 0, &g_ui_tex[slot]);
+            sceGxmSetVertexStream(g_ctx, 0, g_ui_vtx);
+            sceGxmDraw(g_ctx, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16, g_quad_idx, 4);
         }
         g_notif[slot].value = (unsigned)++seq;
         sceGxmEndScene(g_ctx, nullptr, &g_notif[slot]);
@@ -710,9 +740,9 @@ void present(d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t
     }
     if (g_ime_state.load() == 2) p = Pad();            // the keyboard owns the pad while it is open
     uint64_t dt = last_us ? now - last_us : 16667; if (dt > 100000) dt = 100000;
-    input_tick(p, dt);
+    input_frame(p, dt);
     last_us = now;
-    int cell = 4; g_grid_on.store(input_grid_active(&cell)); g_grid_cell.store(cell);
+    int cell = 4; g_grid_on.store(input_grid_active(&cell) && !menu_is_open()); g_grid_cell.store(cell);
     if (input_take_ime_request() && g_ime_state.load() == 0) g_ime_state.store(1);
     if (g_ime_state.load() == 3) { input_text(g_ime_text); g_ime_state.store(0); }
 }

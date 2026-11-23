@@ -18,6 +18,7 @@
 #ifndef __vita__
 #include "sc_host.h"
 #include "sc_input.h"
+#include "sc_menu.h"
 
 #include "runtime/host_clock.h"
 #include "runtime/ds_emul.h"
@@ -56,6 +57,33 @@ std::vector<PadStep> load_script(const char* path) {
         v.push_back(s);
     }
     std::fclose(f); return v;
+}
+// Host preview of the controls menu: the game frame scaled to 725x544 and
+// pillarboxed as on the Vita, with the menu image blended on top (24-bit BMP).
+void write_menu_bmp(const char* path, d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t h, const uint32_t* pal, const uint32_t* ui) {
+    FILE* f = std::fopen(path, "wb"); if (!f) return;
+    const uint32_t W = kMenuW, H = kMenuH, row = W * 3, data = row * H, off = 54;
+    uint8_t hdr[54] = { 'B', 'M' };
+    uint32_t v = off + data; std::memcpy(hdr + 2, &v, 4); std::memcpy(hdr + 10, &off, 4);
+    v = 40; std::memcpy(hdr + 14, &v, 4); std::memcpy(hdr + 18, &W, 4);
+    int32_t ih = (int32_t)H; std::memcpy(hdr + 22, &ih, 4);
+    uint16_t planes = 1, bpp = 24; std::memcpy(hdr + 26, &planes, 2); std::memcpy(hdr + 28, &bpp, 2);
+    std::memcpy(hdr + 34, &data, 4);
+    std::fwrite(hdr, 1, 54, f);
+    std::vector<uint8_t> src(w * h), line(row);
+    for (uint32_t y = 0; y < h; ++y) c.read(pixels + y * pitch, src.data() + y * w, w);
+    for (int y = (int)H - 1; y >= 0; --y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            int r = 0, g = 0, b = 0;
+            const int gx = ((int)x - 117) * 640 / 725;
+            if (gx >= 0 && gx < 640 && w == 640 && h == 480) { const uint32_t p = pal[src[(y * 480 / 544) * w + gx]]; r = p & 0xFF; g = (p >> 8) & 0xFF; b = (p >> 16) & 0xFF; }
+            const uint32_t u = ui[y * W + x]; const int a = u >> 24;
+            r += (((int)(u & 0xFF)) - r) * a / 255; g += (((int)((u >> 8) & 0xFF)) - g) * a / 255; b += (((int)((u >> 16) & 0xFF)) - b) * a / 255;
+            line[x * 3] = (uint8_t)b; line[x * 3 + 1] = (uint8_t)g; line[x * 3 + 2] = (uint8_t)r;
+        }
+        std::fwrite(line.data(), 1, row, f);
+    }
+    std::fclose(f);
 }
 uint64_t g_frames = 0, g_last_us = 0, g_win_start = 0, g_win_frames = 0;
 
@@ -132,7 +160,18 @@ void present(d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t
             if (st.frame == g_frames && !st.text.empty()) input_text(st.text);
             if (st.frame == g_frames && st.wx >= 0) input_warp(st.wx, st.wy);
         }
-        input_tick(cur, 16667);
+        input_frame(cur, 16667);
+    }
+    {   // Menu previews (SC_SHOTS): one image each time the menu changes.
+        static uint32_t last_seq = ~0u; uint32_t seq = 0;
+        const uint32_t* ui = menu_image(&seq);
+        const char* d = std::getenv("SC_SHOTS");
+        if (ui && d && seq != last_seq) {
+            mkdir(d, 0777);
+            char p[512]; std::snprintf(p, sizeof p, "%s/menu_%06llu.bmp", d, (unsigned long long)g_frames);
+            write_menu_bmp(p, c, pixels, pitch, w, h, pal, ui);
+        }
+        last_seq = ui ? seq : ~0u;
     }
     static const char* dir = std::getenv("SC_SHOTS");
     static uint64_t every = std::getenv("SC_SHOT_EVERY") ? std::strtoull(std::getenv("SC_SHOT_EVERY"), nullptr, 10) : 30;

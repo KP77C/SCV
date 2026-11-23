@@ -1,5 +1,11 @@
 // sc_input.cpp — K's control scheme (2026-11-20), see sc_input.h.
 //
+// Everything below is the DEFAULT layout. The player can move every job to
+// another button, change the keys, and change the cursor/stick/touch options
+// in the controls menu (D-pad right + Start, sc_menu.cpp); sc_controls.h holds
+// those settings. This file works on logical buttons (the default ones), and
+// the physical pad is remapped onto them first.
+//
 //   Right stick   cursor (D-pad right held: faster; L held: edge scrolling)
 //   Touch screen  cursor under the finger; tap = left click, touch and move = drag
 //   Left stick    map scroll (arrow keys)
@@ -19,6 +25,7 @@
 #include <cstdlib>
 #include "sc_input.h"
 #include "sc_host.h"
+#include "sc_controls.h"
 
 #include "runtime/win32_shims_window.h"
 
@@ -59,7 +66,11 @@ uint32_t scan(uint32_t vk) {
     case VK_RETURN: return 0x1C; case VK_CONTROL: return 0x1D; case VK_SPACE: return 0x39;
     case VK_LEFT: return 0x4B; case VK_RIGHT: return 0x4D; case VK_UP: return 0x48; case VK_DOWN: return 0x50;
     case VK_F10: return 0x44; case VK_ESCAPE: return 0x01;
+    case 0x09: return 0x0F; case 0x08: return 0x0E; case 0x2E: return 0x53; case 0x10: return 0x2A;
+    case 0x24: return 0x47; case 0x13: return 0x45; case 0x7A: return 0x57; case 0x7B: return 0x58;
+    case 0xBB: return 0x0D; case 0xBD: return 0x0C; case '0': return 0x0B;
     default: {
+        if (vk >= 0x70 && vk <= 0x78) return 0x3B + (vk - 0x70);   // F1-F9
         static const char* row = "QWERTYUIOP\0\0\0\0ASDFGHJKL\0\0\0\0\0ZXCVBNM";
         if (vk >= '1' && vk <= '9') return 2 + (vk - '1');
         for (int i = 0; i < 38; ++i) if (row[i] && (uint32_t)row[i] == vk) return 0x10 + i;
@@ -113,7 +124,7 @@ void rbutton(bool down) { if (g_rbtn != down) { g_rbtn = down; g_down[2] = down;
 // Stick deflection in -1..1 with a dead zone.
 double axis(uint8_t v) {
     double d = (int)v - 128; d /= 127.0;
-    const double dz = 0.18;
+    const double dz = controls().deadzone_pct / 100.0;
     if (std::fabs(d) < dz) return 0;
     return (d > 0 ? d - dz : d + dz) / (1 - dz);
 }
@@ -133,22 +144,49 @@ void input_text(const std::string& s) {
 
 void input_warp(int x, int y) { move_to(x, y); g_fx = x; g_fy = y; }
 
-void input_tick(const Pad& p, uint64_t dt_us) {
+void input_tick(const Pad& raw, uint64_t dt_us) {
+    const Controls& cfg = controls();
+    // Physical -> logical: the player's layout, then the stick swap.
+    Pad p = raw;
+    p.buttons = controls_remap(raw.buttons);
+    if (cfg.cursor_left_stick) { p.lx = raw.rx; p.ly = raw.ry; p.rx = raw.lx; p.ry = raw.ly; }
     const uint32_t b = p.buttons, pressed = b & ~g_prev, released = g_prev & ~b;
     const bool L = b & PAD_L;
     const double dt = dt_us / 1e6;
     g_clock_us += dt_us;
 
+    // Toggles: fast cursor (tap D-pad right) and edge scrolling (tap L alone:
+    // pressed and let go within 350 ms with no other button pressed meanwhile,
+    // so L combos never flip it).
+    static bool fast_on = false, edge_on = false, l_alone = false;
+    static uint64_t l_down_us = 0;
+    if (cfg.fast_toggle && (pressed & PAD_RIGHT)) fast_on = !fast_on;
+    if (!cfg.fast_toggle) fast_on = false;
+    if (pressed & PAD_L) { l_alone = true; l_down_us = g_clock_us; }
+    if (pressed & ~PAD_L) l_alone = false;
+    if ((released & PAD_L) && l_alone && g_clock_us - l_down_us <= 350000 && cfg.edge == EDGE_TOGGLE) {
+        edge_on = !edge_on;
+        log("[not-bound] controls: edge scrolling %s", edge_on ? "on" : "off");
+    }
+    const bool fast = cfg.fast_toggle ? fast_on : (b & PAD_RIGHT) != 0;
+    const bool edge = cfg.edge == EDGE_ON || (cfg.edge == EDGE_HOLD && L) || (cfg.edge == EDGE_TOGGLE && edge_on);
+    const double guard = edge ? 0 : kEdgeGuard;
+
     // Command grid: hold D-pad up, pick with the right stick, press R to
     // click the cell (K, 2026-11-20). The grid stays up while D-pad up is
     // held, so several buttons can be pressed in a row; releasing closes it.
     // L + D-pad up = Space (K, build 21); the grid opens only without L.
-    static bool space_by_up = false;
-    if ((pressed & kBtnGrid) && L) { key(VK_SPACE, true); space_by_up = true; }
-    else if (pressed & kBtnGrid) { g_grid = true; g_cell = 4; }
-    if ((released & kBtnGrid) && space_by_up) { key(VK_SPACE, false); space_by_up = false; }
+    // Grid toggle (player option): a tap opens it, another tap closes it.
+    static uint32_t mod_grid_vk = 0;
+    static bool grid_opened_now = false;
+    grid_opened_now = false;
+    if ((pressed & kBtnGrid) && L) { if (cfg.key_mod_grid) { mod_grid_vk = cfg.key_mod_grid; key(mod_grid_vk, true); } }
+    else if ((pressed & kBtnGrid) && cfg.grid_toggle && g_grid) g_grid = false;
+    else if (pressed & kBtnGrid) { g_grid = true; g_cell = 4; grid_opened_now = true; }
+    if ((released & kBtnGrid) && mod_grid_vk) { key(mod_grid_vk, false); mod_grid_vk = 0; }
     if (g_grid) g_cell = grid_cell(p);
-    if ((released & kBtnGrid) && g_grid) g_grid = false;
+    if ((released & kBtnGrid) && g_grid && !cfg.grid_toggle) g_grid = false;
+    (void)grid_opened_now;
     // Shoulders as digits (K, build 18): D-pad left + L/R = Ctrl+5/6 (Ctrl is
     // already held by D-pad left), D-pad down + L/R = 5/6 (K, build 20). D-pad up
     // is only the grid now, so R there always clicks the picked cell, centre included.
@@ -174,8 +212,9 @@ void input_tick(const Pad& p, uint64_t dt_us) {
 
     // Front touch screen: the cursor goes where the finger is and follows a
     // drag (K, 2026-11-20). Same edge rule as the stick: without L it stops 2 px short.
+    if (cfg.touch == TOUCH_OFF) p.touch = false;
     if (!g_grid && p.touch) {
-        const double m = L ? 0 : kEdgeGuard;
+        const double m = guard;
         double x = p.tx, y = p.ty;
         x = x < m ? m : x > 639 - m ? 639 - m : x; y = y < m ? m : y > 479 - m ? 479 - m : y;
         if ((int)x != (int)g_fx || (int)y != (int)g_fy) move_to((int)x, (int)y);
@@ -183,25 +222,27 @@ void input_tick(const Pad& p, uint64_t dt_us) {
         // Touch clicks too (K, build 20): finger down = left button down where
         // it landed, finger up = release. A tap is a click (two quick taps a
         // double click), and moving while touching drags a selection box.
-        if (!g_touch_btn && !g_lbtn) { lbutton(true); g_touch_btn = true; }
+        if (cfg.touch == TOUCH_CLICK && !g_touch_btn && !g_lbtn) { lbutton(true); g_touch_btn = true; }
     }
     if (!p.touch && g_touch_btn) { lbutton(false); g_touch_btn = false; }
 
     // Cursor from the right stick (not while the grid owns it).
     if (!g_grid && !p.touch) {
         double x = axis(p.rx), y = axis(p.ry);
+        if (cfg.invert_y) y = -y;
         if (g_stick_hold) { if (x || y) x = y = 0; else g_stick_hold = false; }
         if (x || y) {
             // The game can move the cursor itself (SetCursorPos when a mission starts),
             // so pick up from where it really is.
             uint32_t cx, cy; wx86_get_cursor(&cx, &cy);
             if ((int)cx != (int)g_fx || (int)cy != (int)g_fy) { g_fx = cx; g_fy = cy; }
-            const double speed = ((b & PAD_RIGHT) ? 1400.0 : 560.0) * dt;   // px per second at full deflection; D-pad right = fast (K, build 21)
-            g_fx += x * std::fabs(x) * speed; g_fy += y * std::fabs(y) * speed;
-            const double m = L ? 0 : kEdgeGuard;
+            const double speed = (fast ? cfg.fast_speed : cfg.cursor_speed) * dt;   // px per second at full deflection; D-pad right = fast (K, build 21)
+            const double cx2 = cfg.linear ? x : x * std::fabs(x), cy2 = cfg.linear ? y : y * std::fabs(y);
+            g_fx += cx2 * speed; g_fy += cy2 * speed;
+            const double m = guard;
             g_fx = g_fx < m ? m : g_fx > 639 - m ? 639 - m : g_fx; g_fy = g_fy < m ? m : g_fy > 479 - m ? 479 - m : g_fy;
             move_to((int)g_fx, (int)g_fy);
-        } else if (!L) {
+        } else if (guard > 0) {
             // Edge scrolling only while L is held (K, 2026-11-20): when L is let
             // go with the cursor on an edge, step it back inside.
             uint32_t cx, cy; wx86_get_cursor(&cx, &cy);
@@ -216,8 +257,9 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     // its own set speed, so L does not change it yet.
     {
         double x = axis(p.lx), y = axis(p.ly);
-        key(VK_LEFT, x < -0.35); key(VK_RIGHT, x > 0.35);
-        key(VK_UP, y < -0.35);   key(VK_DOWN, y > 0.35);
+        const double t = cfg.scroll_pct / 100.0;
+        key(VK_LEFT, x < -t); key(VK_RIGHT, x > t);
+        key(VK_UP, y < -t);   key(VK_DOWN, y > t);
     }
 
     // Mouse buttons. R = left click, L+R = right click, Cross = right click.
@@ -231,10 +273,11 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     g_sh_owned &= ~released;
 
     // Face buttons.
+    // Keys come from the settings (defaults A/A, S/H, R/G, P/R).
     struct Face { uint32_t bit; uint32_t plain, with_l, digit; };
-    static const Face faces[] = {
-        { PAD_CROSS, 'A', 'A', '1' }, { PAD_SQUARE, 'S', 'H', '2' },
-        { PAD_TRIANGLE, 'R', 'G', '3' }, { PAD_CIRCLE, 'P', 'R', '4' },
+    const Face faces[] = {
+        { PAD_CROSS, cfg.key[0], cfg.key_mod[0], '1' }, { PAD_SQUARE, cfg.key[1], cfg.key_mod[1], '2' },
+        { PAD_TRIANGLE, cfg.key[2], cfg.key_mod[2], '3' }, { PAD_CIRCLE, cfg.key[3], cfg.key_mod[3], '4' },
     };
     for (int i = 0; i < 4; ++i) {
         const Face& f = faces[i];
@@ -247,7 +290,7 @@ void input_tick(const Pad& p, uint64_t dt_us) {
                 if (ctrl) key(VK_CONTROL, false);
                 key(f.digit, true); g_face_key[i] = f.digit | (ctrl ? 0x100 : 0);
             } else {
-                uint32_t vk = L ? f.with_l : f.plain; key(vk, true); g_face_key[i] = vk;
+                uint32_t vk = L ? f.with_l : f.plain; if (vk) key(vk, true); g_face_key[i] = vk;
             }
         }
         if (released & f.bit) {
@@ -268,10 +311,11 @@ void input_tick(const Pad& p, uint64_t dt_us) {
     // Start = F10 (game menu), L+Start = Escape (K, 2026-11-20). The key that
     // went down is the one released, even if L changes in between.
     static uint32_t start_vk = 0;
-    if (pressed & PAD_START) { start_vk = L ? VK_ESCAPE : VK_F10; key(start_vk, true); }
+    if (pressed & PAD_START) { start_vk = L ? cfg.key_mod_start : cfg.key_start; if (start_vk) key(start_vk, true); }
     if ((released & PAD_START) && start_vk) { key(start_vk, false); start_vk = 0; }
-    if (pressed & PAD_SELECT) { if (L) g_ime = true; else key(VK_RETURN, true); }
-    if (released & PAD_SELECT) key(VK_RETURN, false);
+    static uint32_t select_vk = 0;
+    if (pressed & PAD_SELECT) { if (L) g_ime = true; else if (cfg.key_select) { select_vk = cfg.key_select; key(select_vk, true); } }
+    if ((released & PAD_SELECT) && select_vk) { key(select_vk, false); select_vk = 0; }
 
     g_prev = b;
 }
