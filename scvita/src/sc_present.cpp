@@ -45,6 +45,12 @@ std::vector<PadStep> load_script(const char* path) {
         if (std::sscanf(line, "%llu touch %d %d", &tf, &gx, &gy) == 3) {  // "<frame> touch x y": finger on the screen (640x480)
             PadStep s; s.frame = tf; s.pad = v.empty() ? Pad() : v.back().pad; s.pad.touch = true; s.pad.tx = gx; s.pad.ty = gy; v.push_back(s); continue;
         }
+        if (std::sscanf(line, "%llu touch2 %d", &tf, &gx) == 2) {         // "<frame> touch2 0|1": second finger
+            PadStep st; st.frame = tf; st.pad = v.empty() ? Pad() : v.back().pad; st.pad.touch2 = gx != 0; v.push_back(st); continue;
+        }
+        if (std::sscanf(line, "%llu rear %d %d", &tf, &gx, &gy) == 3) {   // "<frame> rear x y" / "<frame> rear -1 -1" = lifted
+            PadStep st; st.frame = tf; st.pad = v.empty() ? Pad() : v.back().pad; st.pad.rear = gx >= 0; st.pad.rtx = gx; st.pad.rty = gy; v.push_back(st); continue;
+        }
         if (std::sscanf(line, "%llu untouc%1[h]", &tf, txt) == 2) {          // "<frame> untouch": finger lifted
             PadStep s; s.frame = tf; s.pad = v.empty() ? Pad() : v.back().pad; s.pad.touch = false; v.push_back(s); continue;
         }
@@ -52,7 +58,7 @@ std::vector<PadStep> load_script(const char* path) {
             PadStep s; s.frame = tf; s.text = txt; s.pad = v.empty() ? Pad() : v.back().pad; v.push_back(s); continue;
         }
         if (line[0] == '#' || std::sscanf(line, "%llu %x %u %u %u %u", &fr, &b, &lx, &ly, &rx, &ry) != 6) continue;
-        PadStep s; s.frame = fr; if (!v.empty()) { s.pad.touch = v.back().pad.touch; s.pad.tx = v.back().pad.tx; s.pad.ty = v.back().pad.ty; }
+        PadStep s; s.frame = fr; if (!v.empty()) { s.pad = v.back().pad; }
         s.pad.buttons = b; s.pad.lx = lx; s.pad.ly = ly; s.pad.rx = rx; s.pad.ry = ry;
         v.push_back(s);
     }

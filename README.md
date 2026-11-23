@@ -65,15 +65,17 @@ These are the default controls. Every one of them can be changed in game.
 
 ### Controls menu
 
-Hold **D-pad right** and press **Start**, anywhere (main menu or in a match), to open the controls menu. The game keeps running underneath, so pause it with the game menu first if a match is on. The menu always uses the D-pad, Cross, Circle and Start, whatever layout you set, so you can't lock yourself out.
+Hold **D-pad right** and press **Start**, anywhere (main menu or in a match), to open the controls menu. The game keeps running underneath, so pause it with the game menu first if a match is on. The menu always uses the D-pad, Cross, Circle and Start, whatever you bind, so you can't lock yourself out.
 
-- **Button layout**: move any job (left click, modifier, command grid, Ctrl, numbers, fast cursor, Start keys, Select key, the four key buttons) to any button. The job that was on that button moves to the old one, so nothing is lost.
-- **Keys**: choose the key each key button sends, alone and with the modifier, plus the Start, modifier + Start, Select and modifier + D-pad up keys. Letters, digits, F1-F12, Space, Enter, Esc, Tab and more, or None.
-- **Cursor and sticks**: normal and fast cursor speed, fast cursor on hold or toggle, cursor on the right or left stick, smooth or linear stick response, inverted up/down, stick dead zone.
-- **Scrolling, grid and touch**: edge scrolling On, Hold modifier, Toggle (tap the modifier on its own) or Off; how far to push the map-scroll stick; command grid on hold or toggle; touch screen Move and click, Move only or Off.
-- **Reset everything to defaults**.
+- **PC controls**: every PC key (letters, numbers, Ctrl + number, Shift + number, F1-F12, Space, Enter, Esc, Tab, Shift, Ctrl, Alt, arrows and more) and the left and right mouse buttons. Select one and press Cross, then hold any button or combination of buttons (for example L + Cross) and let go to record it. Triangle records a second binding, Square clears. A binding used by two controls shows in red.
+- **Port features**: the command grid, fast cursor, edge scrolling and on-screen keyboard, each with its binding and its options (hold or toggle, fast cursor speed, edge scrolling On / Hold / Toggle / Off).
+- **Cursor and sticks**: normal and fast cursor speed, cursor on the right or left stick, smooth or linear response, inverted up/down, dead zone, map-scroll stick push.
+- **Touch screen**: front touch Move and click / Move only / Off, right click by long press and/or two-finger tap, long-press time, back touchpad as a trackpad or to scroll the map, and its speed.
+- **Presets**: a touch screen mouse preset (touch clicks, buttons are all keyboard, R = Shift) and Reset to defaults.
 
-Settings are saved to `ux0:data/StarCraft/scvita_controls.txt` when the menu closes and loaded at start. It is plain text; delete it to go back to the defaults.
+When a button is pressed, the binding with the most buttons that are all held wins, so Cross can send A while D-pad down + Cross sends 1. Keys stay held as long as their buttons are held, so Ctrl or Shift on a button work as real modifiers.
+
+Settings are saved to `ux0:data/StarCraft/scvita_controls.txt` when the menu closes and loaded at start. It is plain text (`bind.key_a=Cross, L + Cross`); delete it to go back to the defaults.
 
 ## Acknowledgements
 

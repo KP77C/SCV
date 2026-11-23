@@ -26,6 +26,11 @@ struct Pad {
     // false when no finger is down or the finger is on a side bar.
     bool touch = false;
     int  tx = 0, ty = 0;
+    bool touch2 = false;             // a second finger on the front screen
+    // Back touchpad, in its own pixels (about 960x445 on the Vita, half the
+    // raw report); only movement is used, so the range does not matter.
+    bool rear = false;
+    int  rtx = 0, rty = 0;
 };
 
 // One sample per frame; dt_us is the time since the previous sample.

@@ -665,6 +665,7 @@ bool present_init() {
     g_interval = (f && std::atoi(f) == 30) ? 2 : 1;
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_START);
     SceAppUtilInitParam ai; SceAppUtilBootParam bi;
     std::memset(&ai, 0, sizeof ai); std::memset(&bi, 0, sizeof bi);
     sceAppUtilInit(&ai, &bi);
@@ -735,7 +736,12 @@ void present(d2rt::Cpu& c, uint32_t pixels, uint32_t pitch, uint32_t w, uint32_t
                 p.tx = (int)(sx * 640.0 / kOutW);
                 p.ty = (int)(sy * 480.0 / kOutH);
                 if (p.ty > 479) p.ty = 479; if (p.ty < 0) p.ty = 0;
+                p.touch2 = td.reportNum > 1;
             }
+        }
+        SceTouchData rd; std::memset(&rd, 0, sizeof rd);
+        if (sceTouchPeek(SCE_TOUCH_PORT_BACK, &rd, 1) > 0 && rd.reportNum > 0) {
+            p.rear = true; p.rtx = rd.report[0].x / 2; p.rty = rd.report[0].y / 2;
         }
     }
     if (g_ime_state.load() == 2) p = Pad();            // the keyboard owns the pad while it is open
