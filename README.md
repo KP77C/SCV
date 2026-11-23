@@ -26,20 +26,22 @@ cd tools/winvita
 LIBTAG=_prof EXTRA="-DPROF_COUNTERS" TARGET=vita ./build.sh
 # game
 cd ../../scvita
-WXTAG=_prof TARGET=vita ./build.sh      # -> scvita/build-vita/scvita.vpk
+WXTAG=_prof TARGET=vita ./build.sh      # -> scvita/build-vita/scv.vpk
 ```
 
 Leave out `TARGET=vita` to build for Linux ARM (`qemu-arm`) instead, for testing on a PC.
 
 ## Installing
 
-1. Install `scvita.vpk` with VitaShell.
+1. Install `scv.vpk` with VitaShell.
 2. Copy your StarCraft 1.16.1 folder to `ux0:data/StarCraft/`.
 3. You need `ur0:data/libshacccg.suprx` (the shader compiler).
 
 Logs are written to `ux0:data/StarCraft/` (`scvita_log.txt`, `scvita_progress.txt`, `scvita_stdout.txt`).
 
 ## Controls
+
+These are the defaults. Hold **D-pad right** and press **Start** at any time to open the controls menu and change any of them.
 
 | Input | Action |
 |---|---|
@@ -58,6 +60,7 @@ Logs are written to `ux0:data/StarCraft/` (`scvita_log.txt`, `scvita_progress.tx
 | L + D-pad up | Space |
 | Start / L+Start | F10 (menu) / Escape |
 | Select / L+Select | Enter / on-screen keyboard |
+| **D-pad right + Start** | **Controls menu**: rebind everything (see below) |
 
 Double click a unit to select all units of that type on screen.
 

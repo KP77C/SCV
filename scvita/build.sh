@@ -1,7 +1,7 @@
 #!/bin/bash
 # build.sh — StarCraft Vita boot harness.
 #   ./build.sh               qemu-arm/Linux host test binary -> build-arm/scvita_boot
-#   TARGET=vita ./build.sh   PS Vita package                 -> build-vita/scvita.vpk
+#   TARGET=vita ./build.sh   PS Vita package                 -> build-vita/scv.vpk
 set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 WX="${WINX86:-$ROOT/../tools/winvita}"
@@ -34,8 +34,8 @@ if [ "${TARGET:-}" = vita ]; then
             EXTRA_A+=(-a "sce_sys/$f=sce_sys/$f")
         fi
     done
-    ( cd "$OUT" && vita-pack-vpk -s sce_sys/param.sfo -b eboot.bin "${EXTRA_A[@]}" scvita.vpk )
-    echo "built $OUT/scvita.vpk"
+    ( cd "$OUT" && vita-pack-vpk -s sce_sys/param.sfo -b eboot.bin "${EXTRA_A[@]}" scv.vpk )
+    echo "built $OUT/scv.vpk"
     exit 0
 fi
 OUT="$ROOT/build-arm"
