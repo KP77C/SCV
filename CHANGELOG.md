@@ -58,4 +58,4 @@ Each port feature has its own binding and options:
 
 ### Notes
 - Upgrading from 0.1a: your old controls file lines are ignored, so you start on the defaults.
-- New in 0.2 and still to be tried on a Vita: the controls menu, the back touchpad, and long-press and two-finger right click.
+- The controls menu has been tried on a Vita. Still to be tried there: the back touchpad, and long-press and two-finger right click.
